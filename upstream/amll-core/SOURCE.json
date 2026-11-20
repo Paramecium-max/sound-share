@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/amll-dev/applemusic-like-lyrics",
+  "npm": "@applemusic-like-lyrics/core",
+  "version": "0.6.0",
+  "gitHead": null,
+  "source": "original TypeScript sources embedded in the published source map",
+  "license": "AGPL-3.0-only"
+}
