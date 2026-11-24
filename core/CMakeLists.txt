@@ -55,6 +55,7 @@ target_link_libraries(miplay_core_sidecar PRIVATE miplay_core)
 enable_testing()
 add_executable(miplay_core_tests
     tests/test_protocol_and_sync.cpp
+    src/sidecar/ws_server.cpp
 )
 target_include_directories(miplay_core_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(miplay_core_tests PRIVATE miplay_core)

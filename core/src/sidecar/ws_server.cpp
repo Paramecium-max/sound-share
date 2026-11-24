@@ -54,7 +54,7 @@ bool LocalWsServer::start(uint16_t port, const std::string& auth_token, WsMessag
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
     if (bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0 ||
-        listen(listen_fd_, 16) != 0) {
+        listen(listen_fd_, 16) != 0 || !net::set_nonblocking(listen_fd_, true)) {
         net::close_socket(listen_fd_);
         listen_fd_ = kInvalidSocket;
         return false;
@@ -66,14 +66,6 @@ bool LocalWsServer::start(uint16_t port, const std::string& auth_token, WsMessag
         port_.store(ntohs(actual.sin_port));
     }
 
-#ifdef _WIN32
-    DWORD tv = 200;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-    struct timeval tv{0, 200000};
-    setsockopt(listen_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
-
     running_.store(true);
     accept_th_ = std::thread(&LocalWsServer::accept_loop, this);
     return true;
@@ -81,50 +73,64 @@ bool LocalWsServer::start(uint16_t port, const std::string& auth_token, WsMessag
 
 void LocalWsServer::stop() {
     if (!running_.exchange(false)) return;
+    if (accept_th_.joinable()) accept_th_.join();
     if (listen_fd_ != kInvalidSocket) {
         net::close_socket(listen_fd_);
         listen_fd_ = kInvalidSocket;
     }
-    if (accept_th_.joinable()) accept_th_.join();
     {
         std::lock_guard<std::mutex> lock(clients_mu_);
-        for (SocketHandle c : clients_) net::close_socket(c);
-        clients_.clear();
+        for (const auto& [fd, authenticated] : clients_) net::shutdown_socket(fd);
     }
     for (auto& t : client_ths_) {
         if (t.joinable()) t.join();
     }
     client_ths_.clear();
+    port_.store(0);
 }
 
 void LocalWsServer::broadcast_text(const std::string& text) {
     std::lock_guard<std::mutex> lock(clients_mu_);
-    for (auto it = clients_.begin(); it != clients_.end(); ) {
-        if (!send_ws_text(*it, text)) {
-            net::close_socket(*it);
-            it = clients_.erase(it);
-        } else {
-            ++it;
+    if (!running_.load()) return;
+    for (auto& [fd, authenticated] : clients_) {
+        if (authenticated && !send_ws_text(fd, text)) {
+            authenticated = false;
+            net::shutdown_socket(fd);
         }
     }
 }
 
 void LocalWsServer::accept_loop() {
     while (running_.load()) {
+        if (!net::wait_readable(listen_fd_, 50) || !running_.load()) continue;
         struct sockaddr_in peer{};
         socklen_t plen = sizeof(peer);
         SocketHandle fd = accept(listen_fd_, reinterpret_cast<struct sockaddr*>(&peer), &plen);
         if (fd == kInvalidSocket) continue;
+        if (!net::set_nonblocking(fd, false) || !net::set_socket_timeout(fd, SO_SNDTIMEO, 100)) {
+            net::close_socket(fd);
+            continue;
+        }
         net::set_tcp_nodelay(fd, true);
-        client_ths_.emplace_back(&LocalWsServer::handle_client, this, fd);
+        {
+            std::lock_guard<std::mutex> lock(clients_mu_);
+            clients_.emplace(fd, false);
+        }
+        client_ths_.emplace_back([this, fd]() {
+            handle_client(fd);
+            std::lock_guard<std::mutex> lock(clients_mu_);
+            clients_.erase(fd);
+            net::close_socket(fd);
+        });
     }
 }
 
 void LocalWsServer::handle_client(SocketHandle fd) {
     char hbuf[4096];
+    while (running_.load() && !net::wait_readable(fd, 50)) {}
+    if (!running_.load()) return;
     auto n = recv(fd, hbuf, sizeof(hbuf) - 1, 0);
     if (n <= 0) {
-        net::close_socket(fd);
         return;
     }
     hbuf[n] = '\0';
@@ -134,7 +140,6 @@ void LocalWsServer::handle_client(SocketHandle fd) {
     if (!auth_token_.empty() && req.find("token=" + auth_token_) == std::string::npos) {
         const char* deny = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
         net::send_all(fd, reinterpret_cast<const uint8_t*>(deny), std::strlen(deny));
-        net::close_socket(fd);
         return;
     }
 
@@ -149,7 +154,6 @@ void LocalWsServer::handle_client(SocketHandle fd) {
         }
     }
     if (ws_key.empty()) {
-        net::close_socket(fd);
         return;
     }
 
@@ -160,21 +164,12 @@ void LocalWsServer::handle_client(SocketHandle fd) {
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: " + accept_val + "\r\n\r\n";
     if (!net::send_all(fd, reinterpret_cast<const uint8_t*>(resp.data()), resp.size())) {
-        net::close_socket(fd);
         return;
     }
 
-#ifdef _WIN32
-    DWORD tv = 200;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-    struct timeval tv{0, 200000};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
-
     {
         std::lock_guard<std::mutex> lock(clients_mu_);
-        clients_.insert(fd);
+        clients_.at(fd) = true;
     }
 
     std::vector<uint8_t> acc;
@@ -182,7 +177,7 @@ void LocalWsServer::handle_client(SocketHandle fd) {
     while (running_.load()) {
         auto r = recv(fd, reinterpret_cast<char*>(buf), sizeof(buf), 0);
         if (r == 0) break;
-        if (r < 0) continue;
+        if (r < 0) break;
         acc.insert(acc.end(), buf, buf + r);
 
         while (acc.size() >= 2) {
@@ -216,26 +211,20 @@ void LocalWsServer::handle_client(SocketHandle fd) {
             acc.erase(acc.begin(), acc.begin() + static_cast<ptrdiff_t>(off + plen));
 
             if (opcode == 0x08) { // Close
-                goto done;
+                return;
             } else if (opcode == 0x09) { // Ping -> Pong
                 std::vector<uint8_t> pong = {0x8A, 0x00};
-                net::send_all(fd, pong.data(), pong.size());
+                std::lock_guard<std::mutex> lock(clients_mu_);
+                if (!net::send_all(fd, pong.data(), pong.size())) return;
             } else if (opcode == 0x01 && handler_) { // Text frame
                 std::string reply = handler_(payload);
                 if (!reply.empty()) {
                     std::lock_guard<std::mutex> lock(clients_mu_);
-                    send_ws_text(fd, reply);
+                    if (!send_ws_text(fd, reply)) return;
                 }
             }
         }
     }
-
-done:
-    {
-        std::lock_guard<std::mutex> lock(clients_mu_);
-        clients_.erase(fd);
-    }
-    net::close_socket(fd);
 }
 
 } // namespace miplay::sidecar

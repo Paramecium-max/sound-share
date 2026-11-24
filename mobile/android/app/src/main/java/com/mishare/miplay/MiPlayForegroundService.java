@@ -13,13 +13,15 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 
 /**
  * 常驻前台音频与全屋妙播服务：
  * - 持有 WifiManager.MulticastLock 确保锁屏不丢 UDP 5355 mDNS 组播
- * - 持有 MediaProjection 令牌实现后台全局 AudioPlaybackCapture 抓音
+ * - SS-11: 登记 MediaProjection.Callback 监听系统撤销事件，撤销或服务销毁时立即释放令牌与采集并同步 UI
  */
 public class MiPlayForegroundService extends Service {
     public static final String ACTION_START = "com.mishare.miplay.ACTION_START";
@@ -30,6 +32,8 @@ public class MiPlayForegroundService extends Service {
 
     private WifiManager.MulticastLock multicastLock;
     private PowerManager.WakeLock wakeLock;
+    private MediaProjection activeProjection;
+    private MediaProjection.Callback projectionCallback;
 
     @Override
     public void onCreate() {
@@ -59,9 +63,20 @@ public class MiPlayForegroundService extends Service {
             if (code == Activity.RESULT_OK && data != null) {
                 MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
                 if (mpm != null) {
+                    releaseProjection(false);
                     MediaProjection mp = mpm.getMediaProjection(code, data);
                     if (mp != null) {
+                        activeProjection = mp;
+                        projectionCallback = new MediaProjection.Callback() {
+                            @Override
+                            public void onStop() {
+                                releaseProjection(true);
+                            }
+                        };
+                        mp.registerCallback(projectionCallback, new Handler(Looper.getMainLooper()));
                         MultiRoomManager.getInstance().onMediaProjectionGranted(mp);
+                    } else {
+                        MultiRoomManager.getInstance().onMediaProjectionDenied();
                     }
                 }
             }
@@ -69,8 +84,25 @@ public class MiPlayForegroundService extends Service {
         return START_STICKY;
     }
 
+    private void releaseProjection(boolean notifyRevoked) {
+        MediaProjection mp = activeProjection;
+        MediaProjection.Callback cb = projectionCallback;
+        activeProjection = null;
+        projectionCallback = null;
+        if (mp != null) {
+            if (cb != null) {
+                try { mp.unregisterCallback(cb); } catch (Exception ignored) {}
+            }
+            try { mp.stop(); } catch (Exception ignored) {}
+        }
+        if (notifyRevoked) {
+            MultiRoomManager.getInstance().onMediaProjectionRevoked("系统已停止全局抓音权限，已自动切回校准测试音");
+        }
+    }
+
     @Override
     public void onDestroy() {
+        releaseProjection(true);
         MultiRoomManager.getInstance().stopMultiroom();
         releaseLocks();
         super.onDestroy();

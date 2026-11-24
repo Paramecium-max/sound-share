@@ -30,6 +30,10 @@ struct NetworkInterface {
 void init_network();
 void close_socket(SocketHandle fd);
 bool set_nonblocking(SocketHandle fd, bool enable);
+bool wait_readable(SocketHandle fd, int timeout_ms);
+bool wait_connect_result(SocketHandle fd, int timeout_ms);
+bool set_socket_timeout(SocketHandle fd, int option, int timeout_ms);
+void shutdown_socket(SocketHandle fd);
 bool set_tcp_nodelay(SocketHandle fd, bool enable);
 bool set_reuse_addr(SocketHandle fd);
 uint32_t ipv4_to_u32_host_order(const std::string& ipv4);

@@ -118,16 +118,20 @@
 
   /* Draw the displacement map. Red = x shift, green = y shift, 128 = none. */
   function buildMap(w, h, radius, bezel, magnify) {
+    // Half-resolution map: the rim is Gaussian-softened anyway, and feImage
+    // upscales it, so this cuts map generation and upload cost to a quarter.
+    var k = 0.5;
+    var mw = Math.max(2, Math.ceil(w * k)), mh = Math.max(2, Math.ceil(h * k));
     var canvas = document.createElement('canvas');
-    canvas.width = w; canvas.height = h;
+    canvas.width = mw; canvas.height = mh;
     var ctx = canvas.getContext('2d');
-    var img = ctx.createImageData(w, h);
+    var img = ctx.createImageData(mw, mh);
     var data = img.data;
     var hw = w / 2, hh = h / 2;
     var maxMag = Math.max(1e-6, magnify);
-    for (var py = 0; py < h; py++) {
-      for (var px = 0; px < w; px++) {
-        var x = px + 0.5 - hw, y = py + 0.5 - hh;
+    for (var py = 0; py < mh; py++) {
+      for (var px = 0; px < mw; px++) {
+        var x = (px + 0.5) / k - hw, y = (py + 0.5) / k - hh;
         var f = roundedRectField(x, y, hw, hh, radius);
         var inside = -f.d;                    // distance in from the outline
         var vx = 0, vy = 0;
@@ -144,11 +148,48 @@
           vx -= (x / hw) * magnify / maxMag * 0.25;
           vy -= (y / hh) * magnify / maxMag * 0.25;
         }
-        var i = (py * w + px) * 4;
+        var i = (py * mw + px) * 4;
         data[i] = Math.round(128 + Math.max(-1, Math.min(1, vx)) * 127);
         data[i + 1] = Math.round(128 + Math.max(-1, Math.min(1, vy)) * 127);
         data[i + 2] = 128;
         data[i + 3] = 255;
+      }
+    }
+    // Smooth the displacement texture once. Keeping the blur in the SVG
+    // graph would repeat it on each pressed frame with the same input.
+    var sigma = Math.max(1.5, bezel * 0.25) * k;
+    var padding = Math.ceil(sigma * 3);
+    var weights = [];
+    var weightSum = 0;
+    for (var i = -padding; i <= padding; i++) {
+      var weight = Math.exp(-(i * i) / (2 * sigma * sigma));
+      weights.push(weight);
+      weightSum += weight;
+    }
+    var horizontal = new Float32Array(data.length);
+    for (var y = 0; y < mh; y++) {
+      for (var x = 0; x < mw; x++) {
+        var pixel = (y * mw + x) * 4;
+        for (var j = -padding; j <= padding; j++) {
+          var sample = (y * mw + Math.min(mw - 1, Math.max(0, x + j))) * 4;
+          var normalized = weights[j + padding] / weightSum;
+          horizontal[pixel] += data[sample] * normalized;
+          horizontal[pixel + 1] += data[sample + 1] * normalized;
+        }
+      }
+    }
+    for (var y = 0; y < mh; y++) {
+      for (var x = 0; x < mw; x++) {
+        var pixel = (y * mw + x) * 4;
+        var red = 0, green = 0;
+        for (var j = -padding; j <= padding; j++) {
+          var sample = (Math.min(mh - 1, Math.max(0, y + j)) * mw + x) * 4;
+          var normalized = weights[j + padding] / weightSum;
+          red += horizontal[sample] * normalized;
+          green += horizontal[sample + 1] * normalized;
+        }
+        data[pixel] = red;
+        data[pixel + 1] = green;
       }
     }
     ctx.putImageData(img, 0, 0);
@@ -162,14 +203,17 @@
 
   function apply(el, mode) {
     var rect = el.getBoundingClientRect();
-    var w = Math.round(rect.width), h = Math.round(rect.height);
+    // A stretching lens keeps the map in its own layout coordinates.
+    var dynamic = el.hasAttribute('data-refract-dynamic');
+    var w = dynamic ? el.offsetWidth : Math.round(rect.width);
+    var h = dynamic ? el.offsetHeight : Math.round(rect.height);
     if (w < 8 || h < 8) return;
 
     var cs = getComputedStyle(el);
     var radius = parseFloat(cs.borderTopLeftRadius) || 0;
     radius = Math.min(radius, w / 2, h / 2);
 
-    var strength = Math.max(0, Math.min(2, readNumber(el, 'data-refract', 1) || 1));
+    var strength = Math.max(0, Math.min(2, readNumber(el, 'data-refract', 1)));
     // The rim band: about half the corner radius, kept to under a third of
     // the short side so the middle of the control stays undistorted.
     var bezel = readNumber(el, 'data-refract-bezel', Math.max(8, Math.min(20, radius * 0.5 || 12)));
@@ -177,7 +221,8 @@
     // Regular glass bends a strongly blurred picture; clear glass bends a sharp
     // one (that is where text visibly curves at the rim).
     var isClear = el.classList.contains('glass-clear');
-    var blur = readNumber(el, 'data-refract-blur', isClear ? 0.5 : 10);
+    var blur = el.hasAttribute('data-refract-adaptive-blur')
+      ? 'var(--glass-blur-radius)' : readNumber(el, 'data-refract-blur', isClear ? 0.5 : 10) + 'px';
     var dispersion = Math.max(0, Math.min(0.2, readNumber(el, 'data-refract-dispersion', 0.04)));
     var magnify = readNumber(el, 'data-refract-magnify', 0);
     var scale = Math.round(bezel * 1.2 * strength);   // max shift = scale / 2
@@ -211,42 +256,52 @@
       href: buildMap(w, h, radius, bezel, magnify),
       x: 0, y: 0, width: w, height: h,
       preserveAspectRatio: 'none',
-      result: 'raw'
+      result: 'map'
     });
-    // Soften the map a little so the pull changes smoothly where the outline
-    // curves (capsule ends, corners) instead of pinching into a dark knot.
-    node('feGaussianBlur', { in: 'raw', stdDeviation: Math.max(1.5, bezel * 0.25).toFixed(1), result: 'map' });
 
+    var displacements = [];
     if (dispersion > 0) {
       // A touch of colour fringing at the rim, as a real lens shows: red, green
       // and blue are bent by slightly different amounts, then added back up.
       var channels = [
-        { c: 'r', s: scale, m: '1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0' },
-        { c: 'g', s: scale * (1 - dispersion), m: '0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0' },
-        { c: 'b', s: scale * (1 - 2 * dispersion), m: '0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0' }
+        { c: 'r', f: 1, m: '1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0' },
+        { c: 'g', f: 1 - dispersion, m: '0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0' },
+        { c: 'b', f: 1 - 2 * dispersion, m: '0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0' }
       ];
       channels.forEach(function (ch) {
-        node('feDisplacementMap', {
-          in: 'SourceGraphic', in2: 'map', scale: ch.s.toFixed(2),
+        var disp = node('feDisplacementMap', {
+          in: 'SourceGraphic', in2: 'map', scale: (scale * ch.f).toFixed(2),
           xChannelSelector: 'R', yChannelSelector: 'G', result: 'd' + ch.c
         });
+        displacements.push({ node: disp, factor: ch.f });
         node('feColorMatrix', { in: 'd' + ch.c, type: 'matrix', values: ch.m, result: ch.c });
       });
       node('feComposite', { in: 'r', in2: 'g', operator: 'arithmetic', k1: 0, k2: 1, k3: 1, k4: 0, result: 'rg' });
       node('feComposite', { in: 'rg', in2: 'b', operator: 'arithmetic', k1: 0, k2: 1, k3: 1, k4: 0 });
     } else {
-      node('feDisplacementMap', {
+      var disp = node('feDisplacementMap', {
         in: 'SourceGraphic', in2: 'map', scale: scale,
         xChannelSelector: 'R', yChannelSelector: 'G'
       });
+      displacements.push({ node: disp, factor: 1 });
     }
     ensureDefs().appendChild(filter);
 
-    var value = 'url(#' + id + ') blur(' + blur + 'px) saturate(170%)';
-    var next = { key: key, id: id, mode: mode };
+    var value = 'url(#' + id + ') blur(' + blur + ') saturate(' + (dynamic ? '112%' : '170%') + ')';
+    var next = { key: key, id: id, mode: mode, displacements: displacements, scale: scale,
+      offset: state ? state.offset : 0, value: value, dynamic: dynamic, active: false };
+    updateDisplacementScales(next);
     if (mode === 'backdrop') {
-      el.style.setProperty('backdrop-filter', value);
-      el.style.setProperty('-webkit-backdrop-filter', value);
+      // A resting dynamic lens must not keep a backdrop-filter: even at scale 0
+      // Chromium would still run the whole SVG graph on every repaint.
+      if (!dynamic || next.offset > 0) {
+        el.style.setProperty('backdrop-filter', value);
+        el.style.setProperty('-webkit-backdrop-filter', value);
+        next.active = true;
+      } else {
+        el.style.removeProperty('backdrop-filter');
+        el.style.removeProperty('-webkit-backdrop-filter');
+      }
     } else {
       next.mirror = state && state.mirror ? state.mirror : buildMirror(el);
       next.mirror.bend.style.filter = value;
@@ -388,7 +443,52 @@
     return st ? st.mode : null;
   }
 
-  window.LiquidGlassRefraction = { refresh: refresh, supported: supported, modeOf: modeOf };
+  function updateDisplacementScales(state) {
+    var total = state.scale + state.offset;
+    state.displacements.forEach(function (channel) {
+      channel.node.setAttribute('scale', (total * channel.factor).toFixed(2));
+    });
+  }
+
+  // Update lens displacement (including RGB dispersion channels) without rebuilding SVG/PNG.
+  function setExtraDisplacement(el, pixels) {
+    var st = observed.get(el);
+    if (!st && pixels > 0 && el) {
+      if (!el.hasAttribute('data-refract')) {
+        el.setAttribute('data-refract', '0');
+        el.setAttribute('data-refract-bezel', '11');
+        el.setAttribute('data-refract-blur', '0');
+        el.setAttribute('data-refract-dispersion', '0.14');
+        el.setAttribute('data-refract-dynamic', '');
+      }
+      var m = modeFor(el);
+      if (m) {
+        apply(el, m);
+        if (ro) ro.observe(el);
+        st = observed.get(el);
+      }
+    }
+    if (!st || !st.displacements || !st.displacements.length) return;
+    var offset = Math.round(pixels * 2) / 2;
+    if (offset === st.offset) return;
+    st.offset = offset;
+    if (st.mode === 'backdrop' && st.dynamic) {
+      if (offset > 0 && !st.active) {
+        el.style.setProperty('backdrop-filter', st.value);
+        el.style.setProperty('-webkit-backdrop-filter', st.value);
+        st.active = true;
+      } else if (offset === 0 && st.active) {
+        el.style.removeProperty('backdrop-filter');
+        el.style.removeProperty('-webkit-backdrop-filter');
+        st.active = false;
+      }
+    }
+    updateDisplacementScales(st);
+  }
+
+  window.LiquidGlassRefraction = {
+    refresh: refresh, supported: supported, modeOf: modeOf, setExtraDisplacement: setExtraDisplacement
+  };
 
   function start() {
     refresh();

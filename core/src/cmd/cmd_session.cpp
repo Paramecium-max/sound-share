@@ -4,6 +4,9 @@
 
 #include <chrono>
 #include <cstring>
+#ifndef _WIN32
+#include <cerrno>
+#endif
 
 namespace miplay::cmd {
 
@@ -19,6 +22,13 @@ std::string extract_json_field(const std::string& json, const std::string& key) 
     auto end = json.find('"', pos + 1);
     if (end == std::string::npos) return "";
     return json.substr(pos + 1, end - pos - 1);
+}
+bool connect_pending() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EINPROGRESS || errno == EINTR;
+#endif
 }
 } // namespace
 
@@ -57,44 +67,70 @@ void CmdSession::mark_disconnected(const std::string& reason) {
     }
 }
 
-bool CmdSession::connect(CmdSessionCallbacks cbs) {
+bool CmdSession::connect(CmdSessionCallbacks cbs, const std::atomic<bool>* cancelled) {
     disconnect();
+    aborted_.store(false);
+    const auto is_cancelled = [this, cancelled] {
+        return aborted_.load() || (cancelled && cancelled->load());
+    };
+    if (is_cancelled()) return false;
     net::init_network();
     cbs_ = std::move(cbs);
 
     emit_status("8899 TCP 建连中...");
-    sock_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_ == kInvalidSocket) {
+    SocketHandle s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == kInvalidSocket) {
         emit_status("8899 Socket 创建失败");
         return false;
     }
 
-    net::set_tcp_nodelay(sock_, true);
+    net::set_tcp_nodelay(s, true);
 
-#ifdef _WIN32
-    DWORD tv = 2500;
-    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-    setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-    struct timeval tv{2, 500000};
-    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
+    if (!net::set_nonblocking(s, true) || !net::set_socket_timeout(s, SO_SNDTIMEO, 100)) {
+        net::close_socket(s);
+        emit_status("8899 Socket 配置失败");
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(sock_mu_);
+        if (is_cancelled()) {
+            net::close_socket(s);
+            return false;
+        }
+        sock_ = s;
+    }
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port_);
     if (inet_pton(AF_INET, ip_.c_str(), &addr.sin_addr) != 1) {
-        net::close_socket(sock_);
-        sock_ = kInvalidSocket;
+        {
+            std::lock_guard<std::mutex> lk(sock_mu_);
+            if (sock_ != kInvalidSocket) { net::close_socket(sock_); sock_ = kInvalidSocket; }
+        }
         emit_status("8899 无效目标 IP");
         return false;
     }
 
-    if (::connect(sock_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
-        net::close_socket(sock_);
-        sock_ = kInvalidSocket;
-        emit_status("8899 TCP 连接失败/超时");
+    bool tcp_connected = ::connect(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
+    if (!tcp_connected && connect_pending()) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+        while (!is_cancelled() && std::chrono::steady_clock::now() < deadline) {
+            if (!net::wait_connect_result(s, 25)) continue;
+            int error = 0;
+            socklen_t len = sizeof(error);
+            tcp_connected = getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &len) == 0 &&
+                            error == 0;
+            break;
+        }
+    }
+    if (!tcp_connected || is_cancelled() || !net::set_nonblocking(s, false)) {
+        {
+            std::lock_guard<std::mutex> lk(sock_mu_);
+            if (sock_ != kInvalidSocket) { net::close_socket(sock_); sock_ = kInvalidSocket; }
+        }
+        if (!is_cancelled()) emit_status("8899 TCP 连接失败/超时");
         return false;
     }
 
@@ -106,14 +142,6 @@ bool CmdSession::connect(CmdSessionCallbacks cbs) {
         local_ip_ = lip;
         local_port_ = ntohs(local_addr.sin_port);
     }
-
-#ifdef _WIN32
-    DWORD rtv = 200;
-    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rtv), sizeof(rtv));
-#else
-    struct timeval rtv{0, 200000};
-    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
-#endif
 
     {
         std::lock_guard<std::mutex> lk(auth_mu_);
@@ -130,8 +158,16 @@ bool CmdSession::connect(CmdSessionCallbacks cbs) {
         safety_active_.store(false);
     }
 
-    running_.store(true);
-    connected_.store(true);
+    {
+        std::lock_guard<std::mutex> lk(sock_mu_);
+        if (is_cancelled()) {
+            net::close_socket(sock_);
+            sock_ = kInvalidSocket;
+            return false;
+        }
+        running_.store(true);
+        connected_.store(true);
+    }
     seq_.store(1);
     if (cbs_.on_state_changed) cbs_.on_state_changed(true);
 
@@ -264,20 +300,76 @@ bool CmdSession::connect(CmdSessionCallbacks cbs) {
         emit_status("8899 Legacy 认证通过（明文通道）");
     }
 
+    if (aborted_.load() || !connected_.load()) {
+        disconnect();
+        return false;
+    }
     hb_th_ = std::thread(&CmdSession::heartbeat_loop, this);
     return true;
 }
 
+void CmdSession::send_close_and_abort() {
+    if (connected_.load()) {
+        send_close_device();
+        {
+            std::lock_guard<std::mutex> lk(sock_mu_);
+            if (sock_ != kInvalidSocket) {
+#ifdef _WIN32
+                ::shutdown(sock_, SD_SEND);
+#else
+                ::shutdown(sock_, SHUT_WR);
+#endif
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+    abort();
+}
+
+void CmdSession::abort() {
+    aborted_.store(true);
+    running_.store(false);
+    connected_.store(false);
+    auth_cv_.notify_all();
+    std::lock_guard<std::mutex> lk(sock_mu_);
+    if (sock_ != kInvalidSocket) {
+#ifdef _WIN32
+        ::shutdown(sock_, SD_BOTH);
+#else
+        ::shutdown(sock_, SHUT_RDWR);
+#endif
+    }
+}
+
+void CmdSession::close_and_disconnect() {
+    send_close_and_abort();
+    disconnect();
+}
+
 void CmdSession::disconnect() {
-    if (!running_.exchange(false)) return;
+    aborted_.store(true);
+    running_.store(false);
     bool was_conn = connected_.exchange(false);
     auth_cv_.notify_all();
-    if (sock_ != kInvalidSocket) {
-        net::close_socket(sock_);
-        sock_ = kInvalidSocket;
+    {
+        std::lock_guard<std::mutex> lk(sock_mu_);
+        if (sock_ != kInvalidSocket) {
+#ifdef _WIN32
+            ::shutdown(sock_, SD_BOTH);
+#else
+            ::shutdown(sock_, SHUT_RDWR);
+#endif
+        }
     }
-    if (recv_th_.joinable()) recv_th_.join();
-    if (hb_th_.joinable()) hb_th_.join();
+    if (recv_th_.joinable() && recv_th_.get_id() != std::this_thread::get_id()) recv_th_.join();
+    if (hb_th_.joinable() && hb_th_.get_id() != std::this_thread::get_id()) hb_th_.join();
+    {
+        std::scoped_lock lock(send_mu_, sock_mu_);
+        if (sock_ != kInvalidSocket) {
+            net::close_socket(sock_);
+            sock_ = kInvalidSocket;
+        }
+    }
     if (was_conn && cbs_.on_state_changed) cbs_.on_state_changed(false);
 }
 
@@ -554,6 +646,7 @@ void CmdSession::recv_loop() {
     uint8_t tmp[4096];
 
     while (running_.load()) {
+        if (!net::wait_readable(sock_, 50) || !running_.load()) continue;
         auto n = recv(sock_, reinterpret_cast<char*>(tmp), sizeof(tmp), 0);
         if (n > 0) {
             acc.insert(acc.end(), tmp, tmp + n);

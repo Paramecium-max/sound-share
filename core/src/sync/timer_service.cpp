@@ -36,17 +36,6 @@ bool TimerService::start(const std::string& bind_ip, uint16_t port) {
 
     net::set_reuse_addr(sock_);
 
-    // 设置接收超时以便优雅退出
-#ifdef _WIN32
-    DWORD tv = 100;
-    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-    struct timeval tv{};
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
-    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
-
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -88,6 +77,7 @@ void TimerService::stop() {
 void TimerService::run_loop() {
     uint8_t buf[128];
     while (running_.load()) {
+        if (!net::wait_readable(sock_, 50) || !running_.load()) continue;
         struct sockaddr_in peer{};
         socklen_t peer_len = sizeof(peer);
         auto n = recvfrom(sock_, reinterpret_cast<char*>(buf), sizeof(buf), 0,

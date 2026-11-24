@@ -3,11 +3,16 @@
 #include "sidecar/ws_server.h"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <thread>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -89,12 +94,19 @@ int main(int argc, char** argv) {
 
     uint16_t port = 0;
     std::string token = random_token();
-    for (int i = 1; i + 1 < argc; ++i) {
+#ifdef _WIN32
+    bool exit_on_stdin_close = false;
+#endif
+    for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--port") port = static_cast<uint16_t>(std::stoi(argv[++i]));
-        else if (arg == "--token") token = argv[++i];
+        if (arg == "--port" && i + 1 < argc) port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        else if (arg == "--token" && i + 1 < argc) token = argv[++i];
+#ifdef _WIN32
+        else if (arg == "--exit-on-stdin-close") exit_on_stdin_close = true;
+#endif
     }
 
+    miplay::media::AudioPipeline::recover_playback_route();
     miplay::MultiRoomEngine engine;
     miplay::sidecar::LocalWsServer ws;
 
@@ -133,7 +145,12 @@ int main(int argc, char** argv) {
             bool lpcm = (json_get_str(req, "codec") == "LPCM");
             uint32_t sr = static_cast<uint32_t>(json_get_int(req, "sampleRate", 48000));
             uint32_t delay = static_cast<uint32_t>(json_get_int(req, "basePlayDelayMs", 350));
-            result = engine.start_multiroom(lpcm, sr, delay) ? "true" : "false";
+            if (!engine.start_multiroom(lpcm, sr, delay)) {
+                std::string err = engine.last_error();
+                if (err.empty()) err = "启动全屋播放失败";
+                return "{\"type\":\"rpc\",\"id\":\"" + id + "\",\"error\":\"" + err + "\"}";
+            }
+            result = "true";
         } else if (method == "multiroom.stop") {
             engine.stop_multiroom();
         } else if (method == "multiroom.addDevice") {
@@ -150,10 +167,25 @@ int main(int argc, char** argv) {
                                      json_get_int(req, "volume", 65));
         } else if (method == "volume.setMaster") {
             engine.set_master_volume(json_get_int(req, "volume", 70));
+        } else if (method == "source.listLoopback") {
+            auto srcs = miplay::MultiRoomEngine::list_loopback_sources();
+            std::ostringstream oss;
+            oss << "[";
+            for (size_t i = 0; i < srcs.size(); ++i) {
+                if (i) oss << ",";
+                oss << "{\"id\":\"" << srcs[i].id << "\",\"label\":\"" << srcs[i].label << "\"}";
+            }
+            oss << "]";
+            result = oss.str();
         } else if (method == "source.setMode") {
             int mode = json_get_int(req, "mode", 0);
-            engine.set_source_mode(static_cast<miplay::media::AudioSourceMode>(mode),
-                                   json_get_str(req, "param"));
+            std::string err;
+            if (!engine.set_source_mode(static_cast<miplay::media::AudioSourceMode>(mode),
+                                        json_get_str(req, "param"), &err)) {
+                if (err.empty()) err = "切换音源失败";
+                return "{\"type\":\"rpc\",\"id\":\"" + id + "\",\"error\":\"" + err + "\"}";
+            }
+            result = "true";
         } else {
             return "{\"type\":\"rpc\",\"id\":\"" + id + "\",\"error\":\"unknown method: " + method + "\"}";
         }
@@ -171,14 +203,24 @@ int main(int argc, char** argv) {
     // 约定输出 READY 行供 Electron 主进程解析连接参数
     std::cout << "READY {\"port\":" << ws.port() << ",\"token\":\"" << token << "\"}" << std::endl;
 
-    // 每 1 秒推送一次全屋遥测状态
+    auto next_state = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (!g_stop.load()) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        ws.broadcast_text("{\"type\":\"state\",\"data\":" + engine.snapshot_state_json() + "}");
+#ifdef _WIN32
+        // Electron owns the other end. Closing its pipe lets WASAPI restore the
+        // original playback route before this Windows process exits.
+        if (exit_on_stdin_close && !PeekNamedPipe(GetStdHandle(STD_INPUT_HANDLE),
+                                                 nullptr, 0, nullptr, nullptr, nullptr)) break;
+#endif
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_state) {
+            ws.broadcast_text("{\"type\":\"state\",\"data\":" + engine.snapshot_state_json() + "}");
+            next_state = now + std::chrono::seconds(1);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
+    ws.stop();
     engine.stop_multiroom();
     engine.stop_discovery();
-    ws.stop();
     return 0;
 }

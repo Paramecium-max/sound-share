@@ -10,6 +10,7 @@
   #include <fcntl.h>
   #include <ifaddrs.h>
   #include <net/if.h>
+  #include <poll.h>
 #endif
 
 namespace miplay::net {
@@ -60,6 +61,51 @@ bool set_nonblocking(SocketHandle fd, bool enable) {
     if (flags < 0) return false;
     flags = enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
     return fcntl(fd, F_SETFL, flags) == 0;
+#endif
+}
+
+bool wait_readable(SocketHandle fd, int timeout_ms) {
+#ifdef _WIN32
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(fd, &read_set);
+    timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    return select(0, &read_set, nullptr, nullptr, &timeout) > 0;
+#else
+    pollfd entry{fd, POLLIN, 0};
+    return poll(&entry, 1, timeout_ms) > 0;
+#endif
+}
+
+bool wait_connect_result(SocketHandle fd, int timeout_ms) {
+#ifdef _WIN32
+    fd_set write_set, error_set;
+    FD_ZERO(&write_set);
+    FD_ZERO(&error_set);
+    FD_SET(fd, &write_set);
+    FD_SET(fd, &error_set);
+    timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    return select(0, nullptr, &write_set, &error_set, &timeout) > 0;
+#else
+    pollfd entry{fd, POLLOUT, 0};
+    return poll(&entry, 1, timeout_ms) > 0;
+#endif
+}
+
+bool set_socket_timeout(SocketHandle fd, int option, int timeout_ms) {
+#ifdef _WIN32
+    DWORD timeout = static_cast<DWORD>(timeout_ms);
+#else
+    timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+#endif
+    return setsockopt(fd, SOL_SOCKET, option, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
+}
+
+void shutdown_socket(SocketHandle fd) {
+#ifdef _WIN32
+    ::shutdown(fd, SD_BOTH);
+#else
+    ::shutdown(fd, SHUT_RDWR);
 #endif
 }
 

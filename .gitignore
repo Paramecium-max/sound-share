@@ -5,6 +5,7 @@ desktop/node_modules/
 desktop/dist/
 desktop/release/
 mobile/android/build/
+mobile/android/build_tmp/
 release/
 
 # Local captures & logs

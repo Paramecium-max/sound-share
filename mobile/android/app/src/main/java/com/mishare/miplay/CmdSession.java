@@ -126,6 +126,7 @@ public class CmdSession {
     private String localIp = "";
     private int localPort = 0;
 
+    private final AtomicBoolean aborted = new AtomicBoolean(false);
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean connected = new AtomicBoolean(false);
     private final AtomicBoolean safetyActive = new AtomicBoolean(false);
@@ -133,8 +134,8 @@ public class CmdSession {
     private final AtomicInteger seq = new AtomicInteger(1);
     private final Object sendLock = new Object();
 
-    private Socket socket;
-    private OutputStream out;
+    private volatile Socket socket;
+    private volatile OutputStream out;
     private Thread recvTh;
     private Thread hbTh;
     private Callbacks cbs;
@@ -191,16 +192,26 @@ public class CmdSession {
 
     public boolean connect(Callbacks cbs) {
         disconnect();
+        aborted.set(false);
         this.cbs = cbs;
         emitStatus("8899 TCP 建连中...");
         try {
-            socket = new Socket();
-            socket.setTcpNoDelay(true);
-            socket.connect(new InetSocketAddress(ip, port), 2500);
-            socket.setSoTimeout(300);
-            localIp = socket.getLocalAddress().getHostAddress();
-            localPort = socket.getLocalPort();
-            out = socket.getOutputStream();
+            Socket s = new Socket();
+            socket = s;
+            if (aborted.get()) {
+                try { s.close(); } catch (Exception ignored) {}
+                return false;
+            }
+            s.setTcpNoDelay(true);
+            s.connect(new InetSocketAddress(ip, port), 2500);
+            if (aborted.get()) {
+                try { s.close(); } catch (Exception ignored) {}
+                return false;
+            }
+            s.setSoTimeout(300);
+            localIp = s.getLocalAddress().getHostAddress();
+            localPort = s.getLocalPort();
+            out = s.getOutputStream();
 
             legacyLatch = new CountDownLatch(1);
             versionLatch = new CountDownLatch(1);
@@ -278,25 +289,43 @@ public class CmdSession {
                 emitStatus("8899 Legacy 认证通过（明文通道）");
             }
 
+            if (aborted.get() || !connected.get()) {
+                disconnect();
+                return false;
+            }
             hbTh = new Thread(this::heartbeatLoop, "MiPlay-CmdHB-" + ip);
             hbTh.start();
             return true;
         } catch (Exception e) {
-            emitStatus("8899 连接失败: " + e.getMessage());
+            if (!aborted.get()) emitStatus("8899 连接失败: " + e.getMessage());
             disconnect();
             return false;
         }
     }
 
+    public void closeGracefully() {
+        if (connected.get()) {
+            sendCloseDevice();
+            Socket s = socket;
+            if (s != null) {
+                try { s.shutdownOutput(); } catch (Exception ignored) {}
+            }
+            try { Thread.sleep(40); } catch (InterruptedException ignored) {}
+        }
+        disconnect();
+    }
+
     public void disconnect() {
-        if (!running.getAndSet(false)) return;
+        aborted.set(true);
+        running.set(false);
         boolean wasConn = connected.getAndSet(false);
         safetyActive.set(false);
         handshakeReady.set(false);
         releaseLatches();
-        if (socket != null) {
-            try { socket.close(); } catch (Exception ignored) {}
-            socket = null;
+        Socket s = socket;
+        socket = null;
+        if (s != null) {
+            try { s.close(); } catch (Exception ignored) {}
         }
         if (wasConn && cbs != null) cbs.onStateChanged(false);
     }

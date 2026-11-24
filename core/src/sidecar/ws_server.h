@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
-#include <set>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,7 +40,7 @@ private:
     std::thread accept_th_;
     std::vector<std::thread> client_ths_;
     std::mutex clients_mu_;
-    std::set<SocketHandle> clients_;
+    std::map<SocketHandle, bool> clients_; // socket -> handshake complete
 };
 
 } // namespace miplay::sidecar

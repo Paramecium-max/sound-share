@@ -7,7 +7,11 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -15,6 +19,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class WfdRtspServer {
     private static final String TAG = "MiPlayRTSP";
+    private static final long MEDIA_CONNECT_TIMEOUT_NANOS = TimeUnit.MILLISECONDS.toNanos(1500);
+    // The receiver may also open an auxiliary connection for cover art.
+    private static final int MAX_PENDING_SOCKETS = 4;
 
     public interface Callbacks {
         void onStreamReady(String deviceId, String peerIp, Socket dataSock);
@@ -24,16 +31,20 @@ public class WfdRtspServer {
     }
 
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicBoolean stopping = new AtomicBoolean(false);
+    private final Object socketLock = new Object();
     private ServerSocket serverSocket;
+    private Socket activeCtrlSock;
+    private Socket activeDataSock;
     private volatile int listenPort = 0;
     private String deviceId;
     private String senderIp;
     private int timerPort;
     private long timeOffsetUs;
     private boolean preferLpcm;
+    private int sampleRate = 48000;
     private Callbacks cbs;
-    private final ConcurrentHashMap<Integer, Socket> pendingMultiPorts = new ConcurrentHashMap<>();
-    private Thread acceptTh;
+    private final Map<Integer, Socket> pendingMultiPorts = new HashMap<>();
 
     public static long ipv4ToUint32(String ip) {
         String[] parts = ip.split("\\.");
@@ -46,22 +57,24 @@ public class WfdRtspServer {
     }
 
     public boolean start(String deviceId, String senderIp, int timerPort,
-                         long timeOffsetUs, boolean preferLpcm, Callbacks cbs) {
+                         long timeOffsetUs, boolean preferLpcm, int sampleRate, Callbacks cbs) {
         stop();
         this.deviceId = deviceId;
         this.senderIp = senderIp;
         this.timerPort = timerPort;
         this.timeOffsetUs = timeOffsetUs;
         this.preferLpcm = preferLpcm;
+        this.sampleRate = (sampleRate == 44100 || sampleRate == 48000) ? sampleRate : 48000;
         this.cbs = cbs;
         try {
-            serverSocket = new ServerSocket(0);
-            serverSocket.setReuseAddress(true);
-            serverSocket.setSoTimeout(300);
-            listenPort = serverSocket.getLocalPort();
-            running.set(true);
-            acceptTh = new Thread(this::acceptLoop, "MiPlay-RTSP-" + deviceId);
-            acceptTh.start();
+            ServerSocket listener = new ServerSocket(0);
+            synchronized (socketLock) {
+                serverSocket = listener;
+                listenPort = listener.getLocalPort();
+                stopping.set(false);
+                running.set(true);
+            }
+            new Thread(() -> acceptLoop(listener), "MiPlay-RTSP-" + deviceId).start();
             return true;
         } catch (Exception e) {
             stop();
@@ -70,16 +83,42 @@ public class WfdRtspServer {
     }
 
     public void stop() {
-        if (!running.getAndSet(false)) return;
-        if (serverSocket != null) {
-            try { serverSocket.close(); } catch (Exception ignored) {}
+        Socket ctrl;
+        Socket data;
+        ServerSocket listener;
+        List<Socket> pending;
+        synchronized (socketLock) {
+            stopping.set(true);
+            if (!running.getAndSet(false)) return;
+            listener = serverSocket;
             serverSocket = null;
+            ctrl = activeCtrlSock;
+            activeCtrlSock = null;
+            data = activeDataSock;
+            activeDataSock = null;
+            pending = new ArrayList<>(pendingMultiPorts.values());
+            pendingMultiPorts.clear();
+            listenPort = 0;
+            socketLock.notifyAll();
         }
-        for (Socket s : pendingMultiPorts.values()) {
-            try { s.close(); } catch (Exception ignored) {}
+        if (listener != null) {
+            try { listener.close(); } catch (Exception ignored) {}
         }
-        pendingMultiPorts.clear();
-        listenPort = 0;
+        if (ctrl != null) {
+            try {
+                String body = "wfd_trigger_method: TEARDOWN\r\n";
+                String td = "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n"
+                        + "CSeq: 99\r\nContent-Type: text/parameters\r\n"
+                        + "Content-Length: " + body.length() + "\r\n\r\n" + body;
+                OutputStream os = ctrl.getOutputStream();
+                os.write(td.getBytes(StandardCharsets.UTF_8));
+                os.flush();
+            } catch (Exception ignored) {}
+            try { ctrl.shutdownOutput(); } catch (Exception ignored) {}
+            try { ctrl.close(); } catch (Exception ignored) {}
+        }
+        closeSocket(data);
+        for (Socket s : pending) closeSocket(s);
     }
 
     public int getListenPort() {
@@ -91,35 +130,70 @@ public class WfdRtspServer {
         if (cbs != null) cbs.onStatus(deviceId, s);
     }
 
-    private void acceptLoop() {
-        boolean hasCtrl = false;
-        while (running.get()) {
+    private void acceptLoop(ServerSocket listener) {
+        while (!listener.isClosed()) {
             try {
-                Socket client = serverSocket.accept();
-                client.setTcpNoDelay(true);
-                int peerPort = client.getPort();
-                String peerIp = client.getInetAddress().getHostAddress();
-                if (!hasCtrl) {
-                    hasCtrl = true;
-                    new Thread(() -> handleControl(client, peerIp), "MiPlay-RTSPCtrl-" + deviceId).start();
-                } else {
-                    pendingMultiPorts.put(peerPort, client);
+                Socket client = listener.accept();
+                try { client.setTcpNoDelay(true); } catch (Exception e) {
+                    closeSocket(client);
+                    continue;
                 }
-            } catch (SocketTimeoutException ignored) {
+                synchronized (socketLock) {
+                    if (serverSocket != listener || !running.get()) {
+                        closeSocket(client);
+                    } else if (activeCtrlSock == null) {
+                        activeCtrlSock = client;
+                        String peerIp = client.getInetAddress().getHostAddress();
+                        new Thread(() -> handleControl(client, peerIp), "MiPlay-RTSPCtrl-" + deviceId).start();
+                    } else if (activeCtrlSock.getInetAddress().equals(client.getInetAddress())
+                            && pendingMultiPorts.size() < MAX_PENDING_SOCKETS) {
+                        Socket replaced = pendingMultiPorts.put(client.getPort(), client);
+                        closeSocket(replaced);
+                        socketLock.notifyAll();
+                    } else {
+                        closeSocket(client);
+                    }
+                }
             } catch (Exception e) {
-                if (!running.get()) break;
-                try { Thread.sleep(50); } catch (InterruptedException ignored) { break; }
+                if (!listener.isClosed()) Log.w(TAG, "RTSP accept failed: " + e.getMessage());
+                break;
             }
         }
     }
 
-    private Socket claimMultiPortSocket(int port) {
-        for (int i = 0; i < 30 && running.get(); i++) {
-            Socket s = pendingMultiPorts.remove(port);
-            if (s != null) return s;
-            try { Thread.sleep(50); } catch (InterruptedException ignored) { break; }
+    private Socket claimMultiPortSocket(Socket ctrl, int port) throws InterruptedException {
+        long deadline = System.nanoTime() + MEDIA_CONNECT_TIMEOUT_NANOS;
+        synchronized (socketLock) {
+            while (activeCtrlSock == ctrl) {
+                Socket data = pendingMultiPorts.remove(port);
+                if (data != null) {
+                    activeDataSock = data;
+                    return data;
+                }
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) break;
+                TimeUnit.NANOSECONDS.timedWait(socketLock, remaining);
+            }
         }
         return null;
+    }
+
+    private static void closeSocket(Socket socket) {
+        if (socket != null) {
+            try { socket.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private static int parseMediaPort(String multiPort) {
+        for (String parameter : multiPort.split(";")) {
+            int separator = parameter.indexOf('=');
+            if (separator < 0 || !parameter.substring(0, separator).trim().equalsIgnoreCase("multi_port")) continue;
+            try {
+                int port = Integer.parseInt(parameter.substring(separator + 1).trim());
+                if (port > 0 && port <= 65535) return port;
+            } catch (NumberFormatException ignored) {}
+        }
+        return -1;
     }
 
     private static String extractHeader(String msg, String key) {
@@ -158,10 +232,11 @@ public class WfdRtspServer {
             StringBuilder acc = new StringBuilder();
             byte[] buf = new byte[4096];
             boolean sentM3 = false, sentM4 = false, sentM5 = false;
-            boolean sentTimeOffset = false, hasMultiPort = false;
+            boolean sentTimeOffset = false, setupComplete = false, streaming = false;
+            int mediaPort = 0;
             final String sessionId = "1189641421";
 
-            while (running.get()) {
+            while (running.get() && !ctrl.isClosed()) {
                 int n;
                 try {
                     n = in.read(buf);
@@ -193,11 +268,20 @@ public class WfdRtspServer {
                             report("RTSP M3 查询音频能力...");
                             String body = "wfd_content_SP_protection\r\n"
                                     + "wfd_video_formats\r\n"
+                                    + "wfd_video_enctype\r\n"
+                                    + "wfd_video_gamuttype\r\n"
+                                    + "wfd_video_bitrate\r\n"
+                                    + "wfd_dynamic_video_enable\r\n"
+                                    + "wfd_current_video_info\r\n"
                                     + "wfd_audio_codecs\r\n"
                                     + "wfd_audio_codecs_v2\r\n"
                                     + "wfd_client_rtp_ports\r\n"
                                     + "wfd_tcp_enable\r\n"
-                                    + "wfd_tcp_multi_session_enable\r\n";
+                                    + "wfd_tcp_multi_session_enable\r\n"
+                                    + "wfd_support_secure_win\r\n"
+                                    + "wfd_mirror_control_enable\r\n"
+                                    + "wfd_standby_resume_capability\r\n"
+                                    + "wfd_image_enable_v2\r\n";
                             sendStr(out, "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n"
                                     + "CSeq: 2\r\nContent-Type: text/parameters\r\n"
                                     + "Content-Length: " + body.length() + "\r\n\r\n" + body);
@@ -207,15 +291,17 @@ public class WfdRtspServer {
                             sentM4 = true;
                             boolean hasV2 = msg.contains("wfd_audio_codecs_v2");
                             boolean hasV1 = msg.contains("wfd_audio_codecs:");
-                            report("RTSP M4 下发" + (preferLpcm ? "LPCM" : "ADTS-AAC") + "参数...");
+                            report("RTSP M4 下发" + (preferLpcm ? "LPCM" : "ADTS-AAC") + " " + sampleRate + "Hz 参数...");
+                            String v2Rate = (sampleRate == 44100) ? "0" : "1";
+                            String lpcmMask = (sampleRate == 44100) ? "00000001" : "00000002";
                             StringBuilder sb = new StringBuilder();
                             if (hasV2 || !hasV1) {
                                 sb.append("wfd_type_encryp: 0 1 1 0 0\r\n");
-                                sb.append("wfd_audio_codecs_v2: ").append(preferLpcm ? "2 1" : "1 1").append("\r\n");
+                                sb.append("wfd_audio_codecs_v2: ").append(preferLpcm ? "2 " : "1 ").append(v2Rate).append("\r\n");
                             }
                             if (hasV1) {
                                 sb.append("wfd_audio_codecs: ")
-                                  .append(preferLpcm ? "LPCM 00000002 00" : "AAC 00000001 00").append("\r\n");
+                                  .append(preferLpcm ? ("LPCM " + lpcmMask + " 00") : "AAC 00000001 00").append("\r\n");
                             }
                             sb.append("wfd_client_rtp_ports: RTP/AVP/TCP;interleaved mode=play\r\n");
                             sb.append("wfd_presentation_URL: rtsp://").append(senderIp).append("/wfd1.0/streamid=0 none\r\n");
@@ -233,12 +319,20 @@ public class WfdRtspServer {
                         }
                     } else if (msg.startsWith("SETUP ")) {
                         report("RTSP M6 SETUP 建立音频数据通道...");
-                        String mp = extractHeader(msg, "MultiPort");
-                        int idx = mp.indexOf("multi_port=");
-                        if (idx >= 0) {
-                            hasMultiPort = true;
-                            String sub = mp.substring(idx + 11).split("[;\\s]")[0];
-                            try { dataSock = claimMultiPortSocket(Integer.parseInt(sub)); } catch (Exception ignored) {}
+                        String multiPort = extractHeader(hdr, "MultiPort");
+                        int requestedPort = multiPort.isEmpty() ? 0 : parseMediaPort(multiPort);
+                        if (requestedPort < 0 || requestedPort == ctrl.getPort()) {
+                            sendStr(out, "RTSP/1.0 461 Unsupported Transport\r\nCSeq: " + cseq + "\r\n\r\n");
+                            report("RTSP MultiPort 无效，未建立音频通道");
+                            continue;
+                        }
+                        if (streaming && requestedPort != mediaPort) {
+                            sendStr(out, "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: " + cseq + "\r\n\r\n");
+                            continue;
+                        }
+                        mediaPort = requestedPort;
+                        setupComplete = true;
+                        if (mediaPort > 0 && !sentTimeOffset) {
                             String timeReq = "TIME_OFFSET rtsp://localhost/wfd1.0 RTSP/1.0\r\n"
                                     + "CSeq: 5\r\nContent-Type: text/parameters\r\n"
                                     + "TimeOffset:" + timeOffsetUs + "\r\nContent-Length: 0\r\n\r\n";
@@ -250,6 +344,19 @@ public class WfdRtspServer {
                                 + "\r\nTransport: RTP/AVP/TCP;interleaved=0-1;\r\n\r\n";
                         sendStr(out, setupOk);
                     } else if (msg.startsWith("PLAY ")) {
+                        if (!setupComplete) {
+                            sendStr(out, "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: " + cseq + "\r\n\r\n");
+                            continue;
+                        }
+                        if (!streaming && mediaPort > 0) {
+                            dataSock = claimMultiPortSocket(ctrl, mediaPort);
+                            if (ctrl.isClosed() || stopping.get()) return;
+                            if (dataSock == null) {
+                                sendStr(out, "RTSP/1.0 503 Service Unavailable\r\nCSeq: " + cseq + "\r\n\r\n");
+                                report("RTSP MultiPort 音频反连超时，接收端端口 " + mediaPort);
+                                return;
+                            }
+                        }
                         sendStr(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
                                 + "\r\nSession: " + sessionId + ";timeout=60\r\nRange: npt=now-\r\n\r\n");
                         if (!sentTimeOffset) {
@@ -259,9 +366,13 @@ public class WfdRtspServer {
                             sendStr(out, timeReq);
                             sentTimeOffset = true;
                         }
-                        report(hasMultiPort ? "RTSP M7 同步推流中 (MultiPort)" : "RTSP M7 同步推流中 (TCP Interleaved)");
-                        Socket outSock = (dataSock != null) ? dataSock : ctrl;
-                        if (cbs != null) cbs.onStreamReady(deviceId, peerIp, outSock);
+                        if (!streaming) {
+                            streaming = true;
+                            report(dataSock != null
+                                    ? "RTSP M7 同步推流中 (MultiPort，控制 " + ctrl.getPort() + "，音频 " + dataSock.getPort() + ")"
+                                    : "RTSP M7 同步推流中 (TCP Interleaved，接收端未请求 MultiPort)");
+                            if (cbs != null) cbs.onStreamReady(deviceId, peerIp, dataSock != null ? dataSock : ctrl);
+                        }
                     } else if (msg.startsWith("GET_PARAMETER ")) {
                         sendStr(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
                                 + "\r\nSession: " + sessionId + ";timeout=20\r\n\r\n");
@@ -275,15 +386,34 @@ public class WfdRtspServer {
                         }
                     } else if (msg.startsWith("TEARDOWN ")) {
                         sendStr(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\n\r\n");
-                        break;
+                        return;
                     }
                 }
             }
         } catch (Exception e) {
-            report("RTSP 异常结束: " + e.getMessage());
+            if (!stopping.get()) report("RTSP 异常结束: " + e.getMessage());
         } finally {
-            try { ctrl.close(); } catch (Exception ignored) {}
-            if (cbs != null) cbs.onSessionClosed(deviceId);
+            boolean ownsSession;
+            synchronized (socketLock) {
+                ownsSession = activeCtrlSock == ctrl;
+                if (ownsSession) {
+                    running.set(false);
+                    activeCtrlSock = null;
+                    activeDataSock = null;
+                    if (serverSocket != null) {
+                        try { serverSocket.close(); } catch (Exception ignored) {}
+                        serverSocket = null;
+                    }
+                    listenPort = 0;
+                    for (Socket pending : pendingMultiPorts.values()) closeSocket(pending);
+                    pendingMultiPorts.clear();
+                }
+            }
+            if (ownsSession) {
+                closeSocket(dataSock);
+                closeSocket(ctrl);
+                if (!stopping.get() && cbs != null) cbs.onSessionClosed(deviceId);
+            }
         }
     }
 }

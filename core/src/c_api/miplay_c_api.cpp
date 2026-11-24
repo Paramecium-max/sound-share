@@ -87,9 +87,8 @@ int miplay_engine_set_device_volume(
 int miplay_engine_set_source_mode(
     MiPlayEngineHandle* handle, MiPlaySourceMode mode, const char* param) {
     if (!handle) return -1;
-    handle->engine->set_source_mode(
-        static_cast<miplay::media::AudioSourceMode>(mode), param ? param : "");
-    return 0;
+    return handle->engine->set_source_mode(
+        static_cast<miplay::media::AudioSourceMode>(mode), param ? param : "") ? 0 : -1;
 }
 
 int miplay_engine_push_pcm(

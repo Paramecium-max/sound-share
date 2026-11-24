@@ -81,14 +81,6 @@ SocketHandle MdnsDiscovery::create_multicast_socket(const std::string& bind_ipv4
 
     net::set_reuse_addr(fd);
 
-#ifdef _WIN32
-    DWORD tv = 200;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-    struct timeval tv{0, 200000};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
-
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -186,6 +178,7 @@ void MdnsDiscovery::trigger_query() {
 void MdnsDiscovery::recv_loop(SocketHandle fd, uint16_t /*listen_port*/) {
     uint8_t buf[4096];
     while (running_.load()) {
+        if (!net::wait_readable(fd, 200) || !running_.load()) continue;
         struct sockaddr_in peer{};
         socklen_t plen = sizeof(peer);
         auto n = recvfrom(fd, reinterpret_cast<char*>(buf), sizeof(buf), 0,

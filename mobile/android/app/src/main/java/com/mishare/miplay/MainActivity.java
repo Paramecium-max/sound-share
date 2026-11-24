@@ -56,10 +56,39 @@ public class MainActivity extends Activity {
         ws.setAllowUniversalAccessFromFileURLs(true);
 
         webView.addJavascriptInterface(new AndroidBridge(), "_androidMiPlayBridge");
-        webView.setWebViewClient(new WebViewClient());
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                syncReduceMotionToWeb();
+            }
+        });
 
         setContentView(webView);
         webView.loadUrl("file:///android_asset/www/index.html");
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        syncReduceMotionToWeb();
+    }
+
+    private void syncReduceMotionToWeb() {
+        if (webView == null) return;
+        float scale = 1.0f;
+        try {
+            scale = android.provider.Settings.Global.getFloat(
+                    getContentResolver(),
+                    android.provider.Settings.Global.ANIMATOR_DURATION_SCALE,
+                    1.0f);
+        } catch (Exception ignored) {}
+        final boolean reduce = (scale == 0.0f);
+        webView.post(() -> webView.evaluateJavascript(
+                reduce
+                        ? "document.documentElement.setAttribute('data-reduce-motion','');"
+                        : "document.documentElement.removeAttribute('data-reduce-motion');",
+                null));
     }
 
     private void requestRuntimePermissions() {

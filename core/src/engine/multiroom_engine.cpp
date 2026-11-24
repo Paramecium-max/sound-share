@@ -2,6 +2,7 @@
 #include "platform/net_platform.h"
 
 #include <algorithm>
+#include <future>
 #include <iomanip>
 #include <sstream>
 
@@ -14,13 +15,64 @@ MultiRoomEngine::MultiRoomEngine(std::string bind_ip)
 }
 
 MultiRoomEngine::~MultiRoomEngine() {
+    // 析构前必须停止所有会话并等待全部连接线程与回调退出，确保零悬空 this 访问
+    set_event_callback(nullptr);
     stop_multiroom();
     stop_discovery();
+    std::vector<std::shared_ptr<SessionHandle>> leftovers;
+    {
+        std::lock_guard<std::mutex> lc(lifecycle_mu_);
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& [_, dev] : devices_) {
+            detach_device_stream_locked(dev, leftovers);
+        }
+    }
+    cleanup_detached(leftovers);
 }
 
 void MultiRoomEngine::set_event_callback(JsonEventCallback cb) {
     std::lock_guard<std::mutex> lock(cb_mu_);
     event_cb_ = std::move(cb);
+}
+
+void MultiRoomEngine::set_last_error(const std::string& err) {
+    std::lock_guard<std::mutex> lock(mu_);
+    last_error_ = err;
+}
+
+std::string MultiRoomEngine::last_error() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return last_error_;
+}
+
+std::vector<media::LoopbackSourceInfo> MultiRoomEngine::list_loopback_sources() {
+    return media::AudioPipeline::list_loopback_sources();
+}
+
+bool MultiRoomEngine::validate_audio_config(bool prefer_lpcm, uint32_t sample_rate,
+                                            AudioStreamConfig& out_cfg, std::string& out_error) {
+    if (sample_rate == 0) sample_rate = 48000;
+    if (prefer_lpcm) {
+        if (sample_rate != 48000 && sample_rate != 44100) {
+            out_error = "WFD LPCM 仅支持 48000 Hz 或 44100 Hz 采样率";
+            return false;
+        }
+        out_cfg.lpcm = true;
+        out_cfg.sample_rate = sample_rate;
+        out_cfg.channels = 2;
+        out_cfg.frame_samples = (sample_rate == 44100) ? 441 : 480;
+        return true;
+    }
+    // WFD 1.0 规范 AAC-LC 仅定义 48kHz Stereo (00000001)
+    if (sample_rate != 48000) {
+        out_error = "WFD AAC-LC 仅支持 48000 Hz 采样率（如需 44100 Hz 请切换为 LPCM）";
+        return false;
+    }
+    out_cfg.lpcm = false;
+    out_cfg.sample_rate = 48000;
+    out_cfg.channels = 2;
+    out_cfg.frame_samples = 1024;
+    return true;
 }
 
 void MultiRoomEngine::set_bind_ip(const std::string& ip) {
@@ -115,55 +167,71 @@ std::string MultiRoomEngine::add_manual_device(const std::string& name, const st
 }
 
 bool MultiRoomEngine::remove_device(const std::string& device_id) {
+    std::vector<std::shared_ptr<SessionHandle>> detached;
     {
+        std::lock_guard<std::mutex> lc(lifecycle_mu_);
         std::lock_guard<std::mutex> lock(mu_);
         auto it = devices_.find(device_id);
         if (it == devices_.end()) return false;
-        detach_device_stream_locked(it->second);
+        detach_device_stream_locked(it->second, detached);
         devices_.erase(it);
     }
+    cleanup_detached(detached);
     emit_state_changed();
     return true;
 }
 
 bool MultiRoomEngine::start_multiroom(bool prefer_lpcm, uint32_t sample_rate, uint32_t base_play_delay_ms) {
+    std::vector<std::shared_ptr<SessionHandle>> detached;
     {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (multiroom_running_) return true;
+        std::lock_guard<std::mutex> lc(lifecycle_mu_);
+        if (lifecycle_ == EngineLifecycle::Running) return true;
+        lifecycle_ = EngineLifecycle::Starting;
 
-        sample_rate_ = sample_rate > 0 ? sample_rate : 48000;
-        prefer_lpcm_ = prefer_lpcm;
-
-        // 优先启用原生 ADTS AAC-LC 编码器；若当前平台无原生 AAC 编码器则自动回退 WFD LPCM 保证编码与 RTSP 协商一致
-        aac_encoder_.shutdown();
-        if (!prefer_lpcm_) {
-            if (!aac_encoder_.init(sample_rate_, 2, 192000)) {
-                prefer_lpcm_ = true;
-            }
-        }
-
-        master_clock_.reset(sample_rate_, base_play_delay_ms);
-        multi_sender_.set_stream_type(
-            prefer_lpcm_ ? media::TsAudioStreamType::WfdLpcm : media::TsAudioStreamType::AdtsAac);
-
-        if (!timer_service_.start("0.0.0.0", 0)) {
+        AudioStreamConfig cfg;
+        std::string err;
+        if (!validate_audio_config(prefer_lpcm, sample_rate, cfg, err)) {
+            lifecycle_ = EngineLifecycle::Stopped;
+            set_last_error(err);
             return false;
         }
 
-        // 若用户未勾选任何设备但列表有设备，不阻断启动（前端也支持热加入）
-        for (auto& [_, dev] : devices_) {
-            if (dev.in_group) {
-                attach_device_stream_locked(dev);
+        // 若请求 AAC 但当前平台无原生 AAC 编码器，同步更新单一实际音频配置为 LPCM
+        aac_encoder_.shutdown();
+        if (!cfg.lpcm) {
+            if (!aac_encoder_.init(cfg.sample_rate, cfg.channels, 192000)) {
+                cfg.lpcm = true;
+                cfg.frame_samples = (cfg.sample_rate == 44100) ? 441 : 480;
             }
         }
 
-        // AAC-LC 固定 1024 samples/帧 (21.333ms, 90kHz 步进 1920)；LPCM 用 480 samples/帧 (10ms)
-        const uint32_t frame_samples = prefer_lpcm_ ? ((sample_rate_ == 44100) ? 441 : 480) : 1024;
-        const bool use_aac = !prefer_lpcm_ && aac_encoder_.is_available();
+        master_clock_.reset(cfg.sample_rate, base_play_delay_ms);
+        multi_sender_.set_stream_type(
+            cfg.lpcm ? media::TsAudioStreamType::WfdLpcm : media::TsAudioStreamType::AdtsAac);
 
+        if (!timer_service_.start("0.0.0.0", 0)) {
+            aac_encoder_.shutdown();
+            lifecycle_ = EngineLifecycle::Stopped;
+            set_last_error("TimerService UDP 校时服务启动失败");
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            active_audio_cfg_ = cfg;
+            multiroom_running_ = true;
+            last_error_.clear();
+            for (auto& [_, dev] : devices_) {
+                if (dev.in_group) {
+                    attach_device_stream_locked(dev, detached);
+                }
+            }
+        }
+
+        const bool use_aac = !cfg.lpcm && aac_encoder_.is_available();
         audio_pipeline_.start(
-            sample_rate_,
-            frame_samples,
+            cfg.sample_rate,
+            cfg.frame_samples,
             [this, use_aac](const int16_t* stereo_pcm, size_t samples) {
                 auto ts = master_clock_.next_frame_timestamps(static_cast<uint32_t>(samples));
                 if (use_aac) {
@@ -186,189 +254,277 @@ bool MultiRoomEngine::start_multiroom(bool prefer_lpcm, uint32_t sample_rate, ui
                 }
                 oss << "]}";
                 emit_event_json(oss.str());
-            });
+            },
+            [this] { return multi_sender_.has_streaming_target(); });
 
-        multiroom_running_ = true;
+        lifecycle_ = EngineLifecycle::Running;
     }
+    cleanup_detached(detached);
     emit_state_changed();
     return true;
 }
 
 void MultiRoomEngine::stop_multiroom() {
+    std::vector<std::shared_ptr<SessionHandle>> detached;
     {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (!multiroom_running_) return;
-        multiroom_running_ = false;
-        audio_pipeline_.stop();
-        for (auto& [_, dev] : devices_) {
-            detach_device_stream_locked(dev);
+        std::lock_guard<std::mutex> lc(lifecycle_mu_);
+        if (lifecycle_ == EngineLifecycle::Stopped) return;
+        lifecycle_ = EngineLifecycle::Stopping;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            multiroom_running_ = false;
+            for (auto& [_, dev] : devices_) {
+                detach_device_stream_locked(dev, detached);
+            }
         }
+        // 在持有 lifecycle_mu_（串行化启停）且释放 mu_（允许回调无死锁完成）的状态下彻底清理全部资源
+        audio_pipeline_.stop();
+        cleanup_detached(detached);
         multi_sender_.clear_all();
         aac_encoder_.shutdown();
         timer_service_.stop();
+        lifecycle_ = EngineLifecycle::Stopped;
     }
     emit_state_changed();
 }
 
-void MultiRoomEngine::update_device_status(const std::string& dev_id, const std::string& status) {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = devices_.find(dev_id);
-        if (it != devices_.end()) it->second.status_text = status;
-    }
-    emit_state_changed();
-}
-
-void MultiRoomEngine::attach_device_stream_locked(ManagedDevice& dev) {
-    detach_device_stream_locked(dev);
+bool MultiRoomEngine::attach_device_stream_locked(
+    ManagedDevice& dev, std::vector<std::shared_ptr<SessionHandle>>& detached_out) {
+    detach_device_stream_locked(dev, detached_out);
 
     const std::string dev_id = dev.info.id;
     const std::string dev_ip = dev.info.ip;
     const uint16_t cmd_port = dev.info.cmd_port;
     const int32_t init_vol = dev.volume;
     const std::string sender_ip = bind_ip_;
-    const uint64_t gen = ++dev.attach_gen;
+    const AudioStreamConfig cfg = active_audio_cfg_;
+    const uint64_t sid = next_session_id_.fetch_add(1);
+    dev.active_session_id = sid;
     dev.status_text = "启动 RTSP 监听与 8899 握手...";
 
-    // 1. 启动该设备专属反向 WFD RTSP Server (全屋共享同一个 TimerService 端口与会话基准 TimeOffset)
-    dev.rtsp_server = std::make_unique<rtsp::WfdRtspServer>();
+    auto handle = std::make_shared<SessionHandle>();
+    handle->session_id = sid;
+    handle->device_id = dev_id;
+    handle->rtsp_server = std::make_unique<rtsp::WfdRtspServer>();
+
     rtsp::RtspServerCallbacks rcbs;
-    rcbs.on_stream_ready = [this](const std::string& id, const std::string& peer_ip, SocketHandle data_sock) {
+    rcbs.on_stream_ready = [this, sid](const std::string& id, const std::string& peer_ip, SocketHandle data_sock) {
         int32_t bias = 0;
+        bool valid = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = devices_.find(id);
-            if (it != devices_.end()) {
+            if (it != devices_.end() && it->second.active_session_id == sid &&
+                it->second.in_group && multiroom_running_) {
                 it->second.rtsp_streaming = true;
                 bias = it->second.delay_bias_ms;
+                valid = true;
+                // 按全局唯一 session_id 原子注册目标，防旧会话回调覆盖新目标
+                multi_sender_.add_or_update_target(id, peer_ip, data_sock, bias, false, sid);
             }
         }
-        multi_sender_.add_or_update_target(id, peer_ip, data_sock, bias);
-        emit_state_changed();
+        if (valid) emit_state_changed();
     };
-    rcbs.on_latency_report = [this](const rtsp::RtspLatencyReport& rep) {
+    rcbs.on_latency_report = [this, sid](const rtsp::RtspLatencyReport& rep) {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = devices_.find(rep.device_id);
-        if (it != devices_.end()) it->second.reported_latency_ms = rep.latency_ms;
+        if (it != devices_.end() && it->second.active_session_id == sid) {
+            it->second.reported_latency_ms = rep.latency_ms;
+        }
     };
-    rcbs.on_session_closed = [this](const std::string& id) {
-        multi_sender_.remove_target(id);
+    rcbs.on_session_closed = [this, sid](const std::string& id) {
+        bool valid = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = devices_.find(id);
-            if (it != devices_.end()) it->second.rtsp_streaming = false;
+            if (it != devices_.end() && it->second.active_session_id == sid) {
+                it->second.rtsp_streaming = false;
+                valid = true;
+            }
         }
-        emit_state_changed();
+        multi_sender_.remove_target(id, sid);
+        if (valid) emit_state_changed();
     };
-    rcbs.on_status = [this](const std::string& id, const std::string& st) {
-        update_device_status(id, st);
+    rcbs.on_status = [this, sid](const std::string& id, const std::string& st) {
+        bool valid = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = devices_.find(id);
+            if (it != devices_.end() && it->second.active_session_id == sid) {
+                it->second.status_text = st;
+                valid = true;
+            }
+        }
+        if (valid) emit_state_changed();
     };
 
-    dev.rtsp_server->start(
+    const bool rtsp_ok = handle->rtsp_server->start(
         dev_id,
         sender_ip,
         timer_service_.port(),
         master_clock_.session_origin_us(),
-        prefer_lpcm_,
-        std::move(rcbs));
-    uint16_t rtsp_port = dev.rtsp_server->listen_port();
+        cfg.lpcm,
+        std::move(rcbs),
+        cfg.sample_rate,
+        test_rtsp_bind_port_.load());
+    const uint16_t rtsp_port = rtsp_ok ? handle->rtsp_server->listen_port() : 0;
 
-    // 2. 异步建立 TCP 8899 控制连接并完成 0x0028/0x0029 + Safety 握手（绝不阻塞主锁与 UI）
-    auto session = std::make_shared<cmd::CmdSession>(dev_ip, cmd_port);
-    dev.cmd_session = session;
+    // SS-06：RTSP 监听失败或端口无效时绝不继续建连或发送 Open
+    if (!rtsp_ok || rtsp_port == 0) {
+        handle->rtsp_server->stop();
+        handle->rtsp_server.reset();
+        dev.active_session_id = 0;
+        dev.cmd_connected = false;
+        dev.rtsp_streaming = false;
+        dev.status_text = "RTSP 监听启动失败，未发起 8899 Open";
+        return false;
+    }
+
+    auto cmd_sess = std::make_shared<cmd::CmdSession>(dev_ip, cmd_port);
+    handle->cmd_session = cmd_sess;
     auto meta = audio_pipeline_.current_meta();
 
-    std::thread([this, session, dev_id, sender_ip, rtsp_port, init_vol, meta, gen]() {
+    // SS-01：使用可取消、可等待的托管连接线程（绝不 detach）
+    handle->connect_thread = std::thread([this, handle, cmd_sess, dev_id, sender_ip, rtsp_port, init_vol, meta, sid]() {
+        if (handle->cancelled.load()) return;
+
         cmd::CmdSessionCallbacks ccbs;
-        ccbs.on_version = [this, dev_id](const std::string& v) {
+        ccbs.on_version = [this, dev_id, sid](const std::string& v) {
+            bool valid = false;
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 auto it = devices_.find(dev_id);
-                if (it != devices_.end()) it->second.remote_version = v;
+                if (it != devices_.end() && it->second.active_session_id == sid) {
+                    it->second.remote_version = v;
+                    valid = true;
+                }
             }
-            emit_state_changed();
+            if (valid) emit_state_changed();
         };
-        ccbs.on_state_changed = [this, dev_id, gen](bool conn) {
+        ccbs.on_state_changed = [this, dev_id, sid](bool conn) {
+            bool valid = false;
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 auto it = devices_.find(dev_id);
-                if (it != devices_.end() && it->second.attach_gen == gen) {
+                if (it != devices_.end() && it->second.active_session_id == sid) {
                     it->second.cmd_connected = conn;
+                    valid = true;
                 }
             }
-            emit_state_changed();
+            if (valid) emit_state_changed();
         };
-        ccbs.on_status = [this, dev_id, gen](const std::string& st) {
+        ccbs.on_status = [this, dev_id, sid](const std::string& st) {
+            bool valid = false;
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 auto it = devices_.find(dev_id);
-                if (it != devices_.end() && it->second.attach_gen == gen) {
+                if (it != devices_.end() && it->second.active_session_id == sid) {
                     it->second.status_text = st;
+                    valid = true;
                 }
             }
-            emit_state_changed();
+            if (valid) emit_state_changed();
         };
 
-        if (session->connect(std::move(ccbs))) {
+        if (cmd_sess->connect(std::move(ccbs), &handle->cancelled)) {
             bool still_active = false;
-            {
+            if (!handle->cancelled.load()) {
                 std::lock_guard<std::mutex> lk(mu_);
                 auto it = devices_.find(dev_id);
                 still_active = (multiroom_running_ && it != devices_.end() &&
-                                it->second.in_group && it->second.attach_gen == gen);
+                                it->second.in_group && it->second.active_session_id == sid);
             }
             if (still_active) {
-                session->send_open_device(sender_ip, rtsp_port, 1);
-                session->send_set_media_info(meta.title, meta.artist, meta.album, meta.duration_ms);
-                session->send_set_volume(init_vol);
+                cmd_sess->send_open_device(sender_ip, rtsp_port, 1);
+                cmd_sess->send_set_media_info(meta.title, meta.artist, meta.album, meta.duration_ms);
+                cmd_sess->send_set_volume(init_vol);
             } else {
-                session->disconnect();
+                cmd_sess->close_and_disconnect();
             }
         }
-    }).detach();
+    });
+
+    dev.session = std::move(handle);
+    return true;
 }
 
-void MultiRoomEngine::detach_device_stream_locked(ManagedDevice& dev) {
-    ++dev.attach_gen;
-    multi_sender_.remove_target(dev.info.id);
-    if (dev.cmd_session) {
-        auto s = dev.cmd_session;
-        dev.cmd_session.reset();
-        if (s->is_connected()) s->send_close_device();
-        std::thread([s]() { s->disconnect(); }).detach();
-    }
-    if (dev.rtsp_server) {
-        dev.rtsp_server->stop();
-        dev.rtsp_server.reset();
+void MultiRoomEngine::detach_device_stream_locked(
+    ManagedDevice& dev, std::vector<std::shared_ptr<SessionHandle>>& detached_out) {
+    dev.active_session_id = 0;
+    if (dev.session) {
+        dev.session->cancelled.store(true);
+        detached_out.push_back(std::move(dev.session));
     }
     dev.cmd_connected = false;
     dev.rtsp_streaming = false;
     dev.status_text = "待机";
 }
 
+void MultiRoomEngine::cleanup_detached(std::vector<std::shared_ptr<SessionHandle>>& detached) {
+    auto cleanup = [this](const std::shared_ptr<SessionHandle>& h) {
+        if (!h) return;
+        h->cancelled.store(true);
+        // 按唯一 session_id 移除音频目标，绝不误删同一 device_id 的新会话
+        multi_sender_.remove_target(h->device_id, h->session_id);
+        // On interleaved connections, send RTSP teardown after the RTP writer stops.
+        if (h->rtsp_server) {
+            h->rtsp_server->stop();
+        }
+        if (h->cmd_session) {
+            h->cmd_session->send_close_and_abort();
+        }
+        // 等连接线程完全退出后再由主线程安全 join CmdSession 内部线程并关闭 socket
+        if (h->connect_thread.joinable() && h->connect_thread.get_id() != std::this_thread::get_id()) {
+            h->connect_thread.join();
+        }
+        if (h->cmd_session) {
+            h->cmd_session->disconnect();
+        }
+    };
+    if (detached.size() == 1) {
+        cleanup(detached.front());
+    } else if (!detached.empty()) {
+        // Independent receivers must not accumulate each other's shutdown timeouts.
+        std::vector<std::future<void>> tasks;
+        tasks.reserve(detached.size());
+        for (const auto& h : detached) {
+            tasks.push_back(std::async(std::launch::async, cleanup, h));
+        }
+        for (auto& task : tasks) task.get();
+    }
+    detached.clear();
+}
+
 bool MultiRoomEngine::add_device_to_group(const std::string& device_id) {
+    std::vector<std::shared_ptr<SessionHandle>> detached;
+    bool ok = true;
     {
+        std::lock_guard<std::mutex> lc(lifecycle_mu_);
         std::lock_guard<std::mutex> lock(mu_);
         auto it = devices_.find(device_id);
         if (it == devices_.end()) return false;
         it->second.in_group = true;
         if (multiroom_running_) {
-            attach_device_stream_locked(it->second);
+            ok = attach_device_stream_locked(it->second, detached);
         }
     }
+    cleanup_detached(detached);
     emit_state_changed();
-    return true;
+    return ok;
 }
 
 bool MultiRoomEngine::remove_device_from_group(const std::string& device_id) {
+    std::vector<std::shared_ptr<SessionHandle>> detached;
     {
-        std::lock_guard<std::mutex> lock(mu_);
-        auto it = devices_.find(device_id);
-        if (it == devices_.end()) return false;
-        it->second.in_group = false;
-        if (multiroom_running_) {
-            detach_device_stream_locked(it->second);
+        std::lock_guard<std::mutex> lc(lifecycle_mu_);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto it = devices_.find(device_id);
+            if (it == devices_.end()) return false;
+            it->second.in_group = false;
+            detach_device_stream_locked(it->second, detached);
         }
+        cleanup_detached(detached);
     }
     emit_state_changed();
     return true;
@@ -401,7 +557,7 @@ bool MultiRoomEngine::set_device_volume(const std::string& device_id, int32_t vo
         auto it = devices_.find(device_id);
         if (it == devices_.end()) return false;
         it->second.volume = volume_0_100;
-        s = it->second.cmd_session;
+        if (it->second.session) s = it->second.session->cmd_session;
     }
     if (s && s->is_connected()) s->send_set_volume(volume_0_100);
     emit_state_changed();
@@ -417,8 +573,8 @@ void MultiRoomEngine::set_master_volume(int32_t volume_0_100) {
         for (auto& [_, dev] : devices_) {
             if (!dev.in_group) continue;
             dev.volume = volume_0_100;
-            if (dev.cmd_session && dev.cmd_session->is_connected()) {
-                to_send.emplace_back(dev.cmd_session, dev.volume);
+            if (dev.session && dev.session->cmd_session && dev.session->cmd_session->is_connected()) {
+                to_send.emplace_back(dev.session->cmd_session, dev.volume);
             }
         }
     }
@@ -426,15 +582,22 @@ void MultiRoomEngine::set_master_volume(int32_t volume_0_100) {
     emit_state_changed();
 }
 
-void MultiRoomEngine::set_source_mode(media::AudioSourceMode mode, const std::string& param) {
-    audio_pipeline_.set_source_mode(mode, param);
+bool MultiRoomEngine::set_source_mode(media::AudioSourceMode mode, const std::string& param, std::string* err_out) {
+    std::string err;
+    if (!audio_pipeline_.set_source_mode(mode, param, &err)) {
+        set_last_error(err);
+        if (err_out) *err_out = err;
+        emit_state_changed();
+        return false;
+    }
+    set_last_error("");
     auto meta = audio_pipeline_.current_meta();
     std::vector<std::shared_ptr<cmd::CmdSession>> sessions;
     {
         std::lock_guard<std::mutex> lock(mu_);
         for (auto& [_, dev] : devices_) {
-            if (dev.cmd_session && dev.cmd_session->is_connected()) {
-                sessions.push_back(dev.cmd_session);
+            if (dev.session && dev.session->cmd_session && dev.session->cmd_session->is_connected()) {
+                sessions.push_back(dev.session->cmd_session);
             }
         }
     }
@@ -442,6 +605,7 @@ void MultiRoomEngine::set_source_mode(media::AudioSourceMode mode, const std::st
         s->send_set_media_info(meta.title, meta.artist, meta.album, meta.duration_ms);
     }
     emit_state_changed();
+    return true;
 }
 
 void MultiRoomEngine::push_external_pcm(const int16_t* stereo_pcm, size_t frame_samples) {
@@ -459,13 +623,16 @@ EngineStateSnapshot MultiRoomEngine::snapshot_state() const {
     snap.bind_ip = bind_ip_;
     snap.discovery_running = discovery_running_;
     snap.multiroom_running = multiroom_running_;
+    snap.loopback_supported = media::AudioPipeline::is_loopback_supported();
     snap.timer_service_port = timer_service_.port();
     snap.session_time_offset_us = master_clock_.session_origin_us();
-    snap.sample_rate = sample_rate_;
+    snap.sample_rate = active_audio_cfg_.sample_rate;
     snap.base_play_delay_ms = master_clock_.base_play_delay_ms();
-    snap.prefer_lpcm = prefer_lpcm_;
+    snap.prefer_lpcm = active_audio_cfg_.lpcm;
     snap.master_volume = master_volume_;
     snap.source_mode = audio_pipeline_.source_mode();
+    snap.source_param = audio_pipeline_.source_param();
+    snap.last_error = last_error_;
     snap.track_meta = audio_pipeline_.current_meta();
 
     for (const auto& [_, dev] : devices_) {
@@ -513,6 +680,7 @@ std::string MultiRoomEngine::snapshot_state_json() const {
         << "\"bindIp\":\"" << escape_json(snap.bind_ip) << "\","
         << "\"discoveryRunning\":" << (snap.discovery_running ? "true" : "false") << ","
         << "\"multiroomRunning\":" << (snap.multiroom_running ? "true" : "false") << ","
+        << "\"loopbackSupported\":" << (snap.loopback_supported ? "true" : "false") << ","
         << "\"timerServicePort\":" << snap.timer_service_port << ","
         << "\"sessionTimeOffsetUs\":" << snap.session_time_offset_us << ","
         << "\"sampleRate\":" << snap.sample_rate << ","
@@ -520,6 +688,8 @@ std::string MultiRoomEngine::snapshot_state_json() const {
         << "\"codec\":\"" << (snap.prefer_lpcm ? "LPCM" : "AAC_LC") << "\","
         << "\"masterVolume\":" << snap.master_volume << ","
         << "\"sourceMode\":" << static_cast<int>(snap.source_mode) << ","
+        << "\"sourceParam\":\"" << escape_json(snap.source_param) << "\","
+        << "\"lastError\":\"" << escape_json(snap.last_error) << "\","
         << "\"track\":{"
             << "\"title\":\"" << escape_json(snap.track_meta.title) << "\","
             << "\"artist\":\"" << escape_json(snap.track_meta.artist) << "\","

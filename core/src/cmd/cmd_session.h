@@ -36,8 +36,11 @@ public:
     CmdSession(std::string ip, uint16_t port = 8899);
     ~CmdSession();
 
-    bool connect(CmdSessionCallbacks cbs);
+    bool connect(CmdSessionCallbacks cbs, const std::atomic<bool>* cancelled = nullptr);
+    void abort();
     void disconnect();
+    void close_and_disconnect();
+    void send_close_and_abort();
     bool is_connected() const { return connected_.load(); }
     bool is_safety_enabled() const { return safety_active_.load(); }
     HandshakeStage handshake_stage() const;
@@ -70,7 +73,9 @@ private:
     std::string local_ip_;
     uint16_t local_port_ = 0;
 
+    std::mutex sock_mu_;
     SocketHandle sock_ = kInvalidSocket;
+    std::atomic<bool> aborted_{false};
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<uint16_t> seq_{1};
