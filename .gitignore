@@ -1,0 +1,29 @@
+# Build outputs
+core/build/
+core/build-*/
+desktop/node_modules/
+desktop/dist/
+desktop/release/
+mobile/android/build/
+release/
+
+# Local captures & logs
+captures/
+*.pcap
+*.pcapng
+*.log
+
+# Keys & signing
+*.keystore
+*.jks
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE / OS / Agent local files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.agents/

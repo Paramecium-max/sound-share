@@ -1,0 +1,594 @@
+#include "cmd/cmd_session.h"
+#include "crypto/mini_crypto.h"
+#include "sync/master_clock.h"
+
+#include <chrono>
+#include <cstring>
+
+namespace miplay::cmd {
+
+namespace {
+std::string extract_json_field(const std::string& json, const std::string& key) {
+    std::string pat = "\"" + key + "\"";
+    auto pos = json.find(pat);
+    if (pos == std::string::npos) return "";
+    pos = json.find(':', pos + pat.size());
+    if (pos == std::string::npos) return "";
+    pos = json.find('"', pos + 1);
+    if (pos == std::string::npos) return "";
+    auto end = json.find('"', pos + 1);
+    if (end == std::string::npos) return "";
+    return json.substr(pos + 1, end - pos - 1);
+}
+} // namespace
+
+CmdSession::CmdSession(std::string ip, uint16_t port)
+    : ip_(std::move(ip)), port_(port) {}
+
+CmdSession::~CmdSession() {
+    disconnect();
+}
+
+CmdSession::HandshakeStage CmdSession::handshake_stage() const {
+    std::lock_guard<std::mutex> lk(auth_mu_);
+    return stage_;
+}
+
+void CmdSession::emit_status(const std::string& s) {
+    if (cbs_.on_status) cbs_.on_status(s);
+}
+
+void CmdSession::mark_disconnected(const std::string& reason) {
+    bool was_conn = connected_.exchange(false);
+    {
+        std::lock_guard<std::mutex> lk(auth_mu_);
+        peer_reset_ = true;
+        if (failure_reason_.empty() && !reason.empty()) {
+            failure_reason_ = reason;
+        }
+        if (stage_ != HandshakeStage::ReadySafety && stage_ != HandshakeStage::ReadyLegacy) {
+            stage_ = HandshakeStage::Failed;
+        }
+    }
+    auth_cv_.notify_all();
+    if (was_conn) {
+        if (!reason.empty()) emit_status(reason);
+        if (cbs_.on_state_changed) cbs_.on_state_changed(false);
+    }
+}
+
+bool CmdSession::connect(CmdSessionCallbacks cbs) {
+    disconnect();
+    net::init_network();
+    cbs_ = std::move(cbs);
+
+    emit_status("8899 TCP 建连中...");
+    sock_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_ == kInvalidSocket) {
+        emit_status("8899 Socket 创建失败");
+        return false;
+    }
+
+    net::set_tcp_nodelay(sock_, true);
+
+#ifdef _WIN32
+    DWORD tv = 2500;
+    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
+    struct timeval tv{2, 500000};
+    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port_);
+    if (inet_pton(AF_INET, ip_.c_str(), &addr.sin_addr) != 1) {
+        net::close_socket(sock_);
+        sock_ = kInvalidSocket;
+        emit_status("8899 无效目标 IP");
+        return false;
+    }
+
+    if (::connect(sock_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        net::close_socket(sock_);
+        sock_ = kInvalidSocket;
+        emit_status("8899 TCP 连接失败/超时");
+        return false;
+    }
+
+    struct sockaddr_in local_addr{};
+    socklen_t llen = sizeof(local_addr);
+    if (getsockname(sock_, reinterpret_cast<struct sockaddr*>(&local_addr), &llen) == 0) {
+        char lip[INET_ADDRSTRLEN]{};
+        inet_ntop(AF_INET, &local_addr.sin_addr, lip, sizeof(lip));
+        local_ip_ = lip;
+        local_port_ = ntohs(local_addr.sin_port);
+    }
+
+#ifdef _WIN32
+    DWORD rtv = 200;
+    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rtv), sizeof(rtv));
+#else
+    struct timeval rtv{0, 200000};
+    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+#endif
+
+    {
+        std::lock_guard<std::mutex> lk(auth_mu_);
+        stage_ = HandshakeStage::WaitingChallenge;
+        legacy_auth_done_ = false;
+        version_ack_received_ = false;
+        safety_info_ack_received_ = false;
+        safety_info_ok_ = false;
+        peer_challenge_acked_ = false;
+        local_challenge_verified_ = false;
+        peer_reset_ = false;
+        failure_reason_.clear();
+        dec_cipher_locked_ = false;
+        safety_active_.store(false);
+    }
+
+    running_.store(true);
+    connected_.store(true);
+    seq_.store(1);
+    if (cbs_.on_state_changed) cbs_.on_state_changed(true);
+
+    recv_th_ = std::thread(&CmdSession::recv_loop, this);
+
+    // 阶段 1：等待接收端主动下发 0x0028 挑战并完成 0x0029 认证
+    emit_status("8899 等待 0x0028 挑战认证...");
+    {
+        std::unique_lock<std::mutex> lk(auth_mu_);
+        auth_cv_.wait_for(lk, std::chrono::milliseconds(2000), [this]() {
+            return legacy_auth_done_ || !connected_.load();
+        });
+    }
+
+    if (!connected_.load()) {
+        std::string reason;
+        {
+            std::lock_guard<std::mutex> lk(auth_mu_);
+            reason = failure_reason_.empty() ? "8899 挑战认证阶段被接收端断开" : failure_reason_;
+        }
+        emit_status(reason);
+        disconnect();
+        return false;
+    }
+
+    // 发送 GetVersion（无论 0x0028 是否到达都探活版本；若对端在后台被冻结则不会有任何回复）
+    send_get_version("3.1.6030516");
+
+    bool got_any_app_reply = false;
+    {
+        std::unique_lock<std::mutex> lk(auth_mu_);
+        if (!legacy_auth_done_) {
+            auth_cv_.wait_for(lk, std::chrono::milliseconds(1000), [this]() {
+                return legacy_auth_done_ || version_ack_received_ || !connected_.load();
+            });
+        }
+        got_any_app_reply = (legacy_auth_done_ || version_ack_received_);
+    }
+
+    if (!connected_.load() || !got_any_app_reply) {
+        std::string reason;
+        {
+            std::lock_guard<std::mutex> lk(auth_mu_);
+            if (!failure_reason_.empty()) reason = failure_reason_;
+            else reason = "8899 接收端无应用层响应（请确认接收端在前台运行未休眠）";
+            stage_ = HandshakeStage::Failed;
+        }
+        emit_status(reason);
+        disconnect();
+        return false;
+    }
+
+    // 阶段 2：协商 Modern Safety 安全通道
+    {
+        std::lock_guard<std::mutex> lk(auth_mu_);
+        stage_ = HandshakeStage::NegotiatingSafety;
+    }
+    emit_status("8899 协商 Safety 安全通道...");
+    {
+        std::string offer =
+            "{\"aesIvTypes\":\"3\",\"aesKeyTypes\":\"1\",\"authAlgorithmTypes\":\"4\","
+            "\"authKeyTypes\":\"1\",\"integrityTypes\":\"1\"}";
+        auto env = encode_tlv_string("cmd", offer);
+        send_cmd(CmdType::SafetyInfo, env, false);
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(auth_mu_);
+        auth_cv_.wait_for(lk, std::chrono::milliseconds(1500), [this]() {
+            return safety_info_ack_received_ || !connected_.load();
+        });
+    }
+
+    if (!connected_.load()) {
+        std::string reason;
+        {
+            std::lock_guard<std::mutex> lk(auth_mu_);
+            reason = failure_reason_.empty() ? "8899 SafetyInfo 协商阶段连接断开" : failure_reason_;
+            stage_ = HandshakeStage::Failed;
+        }
+        emit_status(reason);
+        disconnect();
+        return false;
+    }
+
+    bool need_safety = false;
+    {
+        std::lock_guard<std::mutex> lk(auth_mu_);
+        need_safety = safety_info_ok_;
+        if (need_safety) stage_ = HandshakeStage::AuthenticatingSafety;
+    }
+
+    if (need_safety) {
+        emit_status("8899 正在完成 Safety 双向认证...");
+        bool mutual_ok = false;
+        {
+            std::unique_lock<std::mutex> lk(auth_mu_);
+            auth_cv_.wait_for(lk, std::chrono::milliseconds(2500), [this]() {
+                return (peer_challenge_acked_ && local_challenge_verified_) || !connected_.load();
+            });
+            mutual_ok = (peer_challenge_acked_ && local_challenge_verified_ && connected_.load());
+            if (mutual_ok) {
+                stage_ = HandshakeStage::ReadySafety;
+                safety_active_.store(true);
+            } else {
+                stage_ = HandshakeStage::Failed;
+                if (failure_reason_.empty()) {
+                    if (!connected_.load()) failure_reason_ = "8899 SafetyAuth 阶段被远端重置/断开 (RST)";
+                    else if (!peer_challenge_acked_) failure_reason_ = "8899 SafetyAuth 未能解密对端 0x1402 挑战";
+                    else failure_reason_ = "8899 SafetyAuth 等待对端 0x1403 确认超时";
+                }
+            }
+        }
+        if (!mutual_ok) {
+            std::string reason;
+            {
+                std::lock_guard<std::mutex> lk(auth_mu_);
+                reason = failure_reason_;
+            }
+            emit_status(reason);
+            disconnect();
+            return false;
+        }
+        emit_status("8899 Safety 双向加密认证通过");
+    } else {
+        {
+            std::lock_guard<std::mutex> lk(auth_mu_);
+            stage_ = HandshakeStage::ReadyLegacy;
+        }
+        emit_status("8899 Legacy 认证通过（明文通道）");
+    }
+
+    hb_th_ = std::thread(&CmdSession::heartbeat_loop, this);
+    return true;
+}
+
+void CmdSession::disconnect() {
+    if (!running_.exchange(false)) return;
+    bool was_conn = connected_.exchange(false);
+    auth_cv_.notify_all();
+    if (sock_ != kInvalidSocket) {
+        net::close_socket(sock_);
+        sock_ = kInvalidSocket;
+    }
+    if (recv_th_.joinable()) recv_th_.join();
+    if (hb_th_.joinable()) hb_th_.join();
+    if (was_conn && cbs_.on_state_changed) cbs_.on_state_changed(false);
+}
+
+bool CmdSession::send_raw_locked(uint16_t cmd_type, uint16_t seq, const std::vector<uint8_t>& payload) {
+    if (!connected_.load() || sock_ == kInvalidSocket) return false;
+    CmdFrame f;
+    f.cmd_type = cmd_type;
+    f.seq = seq;
+    f.payload = payload;
+    auto wire = encode_frame(f);
+    return net::send_all(sock_, wire.data(), wire.size());
+}
+
+bool CmdSession::send_cmd(CmdType type, const std::vector<uint8_t>& raw_payload, bool allow_encrypt) {
+    if (!connected_.load()) return false;
+    std::lock_guard<std::mutex> lock(send_mu_);
+    uint16_t s = seq_.fetch_add(1);
+    std::vector<uint8_t> payload = raw_payload;
+    if (allow_encrypt && safety_active_.load() && enc_cipher_.is_ready()) {
+        payload = enc_cipher_.encrypt_blob(raw_payload);
+    }
+    return send_raw_locked(static_cast<uint16_t>(type), s, payload);
+}
+
+bool CmdSession::send_get_version(const std::string& ver) {
+    std::vector<uint8_t> p(ver.begin(), ver.end());
+    p.push_back(0x00);
+    return send_cmd(CmdType::GetVersion, p, false);
+}
+
+bool CmdSession::send_get_device_info() {
+    return send_cmd(CmdType::GetDeviceInfo, {}, true);
+}
+
+bool CmdSession::send_set_local_device_info(const std::string& source_name) {
+    std::string json = "{\"sourceName\":\"" + source_name + "\"}";
+    std::vector<uint8_t> p(json.begin(), json.end());
+    return send_cmd(CmdType::SetLocalDeviceInfo, p, true);
+}
+
+bool CmdSession::send_set_play_source(int play_source) {
+    std::string json = "{\"playSource\":" + std::to_string(play_source) + "}";
+    std::vector<uint8_t> p(json.begin(), json.end());
+    return send_cmd(CmdType::SetPlaySource, p, true);
+}
+
+bool CmdSession::send_open_device(const std::string& sender_ip, uint16_t rtsp_port, int mirror_mode) {
+    auto st = handshake_stage();
+    if (st != HandshakeStage::ReadySafety && st != HandshakeStage::ReadyLegacy) {
+        return false;
+    }
+
+    send_set_local_device_info("MiPlay MultiRoom");
+    send_set_play_source(1);
+
+    std::string url = "wfd://" + sender_ip + ":" + std::to_string(rtsp_port) +
+                      "?mirrorMode=" + std::to_string(mirror_mode);
+    std::vector<uint8_t> p(url.begin(), url.end());
+    p.push_back(0x00);
+    bool ok = send_cmd(CmdType::Open, p, true);
+    if (ok) emit_status("已发 Open(" + sender_ip + ":" + std::to_string(rtsp_port) + ")，等待设备反连 RTSP...");
+    return ok;
+}
+
+bool CmdSession::send_close_device() {
+    return send_cmd(CmdType::Close, {}, true);
+}
+
+bool CmdSession::send_resume() {
+    return send_cmd(CmdType::Resume, {}, true);
+}
+
+bool CmdSession::send_pause() {
+    return send_cmd(CmdType::Pause, {}, true);
+}
+
+bool CmdSession::send_heartbeat() {
+    return send_cmd(CmdType::HeartBeat, {}, true);
+}
+
+bool CmdSession::send_set_volume(int volume_0_100) {
+    if (volume_0_100 < 0) volume_0_100 = 0;
+    if (volume_0_100 > 100) volume_0_100 = 100;
+    // 4 字节大端整数 (如 41% -> 00 00 00 29)，实测同时兼容 SoundFlow 1.1.2 与小米 MiPCAudio / 开源接收端
+    return send_cmd(CmdType::SetVolume, encode_u32_be(static_cast<uint32_t>(volume_0_100)), true);
+}
+
+bool CmdSession::send_set_position_ms(uint64_t position_ms) {
+    std::vector<uint8_t> p(8, 0);
+    for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>((position_ms >> (8 * i)) & 0xFF);
+    return send_cmd(CmdType::SetPosition, p, true);
+}
+
+bool CmdSession::send_set_media_info(const std::string& title, const std::string& artist,
+                                     const std::string& album, uint64_t duration_ms) {
+    std::string json = "{\"title\":\"" + title + "\",\"artist\":\"" + artist +
+                       "\",\"album\":\"" + album + "\",\"mTitle\":\"" + title +
+                       "\",\"mArtist\":\"" + artist + "\",\"mAlbum\":\"" + album +
+                       "\",\"mDuration\":" + std::to_string(duration_ms) + "}";
+    std::vector<uint8_t> p(json.begin(), json.end());
+    return send_cmd(CmdType::SetMediaInfo, p, true);
+}
+
+void CmdSession::handle_incoming_frame(const CmdFrame& f) {
+    if (f.cmd_type == static_cast<uint16_t>(CmdType::Challenge)) {
+        // 已完成握手进入业务态时忽略迟到的挑战帧，避免打乱会话
+        {
+            std::lock_guard<std::mutex> alk(auth_mu_);
+            if (stage_ == HandshakeStage::ReadySafety || stage_ == HandshakeStage::ReadyLegacy) return;
+        }
+        auto resp = compute_legacy_challenge_response(f.payload);
+        {
+            std::lock_guard<std::mutex> slk(send_mu_);
+            send_raw_locked(static_cast<uint16_t>(CmdType::ChallengeAck), f.seq, resp);
+        }
+        {
+            std::lock_guard<std::mutex> alk(auth_mu_);
+            legacy_auth_done_ = true;
+        }
+        auth_cv_.notify_all();
+        return;
+    }
+
+    if (f.cmd_type == static_cast<uint16_t>(CmdType::GetVersionAck)) {
+        {
+            std::lock_guard<std::mutex> alk(auth_mu_);
+            version_ack_received_ = true;
+        }
+        auth_cv_.notify_all();
+        if (cbs_.on_version) {
+            std::string v(reinterpret_cast<const char*>(f.payload.data()), f.payload.size());
+            while (!v.empty() && v.back() == '\0') v.pop_back();
+            cbs_.on_version(v);
+        }
+        return;
+    }
+
+    if (f.cmd_type == static_cast<uint16_t>(CmdType::SafetyInfoAck)) {
+        {
+            std::lock_guard<std::mutex> alk(auth_mu_);
+            if (stage_ != HandshakeStage::NegotiatingSafety) return;
+        }
+        auto json_opt = decode_tlv_string(f.payload);
+        if (!json_opt) {
+            std::lock_guard<std::mutex> alk(auth_mu_);
+            safety_info_ack_received_ = true;
+            safety_info_ok_ = false;
+            auth_cv_.notify_all();
+            return;
+        }
+        std::string res = extract_json_field(*json_opt, "result");
+        if (res != "0") {
+            std::lock_guard<std::mutex> alk(auth_mu_);
+            safety_info_ack_received_ = true;
+            safety_info_ok_ = false;
+            auth_cv_.notify_all();
+            return;
+        }
+
+        // 派生 Type-1 密钥材料（receiverIP + receiverPort + senderIP + senderPort）
+        auth_key_ = derive_type1_auth_key(ip_, port_, local_ip_, local_port_);
+        const uint8_t* key16 = reinterpret_cast<const uint8_t*>(auth_key_.data());
+        const uint8_t* iv_t1 = reinterpret_cast<const uint8_t*>(auth_key_.data());
+        const uint8_t* iv_t2 = reinterpret_cast<const uint8_t*>(auth_key_.data() + 16);
+
+        // 真机实证：即使 0x1401 协商 aesIvType="2"，小米原生/SoundFlow 接收端双向均以 iv_t1 (authKey[0:16]) 为初始 CBC IV
+        // 开源 miplay-bridge 入向同样支持 iv_t1 (type-1-compat) 自动探测，因此发送端固定使用 iv_t1 实现全设备 100% 互通
+        {
+            std::lock_guard<std::mutex> slk(send_mu_);
+            enc_cipher_.init(key16, iv_t1);
+            dec_cand_type1_.init(key16, iv_t1);
+            dec_cand_type2_.init(key16, iv_t2);
+            dec_cipher_locked_ = false;
+
+            std::string ts_str = std::to_string(sync::monotonic_now_us());
+            auto md = crypto::md5(reinterpret_cast<const uint8_t*>(ts_str.data()), ts_str.size());
+            local_auth_msg_ = crypto::hex_lower(md.data(), md.size());
+            std::string ch_json = "{\"authMsg\":\"" + local_auth_msg_ + "\"}";
+            auto env = encode_tlv_string("cmd", ch_json);
+            auto blob = enc_cipher_.encrypt_blob(env);
+            send_raw_locked(static_cast<uint16_t>(CmdType::SafetyAuth), seq_.fetch_add(1), blob);
+        }
+
+        {
+            std::lock_guard<std::mutex> alk(auth_mu_);
+            safety_info_ack_received_ = true;
+            safety_info_ok_ = true;
+            stage_ = HandshakeStage::AuthenticatingSafety;
+        }
+        auth_cv_.notify_all();
+        return;
+    }
+
+    if (f.cmd_type == static_cast<uint16_t>(CmdType::SafetyAuth) ||
+        f.cmd_type == static_cast<uint16_t>(CmdType::SafetyAuthAck)) {
+        std::optional<std::vector<uint8_t>> plain;
+        std::optional<std::string> json_opt;
+
+        if (dec_cipher_locked_) {
+            plain = dec_cipher_.decrypt_blob(f.payload);
+            if (plain) json_opt = decode_tlv_string(*plain);
+        } else {
+            SafetyCipher c1 = dec_cand_type1_;
+            if (auto p1 = c1.decrypt_blob(f.payload)) {
+                if (auto j1 = decode_tlv_string(*p1)) {
+                    dec_cipher_ = c1;
+                    dec_cipher_locked_ = true;
+                    json_opt = j1;
+                }
+            }
+            if (!json_opt) {
+                SafetyCipher c2 = dec_cand_type2_;
+                if (auto p2 = c2.decrypt_blob(f.payload)) {
+                    if (auto j2 = decode_tlv_string(*p2)) {
+                        dec_cipher_ = c2;
+                        dec_cipher_locked_ = true;
+                        json_opt = j2;
+                    }
+                }
+            }
+        }
+
+        if (!json_opt) {
+            std::lock_guard<std::mutex> alk(auth_mu_);
+            if (failure_reason_.empty()) {
+                failure_reason_ = "8899 SafetyAuth 解密或 TLV 解析失败";
+            }
+            return;
+        }
+
+        if (f.cmd_type == static_cast<uint16_t>(CmdType::SafetyAuth)) {
+            std::string peer_msg = extract_json_field(*json_opt, "authMsg");
+            if (!peer_msg.empty()) {
+                auto mac = crypto::hmac_sha256(
+                    reinterpret_cast<const uint8_t*>(auth_key_.data()), auth_key_.size(),
+                    reinterpret_cast<const uint8_t*>(peer_msg.data()), peer_msg.size());
+                std::string ack_digest = crypto::hex_lower(mac.data(), mac.size());
+                std::string ack_json = "{\"result\":\"0\",\"authMsgAck\":\"" + ack_digest + "\"}";
+                auto env = encode_tlv_string("ack", ack_json);
+                {
+                    std::lock_guard<std::mutex> slk(send_mu_);
+                    auto blob = enc_cipher_.encrypt_blob(env);
+                    send_raw_locked(static_cast<uint16_t>(CmdType::SafetyAuthAck), f.seq, blob);
+                }
+                {
+                    std::lock_guard<std::mutex> alk(auth_mu_);
+                    peer_challenge_acked_ = true;
+                }
+                auth_cv_.notify_all();
+            }
+        } else {
+            std::string res = extract_json_field(*json_opt, "result");
+            if (res == "0" || res == "1") {
+                std::lock_guard<std::mutex> alk(auth_mu_);
+                local_challenge_verified_ = true;
+                auth_cv_.notify_all();
+            }
+        }
+        return;
+    }
+
+    CmdFrame out = f;
+    if (safety_active_.load() && dec_cipher_locked_ && f.payload.size() >= 25) {
+        if (auto p = dec_cipher_.decrypt_blob(f.payload)) {
+            out.payload = std::move(*p);
+        }
+    }
+    if (cbs_.on_frame) cbs_.on_frame(out);
+}
+
+void CmdSession::recv_loop() {
+    std::vector<uint8_t> acc;
+    acc.reserve(8192);
+    uint8_t tmp[4096];
+
+    while (running_.load()) {
+        auto n = recv(sock_, reinterpret_cast<char*>(tmp), sizeof(tmp), 0);
+        if (n > 0) {
+            acc.insert(acc.end(), tmp, tmp + n);
+            std::vector<CmdFrame> frames;
+            size_t consumed = decode_frames(acc.data(), acc.size(), frames);
+            if (consumed > 0) {
+                acc.erase(acc.begin(), acc.begin() + static_cast<ptrdiff_t>(consumed));
+            }
+            for (const auto& f : frames) {
+                handle_incoming_frame(f);
+            }
+        } else if (n == 0) {
+            mark_disconnected("8899 连接被远端关闭 (FIN)");
+            break;
+        } else {
+            if (net::last_socket_error_is_timeout()) {
+                continue;
+            }
+            int err = net::last_socket_error_code();
+            mark_disconnected("8899 连接被远端重置/断开 (err=" + std::to_string(err) + ")");
+            break;
+        }
+    }
+}
+
+void CmdSession::heartbeat_loop() {
+    for (int tick = 0; running_.load() && connected_.load(); ++tick) {
+        if (tick > 0 && tick % 50 == 0) {
+            if (!send_heartbeat()) {
+                mark_disconnected("8899 心跳发送失败，连接已断开");
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+} // namespace miplay::cmd
