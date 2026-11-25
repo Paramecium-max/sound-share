@@ -58,12 +58,27 @@ MasterMediaClock::FrameTimestamps MasterMediaClock::next_frame_timestamps(uint32
                              ((delay_us * 90ULL) / 1000ULL);
 
     FrameTimestamps out;
+    out.linear_pts_90khz = pts_90k;
     out.pts_90khz = pts_90k & ((1ULL << 33) - 1);
     out.rtp_ts_90khz = static_cast<uint32_t>(pts_90k & 0xFFFFFFFFULL);
     out.play_target_us = origin_us_ + pts_us;
 
     total_samples_ += frame_samples;
     return out;
+}
+
+void MasterMediaClock::catch_up_to_now(uint32_t frame_samples, uint64_t now_us) {
+    if (frame_samples == 0) return;
+    if (now_us == 0) now_us = monotonic_now_us();
+    std::lock_guard<std::mutex> lock(mu_);
+    if (origin_us_ == 0 || now_us <= origin_us_) return;
+    const uint64_t elapsed_us = now_us - origin_us_;
+    const uint64_t expected_samples = (elapsed_us * sample_rate_) / 1000000ULL;
+    // 稳态允许 3 帧以内的微抖裕量；一旦因声卡重路由或系统卡顿滞后超过 3 帧，立即按整帧边界追齐墙钟
+    const uint64_t tolerance = static_cast<uint64_t>(frame_samples) * 3ULL;
+    if (expected_samples > total_samples_ + tolerance) {
+        total_samples_ = (expected_samples / frame_samples) * frame_samples;
+    }
 }
 
 int64_t MasterMediaClock::us_to_90khz(int64_t delta_us) {

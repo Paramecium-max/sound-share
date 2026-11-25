@@ -4,11 +4,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$ROOT/../.." && pwd)"
 TOOLS="${TOOLS_DIR:-$(cd "$REPO/.." && pwd)/tools}"
-JDK="${JAVA_HOME:-$TOOLS/jdk17/usr/lib/jvm/java-17-openjdk-amd64}"
+if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/javac" ]; then
+    JDK="$JAVA_HOME"
+elif [ -x "$TOOLS/jdk17/usr/lib/jvm/java-17-openjdk-amd64/bin/javac" ]; then
+    JDK="$TOOLS/jdk17/usr/lib/jvm/java-17-openjdk-amd64"
+else
+    JDK="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+fi
 export JAVA_HOME="$JDK"
 export PATH="$JDK/bin:$PATH"
 
-SDK="${ANDROID_SDK_ROOT:-$TOOLS/android-sdk}"
+if [ -n "${ANDROID_SDK_ROOT:-}" ] && [ -d "${ANDROID_SDK_ROOT}" ]; then
+    SDK="$ANDROID_SDK_ROOT"
+elif [ -d "$TOOLS/android-sdk" ]; then
+    SDK="$TOOLS/android-sdk"
+else
+    SDK="${ANDROID_HOME:-$HOME/Android/Sdk}"
+fi
 ANDROID_JAR="$SDK/platforms/android-34/android.jar"
 AAPT2="$SDK/build-tools/34.0.0/aapt2"
 D8="$SDK/build-tools/34.0.0/d8"

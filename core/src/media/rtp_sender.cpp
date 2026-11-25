@@ -12,42 +12,85 @@ constexpr size_t kMaxTsPerRtp = 7; // 7 * 188 = 1316 bytes < MTU 1500
 } // namespace
 
 void MultiAudioSender::ActiveTarget::start_writer() {
-    // The RTSP server may still need this TCP connection for teardown.
     if (tcp_data_sock != kInvalidSocket) {
-        net::set_socket_timeout(tcp_data_sock, SO_SNDTIMEO, 100);
+        net::set_tcp_nodelay(tcp_data_sock, true);
+        net::set_socket_timeout(tcp_data_sock, SO_SNDTIMEO, 120);
     }
     writer_th = std::thread([this]() {
+        TsPacketizer packetizer(stream_type);
+        uint16_t rtp_seq = 0;
+        int64_t last_pts_90k = -1;
+        const int64_t min_frame_step_90k = (stream_type == TsAudioStreamType::WfdLpcm) ? 900 : 1920;
         int consecutive_timeouts = 0;
+        std::vector<uint8_t> wire_batch;
+        wire_batch.reserve(3072);
+
         while (!stop_requested.load() && healthy.load()) {
-            QueuedUnit unit;
+            QueuedFrame frame;
             {
                 std::unique_lock<std::mutex> lk(q_mu);
                 q_cv.wait(lk, [this]() {
                     return stop_requested.load() || !healthy.load() || !queue.empty();
                 });
                 if (stop_requested.load() || !healthy.load()) break;
-                unit = std::move(queue.front());
+                frame = std::move(queue.front());
                 queue.pop_front();
             }
+            if (!frame.payload || frame.payload->empty()) continue;
 
-            for (const auto& pkt : unit.rtp_packets) {
-                if (stop_requested.load()) break;
-                if (!net::send_all(tcp_data_sock, pkt.data(), pkt.size())) {
-                    if (net::last_socket_error_is_timeout() && !stop_requested.load()) {
-                        ++consecutive_timeouts;
-                        dropped_frames.fetch_add(1);
-                        needs_resync.store(true);
-                        if (consecutive_timeouts >= 4) {
-                            healthy.store(false);
-                        }
-                        break;
-                    }
+            const int32_t bias_ms = delay_bias_ms.load();
+            const int64_t delta_90k = sync::MasterMediaClock::us_to_90khz(
+                static_cast<int64_t>(bias_ms) * 1000LL);
+            int64_t adj_pts = std::max<int64_t>(0, static_cast<int64_t>(frame.base_pts_90khz) + delta_90k);
+
+            // 动态下调主延迟或单设备偏置时，跳过与已发送音频时间重叠的帧，杜绝 PTS 倒流且不消耗 CC/RTP Seq
+            if (last_pts_90k >= 0 && adj_pts < last_pts_90k + min_frame_step_90k) {
+                dropped_frames.fetch_add(1);
+                force_pat_pmt.store(true);
+                continue;
+            }
+
+            // 保存打包前状态：若首字节即发生写超时，无损回滚 CC 与 RTP Seq，确保恢复帧在线上 100% 连续无断号
+            const TsPacketizer saved_pack = packetizer;
+            const uint16_t saved_seq = rtp_seq;
+            const bool need_pat = force_pat_pmt.exchange(false);
+
+            auto ts_bytes = packetizer.packetize_audio_frame(
+                frame.payload->data(), frame.payload->size(), static_cast<uint64_t>(adj_pts), need_pat);
+            const uint32_t rtp_ts = static_cast<uint32_t>(static_cast<uint64_t>(adj_pts) & 0xFFFFFFFFULL);
+
+            wire_batch.clear();
+            uint32_t pkt_cnt = 0;
+            const size_t chunk_max = kMaxTsPerRtp * kTsPktSize;
+            for (size_t off = 0; off < ts_bytes.size(); off += chunk_max) {
+                const size_t len = std::min(chunk_max, ts_bytes.size() - off);
+                auto pkt = build_rtp_over_tcp_packet(rtp_seq++, rtp_ts, ts_bytes.data() + off, len);
+                wire_batch.insert(wire_batch.end(), pkt.begin(), pkt.end());
+                ++pkt_cnt;
+            }
+
+            if (stop_requested.load()) break;
+            const auto send_res = net::send_all_checked(tcp_data_sock, wire_batch.data(), wire_batch.size());
+            if (send_res == net::SendAllStatus::Ok) {
+                consecutive_timeouts = 0;
+                last_pts_90k = adj_pts;
+                rtp_seq_snap.store(rtp_seq);
+                packets_sent.fetch_add(pkt_cnt);
+                bytes_sent.fetch_add(wire_batch.size());
+            } else if (send_res == net::SendAllStatus::TimeoutClean && !stop_requested.load()) {
+                // 尚未向 TCP 流写入任何字节，流帧边界 100% 完好：回滚序列号与 CC，整帧安全丢弃
+                packetizer = saved_pack;
+                rtp_seq = saved_seq;
+                force_pat_pmt.store(true);
+                dropped_frames.fetch_add(1);
+                if (++consecutive_timeouts >= 5) {
                     healthy.store(false);
                     break;
                 }
-                consecutive_timeouts = 0;
-                packets_sent.fetch_add(1);
-                bytes_sent.fetch_add(pkt.size());
+            } else {
+                // 连接已断，或发生半包写出后持续超时（TCP 帧边界已损坏），立即隔离该目标绝不继续发脏包
+                healthy.store(false);
+                break;
             }
         }
     });
@@ -58,6 +101,7 @@ void MultiAudioSender::ActiveTarget::stop_and_join() {
         std::lock_guard<std::mutex> lock(q_mu);
         stop_requested.store(true);
         healthy.store(false);
+        queue.clear();
     }
     if (owns_socket && tcp_data_sock != kInvalidSocket) {
         net::shutdown_socket(tcp_data_sock);
@@ -77,12 +121,6 @@ MultiAudioSender::~MultiAudioSender() {
 void MultiAudioSender::set_stream_type(TsAudioStreamType type) {
     std::lock_guard<std::mutex> lock(mu_);
     stream_type_ = type;
-    shared_packetizer_.set_stream_type(type);
-    shared_packetizer_.reset();
-    for (auto& [_, p] : biased_packetizers_) {
-        p.set_stream_type(type);
-        p.reset();
-    }
 }
 
 void MultiAudioSender::add_or_update_target(
@@ -111,15 +149,13 @@ void MultiAudioSender::add_or_update_target(
         node->peer_ip = peer_ip;
         node->tcp_data_sock = data_sock;
         node->owns_socket = owns_socket;
+        node->stream_type = stream_type_;
         node->delay_bias_ms.store(std::clamp(delay_bias_ms, -300, 300));
         node->healthy.store(data_sock != kInvalidSocket);
         if (data_sock != kInvalidSocket) {
             node->start_writer();
         }
         targets_[device_id] = std::move(node);
-        if (delay_bias_ms != 0) {
-            biased_packetizers_[device_id] = TsPacketizer(stream_type_);
-        }
     }
     if (replaced) replaced->stop_and_join();
 }
@@ -135,7 +171,6 @@ void MultiAudioSender::remove_target(const std::string& device_id, uint64_t sess
             }
             removed = std::move(it->second);
             targets_.erase(it);
-            biased_packetizers_.erase(device_id);
         }
     }
     if (removed) removed->stop_and_join();
@@ -147,9 +182,6 @@ void MultiAudioSender::set_target_delay_bias(const std::string& device_id, int32
     auto it = targets_.find(device_id);
     if (it != targets_.end()) {
         it->second->delay_bias_ms.store(delay_bias_ms);
-        if (delay_bias_ms != 0 && biased_packetizers_.find(device_id) == biased_packetizers_.end()) {
-            biased_packetizers_[device_id] = TsPacketizer(stream_type_);
-        }
     }
 }
 
@@ -162,7 +194,6 @@ void MultiAudioSender::clear_all() {
             to_stop.push_back(std::move(node));
         }
         targets_.clear();
-        biased_packetizers_.clear();
     }
     for (auto& node : to_stop) {
         if (node) node->stop_and_join();
@@ -178,7 +209,7 @@ bool MultiAudioSender::has_streaming_target() const {
     std::lock_guard<std::mutex> lock(mu_);
     return std::any_of(targets_.begin(), targets_.end(), [](const auto& entry) {
         const auto& target = *entry.second;
-        return target.healthy.load() && target.packets_sent.load() > 0;
+        return target.healthy.load() && target.tcp_data_sock != kInvalidSocket;
     });
 }
 
@@ -216,63 +247,26 @@ void MultiAudioSender::broadcast_audio_frame(
     const uint8_t* audio_payload,
     size_t payload_len,
     uint64_t base_pts_90khz,
-    uint32_t base_rtp_ts_90khz) {
+    uint32_t /*base_rtp_ts_90khz*/) {
+    if (!audio_payload || payload_len == 0) return;
     std::lock_guard<std::mutex> lock(mu_);
     if (targets_.empty()) return;
 
-    std::vector<uint8_t> shared_ts;
-    bool built_shared = false;
+    // 共享不可变载荷，零拷贝入队各设备独立发送通道
+    auto shared_payload = std::make_shared<const std::vector<uint8_t>>(audio_payload, audio_payload + payload_len);
 
-    for (auto& [id, node] : targets_) {
+    for (auto& [_, node] : targets_) {
         if (!node->healthy.load() || node->stop_requested.load() || node->tcp_data_sock == kInvalidSocket) {
             continue;
         }
-
-        const int32_t bias_ms = node->delay_bias_ms.load();
-        const bool need_resync = node->needs_resync.exchange(false);
-        const std::vector<uint8_t>* ts_ptr = nullptr;
-        std::vector<uint8_t> local_ts;
-        uint32_t node_rtp_ts = base_rtp_ts_90khz;
-
-        if (bias_ms == 0 && !need_resync) {
-            if (!built_shared) {
-                shared_ts = shared_packetizer_.packetize_audio_frame(
-                    audio_payload, payload_len, base_pts_90khz);
-                built_shared = true;
-            }
-            ts_ptr = &shared_ts;
-        } else {
-            int64_t delta_90k = sync::MasterMediaClock::us_to_90khz(
-                static_cast<int64_t>(bias_ms) * 1000LL);
-            int64_t adj_pts = static_cast<int64_t>(base_pts_90khz) + delta_90k;
-            if (adj_pts < 0) adj_pts = 0;
-            node_rtp_ts = static_cast<uint32_t>(static_cast<uint64_t>(adj_pts) & 0xFFFFFFFFULL);
-            auto& pack = biased_packetizers_[id];
-            if (need_resync) {
-                pack.set_stream_type(stream_type_);
-                pack.reset(); // 强制下一帧带 PAT/PMT/PCR，实现干净 TS 边界恢复
-            }
-            local_ts = pack.packetize_audio_frame(
-                audio_payload, payload_len, static_cast<uint64_t>(adj_pts));
-            ts_ptr = &local_ts;
-        }
-
-        QueuedUnit unit;
-        const size_t chunk_max = kMaxTsPerRtp * kTsPktSize;
-        for (size_t off = 0; off < ts_ptr->size(); off += chunk_max) {
-            size_t len = std::min(chunk_max, ts_ptr->size() - off);
-            unit.rtp_packets.push_back(build_rtp_over_tcp_packet(
-                node->rtp_seq++, node_rtp_ts, ts_ptr->data() + off, len));
-        }
-
         {
             std::lock_guard<std::mutex> qlk(node->q_mu);
             while (node->queue.size() >= kMaxQueuedFramesPerTarget) {
-                node->queue.pop_front(); // 淘汰最旧整帧（保持 TS/PES 完整边界）
+                node->queue.pop_front(); // 打包前淘汰旧帧，线上 CC 与 RTP Seq 保持连续不断号
                 node->dropped_frames.fetch_add(1);
-                node->needs_resync.store(true);
+                node->force_pat_pmt.store(true);
             }
-            node->queue.push_back(std::move(unit));
+            node->queue.push_back(QueuedFrame{shared_payload, base_pts_90khz});
         }
         node->q_cv.notify_one();
     }
@@ -288,6 +282,7 @@ std::vector<MirrorTargetNode> MultiAudioSender::snapshot_nodes() const {
         snap.session_id = n->session_id;
         snap.peer_ip = n->peer_ip;
         snap.tcp_data_sock = n->tcp_data_sock;
+        snap.rtp_seq = n->rtp_seq_snap.load();
         snap.delay_bias_ms = n->delay_bias_ms.load();
         snap.packets_sent = n->packets_sent.load();
         snap.bytes_sent = n->bytes_sent.load();

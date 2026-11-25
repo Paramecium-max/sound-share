@@ -222,4 +222,36 @@ bool send_all(SocketHandle fd, const uint8_t* data, size_t len) {
     return true;
 }
 
+SendAllStatus send_all_checked(SocketHandle fd, const uint8_t* data, size_t len) {
+    size_t sent = 0;
+    int partial_retries = 0;
+    while (sent < len) {
+#ifdef _WIN32
+        int n = send(fd, reinterpret_cast<const char*>(data + sent),
+                     static_cast<int>(len - sent), 0);
+        if (n <= 0) {
+            if (last_socket_error_is_timeout()) {
+                if (sent == 0) return SendAllStatus::TimeoutClean;
+                if (++partial_retries <= 3) continue;
+            }
+            return SendAllStatus::Failed;
+        }
+#else
+        ssize_t n = ::send(fd, data + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (last_socket_error_is_timeout()) {
+                if (sent == 0) return SendAllStatus::TimeoutClean;
+                if (++partial_retries <= 3) continue;
+            }
+            return SendAllStatus::Failed;
+        }
+        if (n == 0) return SendAllStatus::Failed;
+#endif
+        partial_retries = 0;
+        sent += static_cast<size_t>(n);
+    }
+    return SendAllStatus::Ok;
+}
+
 } // namespace miplay::net

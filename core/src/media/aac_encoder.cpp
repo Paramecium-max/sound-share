@@ -36,6 +36,32 @@ std::vector<uint8_t> AacEncoder::wrap_adts(const uint8_t* raw_aac, size_t len, u
     return out;
 }
 
+void AacEncoder::emit_adts_frames(const uint8_t* data, size_t len, uint32_t sample_rate, uint32_t channels, const AdtsCallback& cb) {
+    if (!data || len == 0 || !cb) return;
+    // 若缓冲区已是 ADTS 流（例如 MFT payloadType=1 单次输出 1~N 个拼合 ADTS 帧），按帧头长度逐帧切分回调
+    if (len >= 7 && data[0] == 0xFF && (data[1] & 0xF6) == 0xF0) {
+        size_t offset = 0;
+        size_t emitted = 0;
+        while (offset + 7 <= len && data[offset] == 0xFF && (data[offset + 1] & 0xF6) == 0xF0) {
+            const size_t frame_len =
+                (static_cast<size_t>(data[offset + 3] & 0x03U) << 11) |
+                (static_cast<size_t>(data[offset + 4]) << 3) |
+                (static_cast<size_t>(data[offset + 5] >> 5) & 0x07U);
+            if (frame_len < 7 || offset + frame_len > len) break;
+            std::vector<uint8_t> frame(data + offset, data + offset + frame_len);
+            if ((frame[1] & 0x01U) != 0) {
+                frame[1] = 0xF9; // 统一无 CRC 帧头为 MPEG-2 ADTS 0xF9，对齐真机接收端预期
+            }
+            cb(frame.data(), frame.size());
+            offset += frame_len;
+            ++emitted;
+        }
+        if (emitted > 0) return;
+    }
+    auto wrapped = wrap_adts(data, len, sample_rate, channels);
+    cb(wrapped.data(), wrapped.size());
+}
+
 #ifdef _WIN32
 
 struct AacEncoder::Impl {
@@ -57,7 +83,7 @@ struct AacEncoder::Impl {
     bool ready = false;
     uint32_t sample_rate = 48000;
     uint32_t channels = 2;
-    int64_t sample_time_100ns = 0;
+    uint64_t total_in_frames = 0;
 
     IMFTransform* mft = nullptr;
     DWORD out_buf_size = 8192;
@@ -66,7 +92,7 @@ struct AacEncoder::Impl {
         shutdown();
         sample_rate = sr > 0 ? sr : 48000;
         channels = ch > 0 ? ch : 2;
-        sample_time_100ns = 0;
+        total_in_frames = 0;
 
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         com_inited = SUCCEEDED(hr);
@@ -199,51 +225,61 @@ struct AacEncoder::Impl {
             in_buf->Unlock();
             in_buf->SetCurrentLength(byte_len);
         }
+        auto drain_outputs = [&]() {
+            for (int tries = 0; tries < 8; ++tries) {
+                IMFSample* out_sample = nullptr;
+                IMFMediaBuffer* out_buf = nullptr;
+                if (FAILED(fn_create_sample(&out_sample)) || !out_sample) break;
+                if (FAILED(fn_create_buf(out_buf_size, &out_buf)) || !out_buf) {
+                    out_sample->Release();
+                    break;
+                }
+                out_sample->AddBuffer(out_buf);
+
+                MFT_OUTPUT_DATA_BUFFER odb{};
+                odb.dwStreamID = 0;
+                odb.pSample = out_sample;
+                DWORD status = 0;
+                HRESULT hr = mft->ProcessOutput(0, 1, &odb, &status);
+                if (hr == S_OK) {
+                    IMFMediaBuffer* contig = nullptr;
+                    if (SUCCEEDED(out_sample->ConvertToContiguousBuffer(&contig)) && contig) {
+                        BYTE* d = nullptr;
+                        DWORD cur_len = 0;
+                        if (SUCCEEDED(contig->Lock(&d, nullptr, &cur_len)) && d && cur_len > 0) {
+                            AacEncoder::emit_adts_frames(d, cur_len, sample_rate, channels, cb);
+                            contig->Unlock();
+                        }
+                        contig->Release();
+                    }
+                }
+                if (odb.pEvents) odb.pEvents->Release();
+                out_buf->Release();
+                out_sample->Release();
+                if (hr != S_OK) break;
+            }
+        };
+
         if (SUCCEEDED(fn_create_sample(&in_sample)) && in_sample) {
             in_sample->AddBuffer(in_buf);
-            const int64_t dur = static_cast<int64_t>((frames * 10000000ULL) / sample_rate);
-            in_sample->SetSampleTime(sample_time_100ns);
-            in_sample->SetSampleDuration(dur);
-            sample_time_100ns += dur;
-            mft->ProcessInput(0, in_sample, 0);
+            // 使用累计样点数精确换算 100ns 时间轴，彻底消除 213333.33 截断造成的 MFT 内部时钟漂移与重置
+            const int64_t t0 = static_cast<int64_t>((total_in_frames * 10000000ULL) / sample_rate);
+            total_in_frames += frames;
+            const int64_t t1 = static_cast<int64_t>((total_in_frames * 10000000ULL) / sample_rate);
+            in_sample->SetSampleTime(t0);
+            in_sample->SetSampleDuration(t1 - t0);
+            HRESULT in_hr = mft->ProcessInput(0, in_sample, 0);
+            // 若编码器输出满返回 MF_E_NOTACCEPTING (0xC00D36B5)，先排空输出再重试写入，杜绝丢帧
+            if (in_hr == static_cast<HRESULT>(0xC00D36B5)) {
+                drain_outputs();
+                mft->ProcessInput(0, in_sample, 0);
+            }
             in_sample->Release();
         }
         in_buf->Release();
 
-        // Drain 所有编码完成的 AAC 帧
-        for (int tries = 0; tries < 8; ++tries) {
-            IMFSample* out_sample = nullptr;
-            IMFMediaBuffer* out_buf = nullptr;
-            if (FAILED(fn_create_sample(&out_sample)) || !out_sample) break;
-            if (FAILED(fn_create_buf(out_buf_size, &out_buf)) || !out_buf) {
-                out_sample->Release();
-                break;
-            }
-            out_sample->AddBuffer(out_buf);
-
-            MFT_OUTPUT_DATA_BUFFER odb{};
-            odb.dwStreamID = 0;
-            odb.pSample = out_sample;
-            DWORD status = 0;
-            HRESULT hr = mft->ProcessOutput(0, 1, &odb, &status);
-            if (hr == S_OK) {
-                IMFMediaBuffer* contig = nullptr;
-                if (SUCCEEDED(out_sample->ConvertToContiguousBuffer(&contig)) && contig) {
-                    BYTE* d = nullptr;
-                    DWORD cur_len = 0;
-                    if (SUCCEEDED(contig->Lock(&d, nullptr, &cur_len)) && d && cur_len > 0) {
-                        auto adts = AacEncoder::wrap_adts(d, cur_len, sample_rate, channels);
-                        cb(adts.data(), adts.size());
-                        contig->Unlock();
-                    }
-                    contig->Release();
-                }
-            }
-            if (odb.pEvents) odb.pEvents->Release();
-            out_buf->Release();
-            out_sample->Release();
-            if (hr != S_OK) break;
-        }
+        // Drain 所有编码完成的 AAC 帧，并逐个完整 ADTS 帧独立回调
+        drain_outputs();
     }
 };
 

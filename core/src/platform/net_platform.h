@@ -40,7 +40,14 @@ uint32_t ipv4_to_u32_host_order(const std::string& ipv4);
 std::string u32_host_order_to_ipv4(uint32_t ip);
 std::vector<NetworkInterface> list_ipv4_interfaces();
 std::string pick_default_lan_ipv4();
+enum class SendAllStatus {
+    Ok = 0,
+    TimeoutClean = 1, // 首字节写出前超时，TCP 字节流帧边界完好
+    Failed = 2        // 连接断开，或写出部分字节后持续超时（流已处于半包脏状态）
+};
+
 bool send_all(SocketHandle fd, const uint8_t* data, size_t len);
+SendAllStatus send_all_checked(SocketHandle fd, const uint8_t* data, size_t len);
 bool last_socket_error_is_timeout();
 int last_socket_error_code();
 

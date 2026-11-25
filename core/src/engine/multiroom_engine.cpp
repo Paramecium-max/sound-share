@@ -229,20 +229,25 @@ bool MultiRoomEngine::start_multiroom(bool prefer_lpcm, uint32_t sample_rate, ui
         }
 
         const bool use_aac = !cfg.lpcm && aac_encoder_.is_available();
+        const uint32_t active_rate = cfg.sample_rate;
         audio_pipeline_.start(
             cfg.sample_rate,
             cfg.frame_samples,
-            [this, use_aac](const int16_t* stereo_pcm, size_t samples) {
-                auto ts = master_clock_.next_frame_timestamps(static_cast<uint32_t>(samples));
+            [this, use_aac, active_rate](const int16_t* stereo_pcm, size_t samples) {
+                master_clock_.catch_up_to_now(static_cast<uint32_t>(samples));
                 if (use_aac) {
+                    // 由实际编码产出的每一帧独立申请 +1024 samples (+1920 ticks) 时间戳，杜绝 0 输出丢号与多输出重号
                     aac_encoder_.encode_pcm(stereo_pcm, samples,
-                        [this, ts](const uint8_t* adts, size_t len) {
-                            multi_sender_.broadcast_audio_frame(adts, len, ts.pts_90khz, ts.rtp_ts_90khz);
+                        [this](const uint8_t* adts, size_t len) {
+                            auto ts = master_clock_.next_frame_timestamps(1024);
+                            multi_sender_.broadcast_audio_frame(
+                                adts, len, ts.linear_pts_90khz, ts.rtp_ts_90khz);
                         });
                 } else {
-                    auto lpcm_frame = media::TsPacketizer::wrap_wfd_lpcm(stereo_pcm, samples);
+                    auto ts = master_clock_.next_frame_timestamps(static_cast<uint32_t>(samples));
+                    auto lpcm_frame = media::TsPacketizer::wrap_wfd_lpcm(stereo_pcm, samples, active_rate);
                     multi_sender_.broadcast_audio_frame(
-                        lpcm_frame.data(), lpcm_frame.size(), ts.pts_90khz, ts.rtp_ts_90khz);
+                        lpcm_frame.data(), lpcm_frame.size(), ts.linear_pts_90khz, ts.rtp_ts_90khz);
                 }
             },
             [this](const std::array<float, 16>& levels) {

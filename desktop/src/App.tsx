@@ -849,9 +849,9 @@ export default function App() {
                   测试音
                 </button>
               </div>
-              {state.sourceMode === 2 && loopbackSources.length > 1 && (
+              {state.sourceMode === 2 && loopbackSources.length >= 1 && (
                 <div className="setting-row" style={{ padding: '4px 0 0' }}>
-                  <span className="setting-title">系统环回监听设备</span>
+                  <span className="setting-title">音频输出接管与采集通道</span>
                   <select
                     className="sheet-select"
                     value={selectedLoopback || state.sourceParam || loopbackSources[0]?.id || ''}

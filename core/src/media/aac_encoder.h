@@ -25,6 +25,9 @@ public:
 
     static std::vector<uint8_t> wrap_adts(const uint8_t* raw_aac, size_t len, uint32_t sample_rate, uint32_t channels);
 
+    // 将裸 AAC 或单个/多个拼合的 ADTS 缓冲区逐帧切分并规范化为完整 ADTS 帧依次回调
+    static void emit_adts_frames(const uint8_t* data, size_t len, uint32_t sample_rate, uint32_t channels, const AdtsCallback& cb);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

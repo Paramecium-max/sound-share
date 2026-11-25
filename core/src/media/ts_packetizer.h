@@ -26,8 +26,10 @@ public:
         uint64_t pts_90khz,
         bool force_pat_pmt = false);
 
-    // WFD LPCM 4 字节子头 (Big-Endian 48kHz 16-bit Stereo)
-    static std::vector<uint8_t> wrap_wfd_lpcm(const int16_t* interleaved_stereo, size_t frame_samples);
+    // WFD LPCM 4 字节子头 (Big-Endian 48kHz / 44.1kHz 16-bit Stereo)
+    static std::vector<uint8_t> wrap_wfd_lpcm(const int16_t* interleaved_stereo,
+                                              size_t frame_samples,
+                                              uint32_t sample_rate = 48000);
 
 private:
     void append_pat(std::vector<uint8_t>& out);

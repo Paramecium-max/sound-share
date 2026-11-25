@@ -23,11 +23,15 @@ public:
 
     // 推进 frame_samples 个音频采样，返回这一帧对应的 90kHz PTS (33-bit) 与 RTP timestamp (32-bit)
     struct FrameTimestamps {
-        uint64_t pts_90khz = 0;       // 33-bit MPEG-TS PES PTS
-        uint32_t rtp_ts_90khz = 0;    // 32-bit RTP Timestamp
-        uint64_t play_target_us = 0;  // 绝对物理目标播放时刻 (us, 主时钟域)
+        uint64_t linear_pts_90khz = 0; // 单调无回绕 90kHz 时间戳
+        uint64_t pts_90khz = 0;        // 33-bit MPEG-TS PES PTS
+        uint32_t rtp_ts_90khz = 0;     // 32-bit RTP Timestamp
+        uint64_t play_target_us = 0;   // 绝对物理目标播放时刻 (us, 主时钟域)
     };
     FrameTimestamps next_frame_timestamps(uint32_t frame_samples);
+
+    // 当发生设备重路由、授权等待或进程挂起导致样本时钟明显落后实时墙钟时，按整帧倍数追齐到当前墙钟
+    void catch_up_to_now(uint32_t frame_samples, uint64_t now_us = 0);
 
     // 按绝对微秒偏移转换为 90kHz 增量 (用于单设备延迟微调)
     static int64_t us_to_90khz(int64_t delta_us);

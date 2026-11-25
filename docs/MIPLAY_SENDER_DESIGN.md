@@ -197,7 +197,7 @@ sequenceDiagram
 
 ---
 
-## 5. 工程目录结构与本地 IPC 契约
+## 5. 工程目录结构与本地 IPC 契
 
 ### 5.1 Monorepo 目录结构（工作区 `/home/ty/K90/mishare`）
 

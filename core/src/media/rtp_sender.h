@@ -30,10 +30,13 @@ struct MirrorTargetNode {
     bool owns_socket = true;
 };
 
-// 全屋一源多发 RTP-over-TCP 分发引擎 (支持每设备有界队列、慢接收端隔离、按会话标识原子增删)
+// 全屋一源多发 RTP-over-TCP 分发引擎：
+// - 每设备独立有界队列 + 独立 TsPacketizer（出队发送前才分配 CC 与 RTP Seq，淘汰旧帧零断号）
+// - 首字节超时安全跳过整帧，半包超时严格隔离防 TCP 帧边界错位
+// - PTS 单调防重叠保护，动态调小延迟不倒流
 class MultiAudioSender {
 public:
-    static constexpr size_t kMaxQueuedFramesPerTarget = 16;
+    static constexpr size_t kMaxQueuedFramesPerTarget = 24;
 
     MultiAudioSender() = default;
     ~MultiAudioSender();
@@ -55,7 +58,7 @@ public:
     size_t active_target_count() const;
     bool has_streaming_target() const;
 
-    // 打包并入队到各设备独立有界队列（绝不在音频线程阻塞等待慢接收端 Socket）
+    // 入队原始音频帧载荷与基准 90kHz PTS（不在采集线程执行 TS 拆包或等待慢 Socket）
     void broadcast_audio_frame(
         const uint8_t* audio_payload,
         size_t payload_len,
@@ -72,8 +75,9 @@ public:
     std::vector<MirrorTargetNode> snapshot_nodes() const;
 
 private:
-    struct QueuedUnit {
-        std::vector<std::vector<uint8_t>> rtp_packets;
+    struct QueuedFrame {
+        std::shared_ptr<const std::vector<uint8_t>> payload;
+        uint64_t base_pts_90khz = 0;
     };
 
     struct ActiveTarget {
@@ -82,18 +86,19 @@ private:
         std::string peer_ip;
         SocketHandle tcp_data_sock = kInvalidSocket;
         bool owns_socket = true;
+        TsAudioStreamType stream_type = TsAudioStreamType::WfdLpcm;
         std::atomic<int32_t> delay_bias_ms{0};
         std::atomic<uint64_t> packets_sent{0};
         std::atomic<uint64_t> bytes_sent{0};
         std::atomic<uint64_t> dropped_frames{0};
         std::atomic<bool> healthy{true};
         std::atomic<bool> stop_requested{false};
-        std::atomic<bool> needs_resync{false};
-        uint16_t rtp_seq = 0;
+        std::atomic<bool> force_pat_pmt{true};
+        std::atomic<uint16_t> rtp_seq_snap{0};
 
         std::mutex q_mu;
         std::condition_variable q_cv;
-        std::deque<QueuedUnit> queue;
+        std::deque<QueuedFrame> queue;
         std::thread writer_th;
 
         void start_writer();
@@ -102,9 +107,7 @@ private:
 
     mutable std::mutex mu_;
     TsAudioStreamType stream_type_ = TsAudioStreamType::WfdLpcm;
-    TsPacketizer shared_packetizer_{TsAudioStreamType::WfdLpcm};
     std::map<std::string, std::shared_ptr<ActiveTarget>> targets_;
-    std::map<std::string, TsPacketizer> biased_packetizers_;
 };
 
 } // namespace miplay::media

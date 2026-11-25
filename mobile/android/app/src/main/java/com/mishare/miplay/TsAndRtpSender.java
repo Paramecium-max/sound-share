@@ -27,8 +27,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class TsAndRtpSender {
     public static final int STREAM_ADTS_AAC = 0x0F;
     public static final int STREAM_WFD_LPCM = 0x83;
-    public static final int MAX_QUEUED_FRAMES = 16;
-    private static final int MAX_PENDING_PCM_FRAMES = 4;
+    public static final int MAX_QUEUED_FRAMES = 24;
+    private static final int MAX_PENDING_PCM_FRAMES = 6;
 
     private static final class AudioFrame {
         final byte[] data;
@@ -66,6 +66,7 @@ public class TsAndRtpSender {
         public final AtomicBoolean stopRequested = new AtomicBoolean(false);
         private final ArrayBlockingQueue<AudioFrame> queue = new ArrayBlockingQueue<>(MAX_QUEUED_FRAMES);
         private final TsPacker packer;
+        private final ByteArrayOutputStream wireBatch = new ByteArrayOutputStream(3072);
         private final long frameDuration90k;
         private long lastPts = -1;
         public final Thread writerThread;
@@ -75,12 +76,15 @@ public class TsAndRtpSender {
             this.sessionId = sessionId;
             this.peerIp = ip;
             this.sock = s;
+            try { s.setTcpNoDelay(true); } catch (Exception ignored) {}
+            try { s.setSendBufferSize(Math.max(s.getSendBufferSize(), 65536)); } catch (Exception ignored) {}
             this.out = s.getOutputStream();
             this.delayBiasMs = bias;
             this.packer = new TsPacker(streamType);
             this.frameDuration90k = streamType == STREAM_WFD_LPCM ? 900 : 1920;
             this.writerThread = new Thread(this::writeLoop, "MiPlay-RtpOut-" + id + "-" + sessionId);
             this.writerThread.setDaemon(true);
+            this.writerThread.setPriority(Thread.NORM_PRIORITY + 2);
             this.writerThread.start();
         }
 
@@ -109,31 +113,38 @@ public class TsAndRtpSender {
             }
             lastPts = pts;
             byte[] ts = packer.pack(frame.data, pts);
+            wireBatch.reset();
+            int pktCount = 0;
+            byte[] hdr = new byte[16];
             for (int off = 0; off < ts.length && !stopRequested.get(); off += 7 * 188) {
                 int length = Math.min(7 * 188, ts.length - off);
-                byte[] packet = new byte[16 + length];
                 int size = 12 + length;
                 int seq = rtpSeq++ & 0xFFFF;
-                packet[0] = 0x24;
-                packet[2] = (byte) (size >>> 8);
-                packet[3] = (byte) size;
-                packet[4] = (byte) 0x80;
-                packet[5] = (byte) 0xA1;
-                packet[6] = (byte) (seq >>> 8);
-                packet[7] = (byte) seq;
-                packet[8] = (byte) (pts >>> 24);
-                packet[9] = (byte) (pts >>> 16);
-                packet[10] = (byte) (pts >>> 8);
-                packet[11] = (byte) pts;
-                packet[12] = (byte) 0xDE;
-                packet[13] = (byte) 0xAD;
-                packet[14] = (byte) 0xBE;
-                packet[15] = (byte) 0xEF;
-                System.arraycopy(ts, off, packet, 16, length);
-                out.write(packet);
-                packetsSent++;
+                hdr[0] = 0x24;
+                hdr[1] = 0x00;
+                hdr[2] = (byte) (size >>> 8);
+                hdr[3] = (byte) size;
+                hdr[4] = (byte) 0x80;
+                hdr[5] = (byte) 0xA1;
+                hdr[6] = (byte) (seq >>> 8);
+                hdr[7] = (byte) seq;
+                hdr[8] = (byte) (pts >>> 24);
+                hdr[9] = (byte) (pts >>> 16);
+                hdr[10] = (byte) (pts >>> 8);
+                hdr[11] = (byte) pts;
+                hdr[12] = (byte) 0xDE;
+                hdr[13] = (byte) 0xAD;
+                hdr[14] = (byte) 0xBE;
+                hdr[15] = (byte) 0xEF;
+                wireBatch.write(hdr, 0, 16);
+                wireBatch.write(ts, off, length);
+                pktCount++;
             }
-            out.flush();
+            if (!stopRequested.get() && wireBatch.size() > 0) {
+                wireBatch.writeTo(out);
+                out.flush();
+                packetsSent += pktCount;
+            }
         }
 
         private void enqueueFrame(AudioFrame frame) {
@@ -248,7 +259,7 @@ public class TsAndRtpSender {
 
         byte[] pack(byte[] payload, long pts90k) {
             ByteArrayOutputStream out = new ByteArrayOutputStream(188 * 8);
-            if (frameCounter % 5 == 0) {
+            if (frameCounter % 4 == 0) {
                 appendPat(out);
                 appendPmt(out);
                 appendPcr(out, pts90k);
@@ -446,12 +457,15 @@ public class TsAndRtpSender {
         return out;
     }
 
-    private static byte[] wrapWfdLpcm(byte[] pcmLe) {
+    private static byte[] wrapWfdLpcm(byte[] pcmLe, int sampleRate) {
         byte[] out = new byte[4 + pcmLe.length];
-        out[0] = (byte) 0xA0; out[1] = 0x06; out[2] = 0x00; out[3] = 0x11;
-        for (int i = 0; i + 1 < pcmLe.length; i += 2) {
-            out[4 + i] = pcmLe[i + 1];
-            out[4 + i + 1] = pcmLe[i];
+        out[0] = (byte) 0xA0;
+        out[1] = (byte) 0x06;
+        out[2] = (byte) 0x00;
+        out[3] = (byte) (sampleRate == 44100 ? 0x09 : 0x11);
+        for (int idx = 0; idx + 1 < pcmLe.length; idx += 2) {
+            out[4 + idx] = pcmLe[idx + 1];
+            out[4 + idx + 1] = pcmLe[idx];
         }
         return out;
     }
@@ -472,7 +486,7 @@ public class TsAndRtpSender {
     public void broadcastPcmFrame(byte[] stereoPcmLe, long basePts90k) {
         synchronized (lock) {
             if (useLpcm) {
-                if (!targets.isEmpty()) fanoutEncodedFrame(wrapWfdLpcm(stereoPcmLe), basePts90k);
+                if (!targets.isEmpty()) fanoutEncodedFrame(wrapWfdLpcm(stereoPcmLe, sampleRate), basePts90k);
                 return;
             }
             if (aacEncoder == null) return;

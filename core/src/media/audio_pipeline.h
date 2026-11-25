@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -31,6 +32,46 @@ struct AudioTrackMeta {
 struct LoopbackSourceInfo {
     std::string id;
     std::string label;
+};
+
+// 跨包连续相位线性重采样器（严格保留上一包末样本做跨包边界插值，杜绝分包边界平顶毛刺）
+class StreamLinearResampler {
+public:
+    void reset(uint32_t src_rate, uint32_t dst_rate);
+    void process_interleaved_stereo(const int16_t* in_stereo, size_t in_frames, std::vector<int16_t>& out_stereo);
+
+private:
+    uint32_t src_rate_ = 48000;
+    uint32_t dst_rate_ = 48000;
+    double step_ = 1.0;
+    double phase_ = 0.0;
+    bool has_prev_ = false;
+    int16_t prev_l_ = 0;
+    int16_t prev_r_ = 0;
+};
+
+// 环回采集平滑弹性抖动缓冲（Pre-roll 水位建立 + ±1 样本连续相位插值时钟漂移补偿 + 欠载尾样本衰减 + 溢出交叉淡入淡出）
+class SmoothLoopbackFifo {
+public:
+    void reset(uint32_t sample_rate = 48000, size_t frame_samples = 480);
+    void push_interleaved_stereo(const int16_t* stereo_pcm, size_t frames);
+    void pop_smooth_frame(int16_t* dst_stereo, size_t out_frames);
+
+    size_t available_frames() const { return ring_.size() / 2; }
+    bool is_primed() const { return primed_; }
+
+private:
+    uint32_t sample_rate_ = 48000;
+    size_t frame_samples_ = 480;
+    size_t preroll_frames_ = 1200;
+    size_t target_frames_ = 1920;
+    size_t low_water_frames_ = 768;
+    size_t high_water_frames_ = 3120;
+    size_t max_frames_ = 9600;
+    bool primed_ = false;
+    int16_t last_l_ = 0;
+    int16_t last_r_ = 0;
+    std::deque<int16_t> ring_;
 };
 
 using PcmFrameCallback = std::function<void(const int16_t* stereo_pcm, size_t frame_samples)>;

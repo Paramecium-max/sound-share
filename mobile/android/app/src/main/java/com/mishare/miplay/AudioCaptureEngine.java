@@ -16,6 +16,7 @@ import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Android 三模式音源采集引擎：
@@ -44,6 +45,9 @@ public class AudioCaptureEngine {
     private volatile MediaProjection mediaProjection = null;
     private volatile AudioRecord activeRecorder = null;
     private Thread worker;
+    private Thread spectrumWorker;
+    private final Object spectrumNotify = new Object();
+    private final AtomicReference<float[]> pendingSpectrum = new AtomicReference<>(null);
     private Callbacks cbs;
     private int sampleRate = 48000;
     private int frameSamples = 1024;
@@ -311,9 +315,14 @@ public class AudioCaptureEngine {
             this.sampleRate = sampleRate;
             this.frameSamples = frameSamples;
             this.cbs = cbs;
+            this.pendingSpectrum.set(null);
             running.set(true);
+            spectrumWorker = new Thread(this::runSpectrumLoop, "MiPlay-Spectrum");
+            spectrumWorker.setDaemon(true);
+            spectrumWorker.setPriority(Thread.NORM_PRIORITY - 1);
+            spectrumWorker.start();
             worker = new Thread(this::runLoop, "MiPlay-AudioEngine");
-            worker.setPriority(Thread.NORM_PRIORITY + 1);
+            worker.setPriority(Thread.MAX_PRIORITY);
             worker.start();
         }
     }
@@ -326,6 +335,10 @@ public class AudioCaptureEngine {
 
     private void stopLocked() {
         running.set(false);
+        synchronized (spectrumNotify) {
+            pendingSpectrum.set(null);
+            spectrumNotify.notifyAll();
+        }
         // 主动停止并释放正在阻塞 read() 的 AudioRecord，确保 worker 立即被唤醒退出
         releaseActiveRecorder();
         Thread w = worker;
@@ -345,6 +358,32 @@ public class AudioCaptureEngine {
             }
             worker = null;
         }
+        Thread sw = spectrumWorker;
+        if (sw != null) {
+            sw.interrupt();
+            try { sw.join(300); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            spectrumWorker = null;
+        }
+    }
+
+    private void runSpectrumLoop() {
+        while (running.get()) {
+            float[] bands = pendingSpectrum.getAndSet(null);
+            if (bands == null) {
+                synchronized (spectrumNotify) {
+                    if (!running.get()) break;
+                    bands = pendingSpectrum.getAndSet(null);
+                    if (bands == null) {
+                        try { spectrumNotify.wait(250); } catch (InterruptedException ignored) { break; }
+                        continue;
+                    }
+                }
+            }
+            Callbacks listener = this.cbs;
+            if (listener != null && running.get()) {
+                try { listener.onSpectrum(bands); } catch (Throwable ignored) {}
+            }
+        }
     }
 
     private AudioRecord createPlaybackRecorder() {
@@ -362,10 +401,10 @@ public class AudioCaptureEngine {
                     .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
                     .build();
             int minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-            if (minBuf <= 0) minBuf = frameSamples * 4 * 4;
+            if (minBuf <= 0) minBuf = frameSamples * 4 * 8;
             AudioRecord rec = new AudioRecord.Builder()
                     .setAudioFormat(fmt)
-                    .setBufferSizeInBytes(Math.max(minBuf, frameSamples * 4 * 4))
+                    .setBufferSizeInBytes(Math.max(minBuf * 2, frameSamples * 4 * 8))
                     .setAudioPlaybackCaptureConfig(cfg)
                     .build();
             if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
@@ -381,14 +420,15 @@ public class AudioCaptureEngine {
     }
 
     private void runLoop() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
         final int frameBytes = frameSamples * 4;
         final byte[] pcm = new byte[frameBytes];
-        final long frameUs = (frameSamples * 1_000_000L) / sampleRate;
-        long nextTickUs = TimerService.monotonicNowUs();
+        long tickOriginUs = TimerService.monotonicNowUs();
+        long tickSamples = 0L;
         long sampleIdx = 0;
         long lastSpecUs = 0;
         int consecutiveReadErrors = 0;
+        short tailL = 0, tailR = 0;
 
         while (running.get()) {
             int m = mode.get();
@@ -402,6 +442,8 @@ public class AudioCaptureEngine {
                 AudioRecord recorder = activeRecorder;
                 if (recorder == null && mediaProjection != null) {
                     recorder = createPlaybackRecorder();
+                    tickOriginUs = TimerService.monotonicNowUs();
+                    tickSamples = 0L;
                 }
                 if (recorder != null) {
                     int read = 0;
@@ -409,7 +451,7 @@ public class AudioCaptureEngine {
                     while (read < frameBytes && running.get()) {
                         int r;
                         try {
-                            r = recorder.read(pcm, read, frameBytes - read);
+                            r = recorder.read(pcm, read, frameBytes - read, AudioRecord.READ_BLOCKING);
                         } catch (Exception ex) {
                             err = true;
                             break;
@@ -421,13 +463,27 @@ public class AudioCaptureEngine {
                         read += r;
                     }
                     if (err) {
-                        Arrays.fill(pcm, read, frameBytes, (byte) 0);
+                        int alignedSampleOff = (read / 4) * 4;
+                        if (alignedSampleOff >= 4) {
+                            tailL = (short) ((pcm[alignedSampleOff - 4] & 0xFF) | (pcm[alignedSampleOff - 3] << 8));
+                            tailR = (short) ((pcm[alignedSampleOff - 2] & 0xFF) | (pcm[alignedSampleOff - 1] << 8));
+                        }
+                        for (int off = alignedSampleOff; off < frameBytes; off += 4) {
+                            tailL = (short) ((tailL * 240) / 256);
+                            tailR = (short) ((tailR * 240) / 256);
+                            pcm[off] = (byte) (tailL & 0xFF);
+                            pcm[off + 1] = (byte) ((tailL >>> 8) & 0xFF);
+                            pcm[off + 2] = (byte) (tailR & 0xFF);
+                            pcm[off + 3] = (byte) ((tailR >>> 8) & 0xFF);
+                        }
                         consecutiveReadErrors++;
                         if (consecutiveReadErrors >= 5) {
                             releaseActiveRecorder();
                             consecutiveReadErrors = 0;
                         }
                     } else {
+                        tailL = (short) ((pcm[frameBytes - 4] & 0xFF) | (pcm[frameBytes - 3] << 8));
+                        tailR = (short) ((pcm[frameBytes - 2] & 0xFF) | (pcm[frameBytes - 1] << 8));
                         consecutiveReadErrors = 0;
                         usedBlockingCapture = true;
                     }
@@ -459,7 +515,8 @@ public class AudioCaptureEngine {
 
             if (!running.get()) break;
             if (mode.get() != m) {
-                nextTickUs = TimerService.monotonicNowUs();
+                tickOriginUs = TimerService.monotonicNowUs();
+                tickSamples = 0L;
                 continue;
             }
             if (cbs != null) {
@@ -467,22 +524,28 @@ public class AudioCaptureEngine {
                 long nowSpec = TimerService.monotonicNowUs();
                 if (nowSpec - lastSpecUs >= 120_000L) {
                     lastSpecUs = nowSpec;
-                    cbs.onSpectrum(computeSpectrum(pcm, frameSamples));
+                    pendingSpectrum.set(computeSpectrum(pcm, frameSamples));
+                    synchronized (spectrumNotify) {
+                        spectrumNotify.notify();
+                    }
                 }
             }
 
             if (!usedBlockingCapture) {
-                nextTickUs += frameUs;
+                tickSamples += frameSamples;
+                long nextTickUs = tickOriginUs + (tickSamples * 1_000_000L) / sampleRate;
                 long now = TimerService.monotonicNowUs();
                 long waitUs = nextTickUs - now;
-                if (waitUs > 1000L) {
+                if (waitUs > 500L) {
                     try { Thread.sleep(waitUs / 1000L, (int) ((waitUs % 1000L) * 1000L)); }
                     catch (InterruptedException ignored) { break; }
-                } else if (now - nextTickUs > 100_000L) {
-                    nextTickUs = now;
+                } else if (now - nextTickUs > 80_000L) {
+                    tickOriginUs = now;
+                    tickSamples = 0L;
                 }
             } else {
-                nextTickUs = TimerService.monotonicNowUs();
+                tickOriginUs = TimerService.monotonicNowUs();
+                tickSamples = 0L;
             }
         }
 

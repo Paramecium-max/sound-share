@@ -209,7 +209,21 @@ public class MultiRoomManager {
         audioEngine.start(activeRate, actualCfg.frameSamples, new AudioCaptureEngine.Callbacks() {
             @Override
             public void onPcmFrame(byte[] stereoPcmLe, int samples) {
-                long curSamples = totalSamples.getAndAdd(samples);
+                // 若因等待系统抓音授权、切源或后台调度阻塞导致样本计数落后实时墙钟 >3 帧，立即按整帧边界追齐
+                long nowUs = TimerService.monotonicNowUs();
+                long elapsedUs = Math.max(0L, nowUs - sessionOriginUs);
+                long expectedSamples = (elapsedUs * activeRate) / 1_000_000L;
+                long curSamples = totalSamples.get();
+                long tolerance = (long) samples * 3L;
+                if (expectedSamples > curSamples + tolerance) {
+                    long aligned = (expectedSamples / samples) * samples;
+                    if (totalSamples.compareAndSet(curSamples, aligned)) {
+                        curSamples = aligned;
+                    } else {
+                        curSamples = totalSamples.get();
+                    }
+                }
+                totalSamples.addAndGet(samples);
                 long pts90k = ((curSamples * 90000L) / activeRate) + (basePlayDelayMs * 90L);
                 multiSender.broadcastPcmFrame(stereoPcmLe, pts90k);
             }

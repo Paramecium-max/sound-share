@@ -130,14 +130,18 @@ void TsPacketizer::append_pcr(std::vector<uint8_t>& out, uint64_t pcr_90khz) {
     out.insert(out.end(), pkt, pkt + kTsSize);
 }
 
-std::vector<uint8_t> TsPacketizer::wrap_wfd_lpcm(const int16_t* interleaved_stereo, size_t frame_samples) {
-    // Wi-Fi Display LPCM private header (4 bytes): sub_stream_id=0xA0, num_frames, emphasis/quant/freq/ch
+std::vector<uint8_t> TsPacketizer::wrap_wfd_lpcm(const int16_t* interleaved_stereo,
+                                                 size_t frame_samples,
+                                                 uint32_t sample_rate) {
+    // Wi-Fi Display LPCM private header (4 bytes): sub_stream_id=0xA0, num_frames, emphasis, quant/freq/ch
+    // Byte 3: [bits 7..6 quant=00 (16-bit)] | [bits 5..3 freq: 001=44.1kHz, 010=48kHz] | [bits 2..0 ch=001 (2ch)]
+    const uint8_t freq_ch_byte = (sample_rate == 44100) ? 0x09 : 0x11;
     std::vector<uint8_t> out;
     out.reserve(4 + frame_samples * 4);
     out.push_back(0xA0);
     out.push_back(0x06);
     out.push_back(0x00);
-    out.push_back(0x11); // 16-bit, 48kHz, 2ch
+    out.push_back(freq_ch_byte);
     for (size_t i = 0; i < frame_samples * 2; ++i) {
         uint16_t u = static_cast<uint16_t>(interleaved_stereo[i]);
         out.push_back(static_cast<uint8_t>((u >> 8) & 0xFF)); // Big-Endian
@@ -154,8 +158,8 @@ std::vector<uint8_t> TsPacketizer::packetize_audio_frame(
     std::vector<uint8_t> out;
     out.reserve(kTsSize * 8);
 
-    // 每 5 帧 (~100ms) 插入 PAT + PMT + PCR（与实机抓包周期完全一致）
-    if (force_pat_pmt || (frame_counter_ % 5 == 0)) {
+    // 每 4 帧 (AAC ~85.3ms < 100ms 标准上限, LPCM 40ms) 插入 PAT + PMT + PCR
+    if (force_pat_pmt || (frame_counter_ % 4 == 0)) {
         append_pat(out);
         append_pmt(out);
         append_pcr(out, pts_90khz);

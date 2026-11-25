@@ -1004,6 +1004,210 @@ static void test_rtsp_multiport_dual_tcp_negotiation() {
     std::cout << "[PASS] test_rtsp_multiport_dual_tcp_negotiation (SS-31)\n";
 }
 
+// 音轨平滑性与抗抖动专项回归：
+// 1) 多帧拼合 ADTS 拆分与独立 PTS 递增
+// 2) MasterMediaClock 阻塞后墙钟追齐（杜绝声卡切换后全程迟到帧）
+// 3) SmoothLoopbackFifo 预缓冲、缺少量样本防归零、±1 样本线性插值频偏消化、极端积压交叉淡化
+// 4) MultiAudioSender 淘汰旧帧与动态下调延迟时保持线上 RTP Seq / MPEG-TS CC / PTS 严格连续不倒流
+// 5) WFD LPCM 44.1kHz / 48kHz 采样率头一致性
+static void test_smooth_audio_anti_jitter_pipeline() {
+    // 1. 拼合双帧 ADTS 切分与 MPEG-4(0xF1) -> MPEG-2(0xF9) 规范化
+    uint8_t raw1[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    uint8_t raw2[16] = {9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6};
+    auto f1 = media::AacEncoder::wrap_adts(raw1, sizeof(raw1), 48000, 2);
+    auto f2 = media::AacEncoder::wrap_adts(raw2, sizeof(raw2), 48000, 2);
+    f1[1] = 0xF1; // 模拟 Windows MFT payloadType=1 输出 MPEG-4 ADTS 同步字
+    std::vector<uint8_t> concat = f1;
+    concat.insert(concat.end(), f2.begin(), f2.end());
+
+    sync::MasterMediaClock aac_clk;
+    aac_clk.reset(48000, 350);
+    std::vector<uint64_t> emitted_pts;
+    std::vector<size_t> emitted_lens;
+    media::AacEncoder::emit_adts_frames(concat.data(), concat.size(), 48000, 2,
+        [&](const uint8_t* adts, size_t len) {
+            CHECK(adts[0] == 0xFF && adts[1] == 0xF9);
+            auto ts = aac_clk.next_frame_timestamps(1024);
+            emitted_pts.push_back(ts.pts_90khz);
+            emitted_lens.push_back(len);
+        });
+    CHECK(emitted_pts.size() == 2);
+    CHECK(emitted_lens[0] == f1.size() && emitted_lens[1] == f2.size());
+    CHECK(emitted_pts[1] - emitted_pts[0] == 1920);
+
+    // 2. 模拟声卡重路由阻塞 250ms 后，MasterMediaClock 自动按整帧边界追齐当前墙钟
+    sync::MasterMediaClock stall_clk;
+    stall_clk.reset(48000, 350);
+    const uint64_t origin = stall_clk.session_origin_us();
+    stall_clk.catch_up_to_now(480, origin + 250000ULL); // 模拟卡顿 250ms (= 12000 samples)
+    auto after_stall = stall_clk.next_frame_timestamps(480);
+    // 追齐后目标播放时刻必须精准落在 (origin + 250ms) + 350ms = origin + 600ms
+    CHECK(after_stall.play_target_us == origin + 250000ULL + 350000ULL);
+
+    // 3. SmoothLoopbackFifo：WASAPI 10ms(480帧) 分包喂给 AAC 21.33ms(1024帧) 消费者，持续 200 帧零静音坑
+    media::SmoothLoopbackFifo fifo;
+    fifo.reset(48000, 1024);
+    std::vector<int16_t> chunk480(480 * 2, 4096);
+    std::vector<int16_t> out1024(1024 * 2, 0);
+
+    // 预热：推入 5 个 10ms 包 (2400 帧 >= preroll 1984 帧)
+    for (int i = 0; i < 5; ++i) fifo.push_interleaved_stereo(chunk480.data(), 480);
+    double time_acc_ms = 0.0;
+    for (int step = 0; step < 120; ++step) {
+        fifo.pop_smooth_frame(out1024.data(), 1024);
+        CHECK(fifo.is_primed());
+        // 断言整帧没有任何样本跌落归零（振幅恒在 4096 附近）
+        for (size_t s = 0; s < out1024.size(); ++s) {
+            CHECK(std::abs(out1024[s] - 4096) <= 2);
+        }
+        // 模拟存在 +500 ppm 声卡偏快时钟，按真实 10ms 颗粒度异步投递 480 帧包
+        time_acc_ms += (1024.0 * 1000.0 / 48000.0) * 1.0005;
+        while (time_acc_ms >= 10.0) {
+            fifo.push_interleaved_stereo(chunk480.data(), 480);
+            time_acc_ms -= 10.0;
+        }
+    }
+
+    // 4. LPCM 44.1kHz vs 48kHz 采样率头验证
+    int16_t one_stereo[2] = {100, -100};
+    auto lpcm48 = media::TsPacketizer::wrap_wfd_lpcm(one_stereo, 1, 48000);
+    auto lpcm44 = media::TsPacketizer::wrap_wfd_lpcm(one_stereo, 1, 44100);
+    CHECK(lpcm48[0] == 0xA0 && lpcm48[3] == 0x11);
+    CHECK(lpcm44[0] == 0xA0 && lpcm44[3] == 0x09);
+
+    // 5. MultiAudioSender 动态调小延迟偏置时，线上 RTP Seq / MPEG-TS Audio CC / PES PTS 严格连续不倒退
+    {
+        media::MultiAudioSender sender;
+        sender.set_stream_type(media::TsAudioStreamType::WfdLpcm);
+        auto [s_tx, s_rx] = make_socket_pair();
+        CHECK(net::set_socket_timeout(s_rx, SO_RCVTIMEO, 500));
+        sender.add_or_update_target("room_smooth", "127.0.0.1", s_tx, +100, true, 1);
+
+        std::vector<int16_t> pcm10ms(480 * 2, 2000);
+        auto payload = media::TsPacketizer::wrap_wfd_lpcm(pcm10ms.data(), 480, 48000);
+
+        // 先在 +100ms 偏置下发 3 帧，随后突然把偏置下调到 0ms（前几帧将落在重叠区间被干净跳过），再继续发 15 帧
+        for (int i = 0; i < 3; ++i) {
+            uint64_t pts = 90000ULL + static_cast<uint64_t>(i) * 900ULL;
+            sender.broadcast_audio_frame(payload.data(), payload.size(), pts, static_cast<uint32_t>(pts));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        sender.set_target_delay_bias("room_smooth", 0);
+        for (int i = 3; i < 20; ++i) {
+            uint64_t pts = 90000ULL + static_cast<uint64_t>(i) * 900ULL;
+            sender.broadcast_audio_frame(payload.data(), payload.size(), pts, static_cast<uint32_t>(pts));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        sender.clear_all();
+
+        std::vector<uint8_t> stream;
+        uint8_t rbuf[4096];
+        for (;;) {
+            auto n = recv(s_rx, reinterpret_cast<char*>(rbuf), sizeof(rbuf), 0);
+            if (n <= 0) break;
+            stream.insert(stream.end(), rbuf, rbuf + n);
+        }
+        net::close_socket(s_rx);
+
+        // 逐个解析 RTP-over-TCP 包及内层 188B MPEG-TS 包，验证 0 帧错位、RTP Seq 连续、Audio CC 连续、PTS 严格递增
+        size_t pos = 0;
+        int rtp_cnt = 0;
+        uint16_t expected_seq = 0;
+        int expected_audio_cc = -1;
+        int64_t prev_pes_pts = -1;
+        while (pos < stream.size()) {
+            CHECK(pos + 4 <= stream.size());
+            CHECK(stream[pos] == 0x24 && stream[pos + 1] == 0x00);
+            const size_t rtp_len = (static_cast<size_t>(stream[pos + 2]) << 8) | stream[pos + 3];
+            CHECK(rtp_len >= 12 + 188 && pos + 4 + rtp_len <= stream.size());
+            const uint8_t* rtp = stream.data() + pos + 4;
+            const uint16_t seq = (static_cast<uint16_t>(rtp[2]) << 8) | rtp[3];
+            if (rtp_cnt > 0) CHECK(seq == expected_seq);
+            expected_seq = static_cast<uint16_t>(seq + 1);
+            ++rtp_cnt;
+
+            const size_t ts_bytes = rtp_len - 12;
+            CHECK(ts_bytes % 188 == 0);
+            for (size_t off = 0; off < ts_bytes; off += 188) {
+                const uint8_t* ts = rtp + 12 + off;
+                CHECK(ts[0] == 0x47);
+                const uint16_t pid = (static_cast<uint16_t>(ts[1] & 0x1F) << 8) | ts[2];
+                const bool pusi = (ts[1] & 0x40) != 0;
+                const bool has_payload = (ts[3] & 0x10) != 0;
+                const int cc = ts[3] & 0x0F;
+                if (pid == 0x1100 && has_payload) {
+                    if (expected_audio_cc >= 0) {
+                        CHECK(cc == expected_audio_cc);
+                    }
+                    expected_audio_cc = (cc + 1) & 0x0F;
+                    if (pusi) {
+                        size_t hdr_off = 4;
+                        if ((ts[3] & 0x20) != 0) hdr_off += 1 + ts[4];
+                        CHECK(hdr_off + 14 <= 188);
+                        const uint8_t* p = ts + hdr_off;
+                        CHECK(p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x01);
+                        uint64_t pts =
+                            (static_cast<uint64_t>((p[9] >> 1) & 0x07) << 30) |
+                            (static_cast<uint64_t>(p[10]) << 22) |
+                            (static_cast<uint64_t>((p[11] >> 1) & 0x7F) << 15) |
+                            (static_cast<uint64_t>(p[12]) << 7) |
+                            (static_cast<uint64_t>((p[13] >> 1) & 0x7F));
+                        if (prev_pes_pts >= 0) {
+                            CHECK(static_cast<int64_t>(pts) >= prev_pes_pts + 900);
+                        }
+                        prev_pes_pts = static_cast<int64_t>(pts);
+                    }
+                }
+            }
+            pos += 4 + rtp_len;
+        }
+        CHECK(rtp_cnt >= 6 && prev_pes_pts > 0);
+    }
+
+    // 6. StreamLinearResampler + SmoothLoopbackFifo 波形连续性/零毛刺专项检验：
+    //    模拟 44.1kHz（每包 441 帧）和 96kHz（每包 960 帧）正弦波分包重采样至 48kHz，
+    //    校验跨包边界最大一阶差分与理论斜率一致，绝无边界阶跃或平顶毛刺
+    for (uint32_t src_sr : {44100u, 96000u}) {
+        media::StreamLinearResampler rs;
+        rs.reset(src_sr, 48000);
+        const double freq = 1000.0;
+        const double amp = 20000.0;
+        const size_t pkt_frames = src_sr / 100; // 10ms 分包
+        std::vector<int16_t> in_pkt(pkt_frames * 2);
+        std::vector<int16_t> out_pkt;
+        std::vector<int16_t> all_out;
+        size_t idx = 0;
+        for (int p = 0; p < 50; ++p) {
+            for (size_t i = 0; i < pkt_frames; ++i) {
+                const double t = static_cast<double>(idx++) / static_cast<double>(src_sr);
+                const int16_t v = static_cast<int16_t>(std::lround(amp * std::sin(2.0 * 3.14159265358979323846 * freq * t)));
+                in_pkt[i * 2] = v;
+                in_pkt[i * 2 + 1] = static_cast<int16_t>(-v);
+            }
+            rs.process_interleaved_stereo(in_pkt.data(), pkt_frames, out_pkt);
+            all_out.insert(all_out.end(), out_pkt.begin(), out_pkt.end());
+        }
+        const size_t total_out_frames = all_out.size() / 2;
+        CHECK(total_out_frames >= 23900 && total_out_frames <= 24100); // 0.5s @ 48kHz ~= 24000 帧
+        // 1kHz @ 48kHz, amp=20000 的理论最大相邻样本差分 = 20000 * 2*pi*1000/48000 ~= 2618；
+        // 二阶差分理论最大 = 20000 * (2*pi*1000/48000)^2 ~= 343；若有边界毛刺会瞬间飙升到 >1000！
+        int32_t max_d1 = 0;
+        int32_t max_d2 = 0;
+        for (size_t i = 2; i < total_out_frames; ++i) {
+            const int32_t x0 = all_out[(i - 2) * 2];
+            const int32_t x1 = all_out[(i - 1) * 2];
+            const int32_t x2 = all_out[i * 2];
+            max_d1 = std::max(max_d1, std::abs(x2 - x1));
+            max_d2 = std::max(max_d2, std::abs((x2 - x1) - (x1 - x0)));
+            CHECK(all_out[i * 2 + 1] == static_cast<int16_t>(-all_out[i * 2]));
+        }
+        CHECK(max_d1 <= 2650);
+        CHECK(max_d2 <= 420);
+    }
+
+    std::cout << "[PASS] test_smooth_audio_anti_jitter_pipeline\n";
+}
+
 int main() {
     test_cmd8899_codec_and_safety();
     test_master_clock_and_trendline();
@@ -1020,6 +1224,7 @@ int main() {
     test_disconnect_no_deadlock_and_teardown(false);
     test_disconnect_no_deadlock_and_teardown(true);
     test_rtsp_multiport_dual_tcp_negotiation();
+    test_smooth_audio_anti_jitter_pipeline();
     std::cout << "\nALL MIPLAY_CORE TESTS PASSED!\n";
     return 0;
 }

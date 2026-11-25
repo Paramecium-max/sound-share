@@ -12,6 +12,27 @@
 
 #ifdef _WIN32
 #include <windows.h>
+
+namespace {
+void disable_windows_power_throttling() {
+    struct WinPowerThrottlingState {
+        ULONG Version;
+        ULONG ControlMask;
+        ULONG StateMask;
+    };
+    using PfnSetProcessInformation = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) return;
+    auto fn = reinterpret_cast<PfnSetProcessInformation>(
+        GetProcAddress(k32, "SetProcessInformation"));
+    if (!fn) return;
+    // ProcessPowerThrottling = 4; bit 0 = EXECUTION_SPEED, bit 2 = IGNORE_TIMER_RESOLUTION
+    // 禁用 Windows 11 后台 EcoQoS 小核降频与定时器劣化，保障后台全屋推流时钟稳定
+    WinPowerThrottlingState state{1, 0x1U | 0x4U, 0U};
+    fn(GetCurrentProcess(), 4, &state, sizeof(state));
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+}
+} // namespace
 #endif
 
 namespace {
@@ -72,14 +93,27 @@ bool json_get_bool(const std::string& json, const std::string& key, bool def_val
     return def_val;
 }
 
+std::string escape_json_str(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out.push_back(c);
+    }
+    return out;
+}
+
 std::string list_interfaces_json() {
     auto ifaces = miplay::net::list_ipv4_interfaces();
     std::ostringstream oss;
     oss << "[";
     for (size_t i = 0; i < ifaces.size(); ++i) {
         if (i) oss << ",";
-        oss << "{\"name\":\"" << ifaces[i].name
-            << "\",\"ipv4\":\"" << ifaces[i].ipv4
+        oss << "{\"name\":\"" << escape_json_str(ifaces[i].name)
+            << "\",\"ipv4\":\"" << escape_json_str(ifaces[i].ipv4)
             << "\",\"isLoopback\":" << (ifaces[i].is_loopback ? "true" : "false") << "}";
     }
     oss << "]";
@@ -106,6 +140,9 @@ int main(int argc, char** argv) {
 #endif
     }
 
+#ifdef _WIN32
+    disable_windows_power_throttling();
+#endif
     miplay::media::AudioPipeline::recover_playback_route();
     miplay::MultiRoomEngine engine;
     miplay::sidecar::LocalWsServer ws;
@@ -173,7 +210,8 @@ int main(int argc, char** argv) {
             oss << "[";
             for (size_t i = 0; i < srcs.size(); ++i) {
                 if (i) oss << ",";
-                oss << "{\"id\":\"" << srcs[i].id << "\",\"label\":\"" << srcs[i].label << "\"}";
+                oss << "{\"id\":\"" << escape_json_str(srcs[i].id)
+                    << "\",\"label\":\"" << escape_json_str(srcs[i].label) << "\"}";
             }
             oss << "]";
             result = oss.str();
