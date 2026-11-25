@@ -62,11 +62,29 @@ void MultiAudioSender::ActiveTarget::start_writer() {
             wire_batch.clear();
             uint32_t pkt_cnt = 0;
             const size_t chunk_max = kMaxTsPerRtp * kTsPktSize;
-            for (size_t off = 0; off < ts_bytes.size(); off += chunk_max) {
+            size_t off = 0;
+
+            // 若本帧带 PAT+PMT+PCR（前 3 个 TS 包）且整帧超过 7 个 TS 包，先将 PAT+PMT+PCR 独立发包 (M=0)，
+            // 保证随后完整 Audio PES（如 >720B 的高码率 AAC 需 5~7 个 TS 包）绝不被 7-TS 边界腰斩触发 MiPCAudio ATSParser 报错！
+            if (ts_bytes.size() > chunk_max && ts_bytes.size() >= 4 * kTsPktSize &&
+                ts_bytes[0] == 0x47 && ((ts_bytes[1] & 0x1F) == 0x00 && ts_bytes[2] == 0x00)) {
+                const size_t psi_len = 3 * kTsPktSize;
+                auto psi_pkt = build_rtp_over_tcp_packet(
+                    rtp_seq++, rtp_ts, ts_bytes.data(), psi_len, 0xDEADBEEFU, false);
+                wire_batch.insert(wire_batch.end(), psi_pkt.begin(), psi_pkt.end());
+                ++pkt_cnt;
+                off = psi_len;
+            }
+
+            while (off < ts_bytes.size()) {
                 const size_t len = std::min(chunk_max, ts_bytes.size() - off);
-                auto pkt = build_rtp_over_tcp_packet(rtp_seq++, rtp_ts, ts_bytes.data() + off, len);
+                // 严格按 RFC 3550：仅整帧最后一个 RTP 分片设置 Marker=1 (0xA1)，其余分片为 0 (0x21)，防止接收端提前 flush 半截 PES
+                const bool is_last = (off + len >= ts_bytes.size());
+                auto pkt = build_rtp_over_tcp_packet(
+                    rtp_seq++, rtp_ts, ts_bytes.data() + off, len, 0xDEADBEEFU, is_last);
                 wire_batch.insert(wire_batch.end(), pkt.begin(), pkt.end());
                 ++pkt_cnt;
+                off += len;
             }
 
             if (stop_requested.load()) break;
@@ -218,7 +236,8 @@ std::vector<uint8_t> MultiAudioSender::build_rtp_over_tcp_packet(
     uint32_t rtp_ts_90khz,
     const uint8_t* ts_bytes,
     size_t ts_len,
-    uint32_t ssrc) {
+    uint32_t ssrc,
+    bool marker) {
     const uint16_t rtp_len = static_cast<uint16_t>(12 + ts_len);
     std::vector<uint8_t> pkt(4 + rtp_len);
     pkt[0] = 0x24;
@@ -227,7 +246,7 @@ std::vector<uint8_t> MultiAudioSender::build_rtp_over_tcp_packet(
     pkt[3] = static_cast<uint8_t>(rtp_len & 0xFF);
 
     pkt[4] = 0x80;
-    pkt[5] = 0xA1;
+    pkt[5] = marker ? 0xA1 : 0x21;
     pkt[6] = static_cast<uint8_t>((rtp_seq >> 8) & 0xFF);
     pkt[7] = static_cast<uint8_t>(rtp_seq & 0xFF);
     pkt[8] = static_cast<uint8_t>((rtp_ts_90khz >> 24) & 0xFF);

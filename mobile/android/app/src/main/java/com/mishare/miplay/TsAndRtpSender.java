@@ -116,8 +116,42 @@ public class TsAndRtpSender {
             wireBatch.reset();
             int pktCount = 0;
             byte[] hdr = new byte[16];
-            for (int off = 0; off < ts.length && !stopRequested.get(); off += 7 * 188) {
-                int length = Math.min(7 * 188, ts.length - off);
+            final int chunkMax = 7 * 188;
+            int off = 0;
+
+            // 若本帧含 PAT+PMT+PCR（前 3 个 TS 包）且整帧超 7 个 TS 包（如 >720B 的高码率 AAC 需 5 个 Audio TS 包），
+            // 先独立发出 PAT+PMT+PCR (Marker=0, 0x21)，确保随后的 Audio PES 完整落入单个 RTP 包内，
+            // 杜绝在 4*184-16=720B 边界被腰斩导致 MiPCAudio ATSParser 报 PES length insufficient！
+            if (ts.length > chunkMax && ts.length >= 4 * 188
+                    && ts[0] == 0x47 && (ts[1] & 0x1F) == 0 && ts[2] == 0) {
+                int psiLen = 3 * 188;
+                int size = 12 + psiLen;
+                int seq = rtpSeq++ & 0xFFFF;
+                hdr[0] = 0x24;
+                hdr[1] = 0x00;
+                hdr[2] = (byte) (size >>> 8);
+                hdr[3] = (byte) size;
+                hdr[4] = (byte) 0x80;
+                hdr[5] = (byte) 0x21; // Marker = 0
+                hdr[6] = (byte) (seq >>> 8);
+                hdr[7] = (byte) seq;
+                hdr[8] = (byte) (pts >>> 24);
+                hdr[9] = (byte) (pts >>> 16);
+                hdr[10] = (byte) (pts >>> 8);
+                hdr[11] = (byte) pts;
+                hdr[12] = (byte) 0xDE;
+                hdr[13] = (byte) 0xAD;
+                hdr[14] = (byte) 0xBE;
+                hdr[15] = (byte) 0xEF;
+                wireBatch.write(hdr, 0, 16);
+                wireBatch.write(ts, 0, psiLen);
+                pktCount++;
+                off = psiLen;
+            }
+
+            while (off < ts.length && !stopRequested.get()) {
+                int length = Math.min(chunkMax, ts.length - off);
+                boolean isLast = (off + length >= ts.length);
                 int size = 12 + length;
                 int seq = rtpSeq++ & 0xFFFF;
                 hdr[0] = 0x24;
@@ -125,7 +159,7 @@ public class TsAndRtpSender {
                 hdr[2] = (byte) (size >>> 8);
                 hdr[3] = (byte) size;
                 hdr[4] = (byte) 0x80;
-                hdr[5] = (byte) 0xA1;
+                hdr[5] = (byte) (isLast ? 0xA1 : 0x21); // 仅整帧最后一个 RTP 分片置 Marker=1
                 hdr[6] = (byte) (seq >>> 8);
                 hdr[7] = (byte) seq;
                 hdr[8] = (byte) (pts >>> 24);
@@ -139,6 +173,7 @@ public class TsAndRtpSender {
                 wireBatch.write(hdr, 0, 16);
                 wireBatch.write(ts, off, length);
                 pktCount++;
+                off += length;
             }
             if (!stopRequested.get() && wireBatch.size() > 0) {
                 wireBatch.writeTo(out);

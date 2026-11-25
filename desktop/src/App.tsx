@@ -236,6 +236,7 @@ export default function App() {
   const [spectrum, setSpectrum] = useState<number[]>(Array(16).fill(0.08));
   const [selectedCodec, setSelectedCodec] = useState<'LPCM' | 'AAC_LC'>('AAC_LC');
   const [toast, setToast] = useState<{ text: string; warn?: boolean } | null>(null);
+  const [refreshingDiscovery, setRefreshingDiscovery] = useState(false);
   const [showAddSheet, setShowAddSheet] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
 
@@ -408,6 +409,8 @@ export default function App() {
             if (Array.isArray(list)) setLoopbackSources(list);
           })
           .catch(() => {});
+        // 连接引擎就绪后立即触发一次无感极速探测，确保开屏秒现设备
+        callRpc('discovery.refresh', {}, { silentError: true }).catch(() => {});
       };
 
       ws.onmessage = (ev) => {
@@ -471,6 +474,38 @@ export default function App() {
 
   const selectedDevices = state.devices.filter((d) => d.inGroup);
   const streamingCount = state.devices.filter((d) => d.rtspStreaming).length;
+
+  const triggerDiscoveryRefresh = (interactive = false) => {
+    if (interactive) {
+      setRefreshingDiscovery(true);
+      setToast({ text: '正在极速扫描局域网内的妙播设备…' });
+      setTimeout(() => setRefreshingDiscovery(false), 900);
+    }
+    callRpc('discovery.refresh', {}, { silentError: !interactive }).catch(() => {});
+  };
+
+  // 窗口重新获得焦点、切回前台或切回“设备”标签时自动无感刷新，随时发现新上线设备
+  useEffect(() => {
+    if (!wsConnected) return;
+    if (activeTab === 'devices') {
+      callRpc('discovery.refresh', {}, { silentError: true }).catch(() => {});
+    }
+  }, [activeTab, wsConnected]);
+
+  useEffect(() => {
+    const onWake = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        callRpc('discovery.refresh', {}, { silentError: true }).catch(() => {});
+      }
+    };
+    window.addEventListener('focus', onWake);
+    document.addEventListener('visibilitychange', onWake);
+    return () => {
+      window.removeEventListener('focus', onWake);
+      document.removeEventListener('visibilitychange', onWake);
+    };
+  }, []);
 
   const handleTogglePlay = async () => {
     if (state.multiroomRunning) {
@@ -591,13 +626,15 @@ export default function App() {
           <div className="lg-toolbar-actions">
             <button
               type="button"
-              className="lg-btn icon-only hide-narrow"
-              onClick={() => {
-                callRpc('discovery.refresh');
-                setToast({ text: '正在重新搜索局域网内的妙播设备…' });
-              }}
-              title="重新搜索局域网设备"
+              className="lg-btn icon-only"
+              onClick={() => triggerDiscoveryRefresh(true)}
+              title="立即刷新搜索局域网设备"
               aria-label="重新搜索"
+              style={
+                refreshingDiscovery
+                  ? { transform: 'rotate(360deg)', transition: 'transform 0.75s ease' }
+                  : { transition: 'transform 0.2s ease' }
+              }
             >
               <Icons.Refresh />
             </button>
@@ -717,10 +754,10 @@ export default function App() {
                     <button
                       type="button"
                       className="lg-btn"
-                      onClick={() => callRpc('discovery.refresh')}
+                      onClick={() => triggerDiscoveryRefresh(true)}
                     >
                       <Icons.Refresh />
-                      <span>重新搜索</span>
+                      <span>立即刷新搜索</span>
                     </button>
                   </div>
                 </div>

@@ -70,7 +70,8 @@ public:
         uint32_t rtp_ts_90khz,
         const uint8_t* ts_bytes,
         size_t ts_len,
-        uint32_t ssrc = 0xDEADBEEFU);
+        uint32_t ssrc = 0xDEADBEEFU,
+        bool marker = true);
 
     std::vector<MirrorTargetNode> snapshot_nodes() const;
 

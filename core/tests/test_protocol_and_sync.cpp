@@ -1,5 +1,6 @@
 #include "cmd/cmd_codec.h"
 #include "crypto/mini_crypto.h"
+#include "discovery/mdns_discovery.h"
 #include "engine/multiroom_engine.h"
 #include "media/aac_encoder.h"
 #include "media/audio_pipeline.h"
@@ -1164,6 +1165,49 @@ static void test_smooth_audio_anti_jitter_pipeline() {
         CHECK(rtp_cnt >= 6 && prev_pes_pts > 0);
     }
 
+    // 5b. 高码率 AAC (>720B, 如 800B 需 5 个 Audio TS 包) 遇到 PAT+PMT+PCR 帧时：
+    //     PAT+PMT+PCR 必须独立为 Marker=0 (0x21) 的 RTP 包，5 个 Audio TS 包必须完整落在单个 Marker=1 (0xA1) RTP 包内，
+    //     杜绝 MiPCAudio.exe ATSParser 报 "numBitsLeft = 5760 (720B), required = 6400" 截断错误！
+    {
+        media::MultiAudioSender sender;
+        sender.set_stream_type(media::TsAudioStreamType::AdtsAac);
+        auto [s_tx, s_rx] = make_socket_pair();
+        CHECK(net::set_socket_timeout(s_rx, SO_RCVTIMEO, 500));
+        sender.add_or_update_target("mipcaudio_pes", "127.0.0.1", s_tx, 0, true, 1);
+
+        std::vector<uint8_t> big_raw(793, 0x5A);
+        auto adts800 = media::AacEncoder::wrap_adts(big_raw.data(), big_raw.size(), 48000, 2);
+        CHECK(adts800.size() == 800);
+        sender.broadcast_audio_frame(adts800.data(), adts800.size(), 90000ULL, 90000U);
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        sender.clear_all();
+
+        std::vector<uint8_t> wire;
+        uint8_t rbuf[4096];
+        for (;;) {
+            auto n = recv(s_rx, reinterpret_cast<char*>(rbuf), sizeof(rbuf), 0);
+            if (n <= 0) break;
+            wire.insert(wire.end(), rbuf, rbuf + n);
+        }
+        net::close_socket(s_rx);
+
+        // 应正好拆成 2 个 RTP 包：
+        // 包 1: PAT+PMT+PCR (3 * 188 = 564B), Marker = 0 (0x21)
+        // 包 2: 完整 5 个 Audio PES TS 包 (5 * 188 = 940B), Marker = 1 (0xA1)
+        size_t pos = 0;
+        std::vector<std::pair<uint8_t, size_t>> pkts;
+        while (pos < wire.size()) {
+            CHECK(pos + 4 <= wire.size() && wire[pos] == 0x24 && wire[pos + 1] == 0x00);
+            const size_t rtp_len = (static_cast<size_t>(wire[pos + 2]) << 8) | wire[pos + 3];
+            CHECK(pos + 4 + rtp_len <= wire.size());
+            pkts.push_back({wire[pos + 5], rtp_len - 12});
+            pos += 4 + rtp_len;
+        }
+        CHECK(pkts.size() == 2);
+        CHECK(pkts[0].first == 0x21 && pkts[0].second == 3 * 188);
+        CHECK(pkts[1].first == 0xA1 && pkts[1].second == 5 * 188);
+    }
+
     // 6. StreamLinearResampler + SmoothLoopbackFifo 波形连续性/零毛刺专项检验：
     //    模拟 44.1kHz（每包 441 帧）和 96kHz（每包 960 帧）正弦波分包重采样至 48kHz，
     //    校验跨包边界最大一阶差分与理论斜率一致，绝无边界阶跃或平顶毛刺
@@ -1208,6 +1252,164 @@ static void test_smooth_audio_anti_jitter_pipeline() {
     std::cout << "[PASS] test_smooth_audio_anti_jitter_pipeline\n";
 }
 
+// mDNS 高可靠发现专项回归：
+// 1) RFC 6762 QU (0x8001) 与 QM (0x0001) 查询报文编码校验
+// 2) _mi-connect._udp.local. TXT appsData Base64 真实控制端口解析
+// 3) _lyra-mdns._udp.local. 新一代服务解析与 TTL=0 Goodbye 退网记录过滤
+// 4) MdnsDiscovery 多网卡 QU 启停 + trigger_query() 突发唤醒无阻塞快速退出
+static void test_mdns_qu_unicast_and_multi_service_discovery() {
+    // 1. 验证 QU (0x8001) vs QM (0x0001)
+    auto qu = discovery::MdnsDiscovery::build_ptr_query_packet("_mi-connect._udp.local", true);
+    auto qm = discovery::MdnsDiscovery::build_ptr_query_packet("_mi-connect._udp.local", false);
+    CHECK(qu.size() == qm.size() && qu.size() > 16);
+    CHECK(qu[qu.size() - 4] == 0x00 && qu[qu.size() - 3] == 0x0C); // PTR
+    CHECK(qu[qu.size() - 2] == 0x80 && qu[qu.size() - 1] == 0x01); // QU = 1, IN = 1
+    CHECK(qm[qm.size() - 2] == 0x00 && qm[qm.size() - 1] == 0x01); // QM = 0, IN = 1
+
+    auto append_name = [](std::vector<uint8_t>& buf, const std::string& name) {
+        size_t start = 0;
+        while (start < name.size()) {
+            size_t dot = name.find('.', start);
+            if (dot == std::string::npos) dot = name.size();
+            size_t len = dot - start;
+            if (len > 0) {
+                buf.push_back(static_cast<uint8_t>(len));
+                buf.insert(buf.end(), name.begin() + static_cast<ptrdiff_t>(start),
+                           name.begin() + static_cast<ptrdiff_t>(dot));
+            }
+            start = dot + 1;
+        }
+        buf.push_back(0);
+    };
+    auto append_rr = [&](std::vector<uint8_t>& buf, const std::string& name,
+                         uint16_t type, uint32_t ttl, const std::vector<uint8_t>& rdata) {
+        append_name(buf, name);
+        buf.push_back(static_cast<uint8_t>(type >> 8));
+        buf.push_back(static_cast<uint8_t>(type & 0xFF));
+        buf.push_back(0x00);
+        buf.push_back(0x01); // IN
+        buf.push_back(static_cast<uint8_t>((ttl >> 24) & 0xFF));
+        buf.push_back(static_cast<uint8_t>((ttl >> 16) & 0xFF));
+        buf.push_back(static_cast<uint8_t>((ttl >> 8) & 0xFF));
+        buf.push_back(static_cast<uint8_t>(ttl & 0xFF));
+        buf.push_back(static_cast<uint8_t>(rdata.size() >> 8));
+        buf.push_back(static_cast<uint8_t>(rdata.size() & 0xFF));
+        buf.insert(buf.end(), rdata.begin(), rdata.end());
+    };
+    auto make_txt = [](const std::vector<std::string>& kvs) {
+        std::vector<uint8_t> out;
+        for (const auto& kv : kvs) {
+            out.push_back(static_cast<uint8_t>(kv.size()));
+            out.insert(out.end(), kv.begin(), kv.end());
+        }
+        return out;
+    };
+
+    // 2. 真机 _mi-connect 响应包（SoundFlow-Pad(F8TnlfFbXH), apps=[5], dev=4, appsData=gQAEBIMiww== -> 8899）
+    {
+        std::vector<uint8_t> pkt(12, 0);
+        pkt[2] = 0x84; // Response + AA
+        pkt[7] = 2;    // ANCOUNT = 2
+        std::vector<uint8_t> ptr_rdata;
+        append_name(ptr_rdata, "SoundFlow-Pad(F8TnlfFbXH)._mi-connect._udp.local");
+        append_rr(pkt, "_mi-connect._udp.local", 12, 10, ptr_rdata);
+        append_rr(pkt, "SoundFlow-Pad(F8TnlfFbXH)._mi-connect._udp.local", 16, 10,
+                  make_txt({"version=196608", "apps=[5]", "name=SoundFlow-Pad", "idHash=RjhU",
+                            "dev=4", "appsData=gQAEBIMiww=="}));
+        discovery::DiscoveredDevice dev;
+        CHECK(discovery::MdnsDiscovery::parse_response_packet(pkt.data(), pkt.size(), "192.168.5.84", dev));
+        CHECK(dev.name == "SoundFlow-Pad");
+        CHECK(dev.id_hash == "RjhU");
+        CHECK(dev.device_type == 4);
+        CHECK(dev.ip == "192.168.5.84");
+        CHECK(dev.cmd_port == 8899);
+
+        // 自定义非 8899 端口 appsData (9988 -> gQAAAAAnBA==)
+        std::vector<uint8_t> pkt2(12, 0);
+        pkt2[2] = 0x84;
+        pkt2[7] = 2;
+        append_rr(pkt2, "_mi-connect._udp.local", 12, 120, ptr_rdata);
+        append_rr(pkt2, "SoundFlow-Pad(F8TnlfFbXH)._mi-connect._udp.local", 16, 120,
+                  make_txt({"apps=[5]", "name=Redmi K90 Pro Max", "mac=AA:BB:CC:DD:EE:FF", "appsData=gQAAAAAnBA=="}));
+        discovery::DiscoveredDevice dev2;
+        CHECK(discovery::MdnsDiscovery::parse_response_packet(pkt2.data(), pkt2.size(), "192.168.5.84", dev2));
+        CHECK(dev2.name == "Redmi K90 Pro Max");
+        CHECK(dev2.cmd_port == 9988);
+    }
+
+    // 3. 真机 _lyra-mdns AppData 二进制 TLV (T=0x02) 中英文真名完整解码（v0 7B头与 v2 9B头）+ 防护校验
+    {
+        // v0 7B 头部实机抓包: C79DF89E._lyra-mdns -> "SoundFlow-Pad" (绝不显示 C79DF89E)
+        std::vector<uint8_t> lyra_ptr1;
+        append_name(lyra_ptr1, "C79DF89E._lyra-mdns._udp.local");
+        std::vector<uint8_t> lyra_pkt1(12, 0);
+        lyra_pkt1[2] = 0x84;
+        lyra_pkt1[7] = 2;
+        append_rr(lyra_pkt1, "_lyra-mdns._udp.local", 12, 10, lyra_ptr1);
+        append_rr(lyra_pkt1, "C79DF89E._lyra-mdns._udp.local", 16, 10,
+                  make_txt({"AppData=AEAFx534ngAFGSQQAQMKAwHargEBgAINU291bmRGbG93LVBhZCUBAw==", "MediumType=8192"}));
+        discovery::DiscoveredDevice d1;
+        CHECK(discovery::MdnsDiscovery::parse_response_packet(lyra_pkt1.data(), lyra_pkt1.size(), "192.168.5.84", d1));
+        CHECK(d1.name == "SoundFlow-Pad");
+        CHECK(d1.name_priority == 1);
+
+        // v2 9B 头部实机抓包: A85D47E1._lyra-mdns -> "帅小白的REDMI K90 Pro Max"
+        std::vector<uint8_t> lyra_ptr2;
+        append_name(lyra_ptr2, "A85D47E1._lyra-mdns._udp.local");
+        std::vector<uint8_t> lyra_pkt2(12, 0);
+        lyra_pkt2[2] = 0x84;
+        lyra_pkt2[7] = 2;
+        append_rr(lyra_pkt2, "_lyra-mdns._udp.local", 12, 120, lyra_ptr2);
+        append_rr(lyra_pkt2, "A85D47E1._lyra-mdns._udp.local", 16, 120,
+                  make_txt({"AppData=AkEBqF1H4UGlAAUZPxdBBwoDAagTAQIBICMAIwKRPwId5biF5bCP55m955qEUkVETUkgSzkwIFBybyBNYXgmACYFBBUViro="}));
+        discovery::DiscoveredDevice d2;
+        CHECK(discovery::MdnsDiscovery::parse_response_packet(lyra_pkt2.data(), lyra_pkt2.size(), "192.168.5.84", d2));
+        CHECK(d2.name == "帅小白的REDMI K90 Pro Max");
+        CHECK(d2.name_priority == 1);
+
+        // 代理 TUN 虚拟网段 198.18.0.1 不得被误识别为局域网音箱
+        discovery::DiscoveredDevice d;
+        std::vector<uint8_t> mi_ptr;
+        append_name(mi_ptr, "TY1234._mi-connect._udp.local");
+        std::vector<uint8_t> tun_pkt(12, 0);
+        tun_pkt[2] = 0x84;
+        tun_pkt[7] = 2;
+        append_rr(tun_pkt, "_mi-connect._udp.local", 12, 120, mi_ptr);
+        append_rr(tun_pkt, "TY1234._mi-connect._udp.local", 16, 120, make_txt({"apps=[5]", "name=TY1234"}));
+        CHECK(!discovery::MdnsDiscovery::parse_response_packet(tun_pkt.data(), tun_pkt.size(), "198.18.0.1", d));
+
+        // 非 MiPlay 服务的 _mi-connect (apps=[1,2] 不含 5) 必须被忽略
+        std::vector<uint8_t> non_audio(12, 0);
+        non_audio[2] = 0x84;
+        non_audio[7] = 2;
+        append_rr(non_audio, "_mi-connect._udp.local", 12, 120, mi_ptr);
+        append_rr(non_audio, "TY1234._mi-connect._udp.local", 16, 120, make_txt({"apps=[1,2]", "name=TY1234"}));
+        CHECK(!discovery::MdnsDiscovery::parse_response_packet(non_audio.data(), non_audio.size(), "192.168.5.90", d));
+
+        // TTL == 0 Goodbye 包不得误报在线
+        std::vector<uint8_t> bye(12, 0);
+        bye[2] = 0x84;
+        bye[7] = 1;
+        append_rr(bye, "_mi-connect._udp.local", 12, 0, mi_ptr);
+        CHECK(!discovery::MdnsDiscovery::parse_response_packet(bye.data(), bye.size(), "192.168.5.90", d));
+    }
+
+    // 4. 真实启停 + trigger_query() 突发唤醒快速回收
+    {
+        discovery::MdnsDiscovery disc;
+        CHECK(disc.start("127.0.0.1", [](const discovery::DiscoveredDevice&) {}));
+        disc.trigger_query();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        auto t0 = std::chrono::steady_clock::now();
+        disc.stop();
+        auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        CHECK(stop_ms < 800);
+    }
+
+    std::cout << "[PASS] test_mdns_qu_unicast_and_multi_service_discovery\n";
+}
+
 int main() {
     test_cmd8899_codec_and_safety();
     test_master_clock_and_trendline();
@@ -1225,6 +1427,7 @@ int main() {
     test_disconnect_no_deadlock_and_teardown(true);
     test_rtsp_multiport_dual_tcp_negotiation();
     test_smooth_audio_anti_jitter_pipeline();
+    test_mdns_qu_unicast_and_multi_service_discovery();
     std::cout << "\nALL MIPLAY_CORE TESTS PASSED!\n";
     return 0;
 }
