@@ -12,7 +12,8 @@ use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use p256::{EncodedPoint, PublicKey};
 use serde_json::json;
 use sha2::Sha256;
-use std::collections::HashMap;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -26,6 +27,10 @@ use crate::protocol::CONTROL_PORT;
 
 pub const LYRA_COMMAND_PORT: u16 = 55_982;
 
+const MAX_PEER_SESSIONS: usize = 128;
+const MAX_CACHED_RESPONSES: usize = 64;
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
+
 const KCP_PUSH: u8 = 0x51;
 const KCP_ACK: u8 = 0x52;
 const LOGICAL_TRUST_LOCAL_NETWORK: u64 = 0x40;
@@ -36,11 +41,22 @@ const SESSION_KEY_SALT: [u8; 32] = [
 
 pub struct LyraControlServer {
     port: u16,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl LyraControlServer {
     pub const fn port(&self) -> u16 {
         self.port
+    }
+}
+
+impl Drop for LyraControlServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -50,15 +66,52 @@ struct PendingResponse {
     count: u8,
 }
 
-#[derive(Default)]
 struct PeerSession {
     server_sn: u32,
     responses: HashMap<u32, Vec<u8>>,
+    response_order: VecDeque<u32>,
     pending: HashMap<u32, PendingResponse>,
     account_hash: Vec<u8>,
     session_key: Option<[u8; 32]>,
     client_channel_id: Option<u64>,
     server_channel_id: Option<u64>,
+    last_active: Instant,
+}
+
+impl Default for PeerSession {
+    fn default() -> Self {
+        Self::new(Instant::now())
+    }
+}
+
+impl PeerSession {
+    fn new(now: Instant) -> Self {
+        Self {
+            server_sn: 0,
+            responses: HashMap::new(),
+            response_order: VecDeque::new(),
+            pending: HashMap::new(),
+            account_hash: Vec::new(),
+            session_key: None,
+            client_channel_id: None,
+            server_channel_id: None,
+            last_active: now,
+        }
+    }
+
+    fn cache_response(&mut self, sn: u32, packet: Vec<u8>) {
+        if !self.responses.contains_key(&sn) {
+            self.response_order.push_back(sn);
+        }
+        self.responses.insert(sn, packet);
+        while self.responses.len() > MAX_CACHED_RESPONSES {
+            if let Some(oldest) = self.response_order.pop_front() {
+                self.responses.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 struct LogicalFrame {
@@ -86,16 +139,22 @@ pub fn start_lyra_server(
     shutdown: Arc<AtomicBool>,
     events: EventEmitter,
 ) -> Result<LyraControlServer> {
-    let socket = UdpSocket::bind((local_ip, LYRA_COMMAND_PORT)).with_context(|| {
-        format!("bind Xiaomi Lyra command socket {local_ip}:{LYRA_COMMAND_PORT}")
-    })?;
+    let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .context("create Xiaomi Lyra command socket")?;
+    let _ = raw.set_reuse_address(true);
+    raw.bind(&SocketAddr::from((local_ip, LYRA_COMMAND_PORT)).into())
+        .with_context(|| {
+            format!("bind Xiaomi Lyra command socket {local_ip}:{LYRA_COMMAND_PORT}")
+        })?;
+    let socket: UdpSocket = raw.into();
     socket
         .set_read_timeout(Some(Duration::from_millis(50)))
         .context("set Xiaomi Lyra command receive timeout")?;
     let local = socket
         .local_addr()
         .context("read Xiaomi Lyra command address")?;
-    thread::Builder::new()
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker = thread::Builder::new()
         .name("miplay-lyra-control".to_owned())
         .spawn(move || {
             events(json!({
@@ -110,14 +169,34 @@ pub fn start_lyra_server(
                 receiver_name,
                 platform,
                 device_type,
-                shutdown,
+                worker_shutdown,
                 events,
             );
         })
         .context("spawn Xiaomi Lyra command server")?;
     Ok(LyraControlServer {
         port: LYRA_COMMAND_PORT,
+        shutdown,
+        worker: Some(worker),
     })
+}
+
+fn prune_stale_sessions(sessions: &mut HashMap<SocketAddr, PeerSession>, now: Instant) {
+    sessions.retain(|_, session| {
+        !session.pending.is_empty()
+            || now.saturating_duration_since(session.last_active) < SESSION_IDLE_TTL
+    });
+    while sessions.len() > MAX_PEER_SESSIONS {
+        let victim = sessions
+            .iter()
+            .min_by_key(|(_, session)| (session.session_key.is_some(), session.last_active))
+            .map(|(peer, _)| *peer);
+        if let Some(peer) = victim {
+            sessions.remove(&peer);
+        } else {
+            break;
+        }
+    }
 }
 
 fn run_server(
@@ -149,10 +228,14 @@ fn run_server(
                     "code": "miplay_lyra_receive_failed",
                     "message": error.to_string(),
                 }));
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(50));
                 continue;
             }
         };
+        let now = Instant::now();
+        if sessions.len() >= MAX_PEER_SESSIONS && !sessions.contains_key(&peer) {
+            prune_stale_sessions(&mut sessions, now);
+        }
         let packet = &buffer[..length];
         events(json!({
             "event": "lyra_packet_received",
@@ -176,7 +259,8 @@ fn run_server(
             }
             let payload = &packet[offset..offset + payload_len];
             offset += payload_len;
-            let session = sessions.entry(peer).or_default();
+            let session = sessions.entry(peer).or_insert_with(|| PeerSession::new(now));
+            session.last_active = now;
             if cmd == KCP_ACK {
                 session.pending.remove(&sn);
                 session.pending.retain(|server_sn, _| *server_sn >= una);
@@ -230,7 +314,7 @@ fn run_server(
             );
             response_packet.extend_from_slice(&response);
             let _ = socket.send_to(&response_packet, peer);
-            session.responses.insert(sn, response_packet.clone());
+            session.cache_response(sn, response_packet.clone());
             session.pending.insert(
                 server_sn,
                 PendingResponse {
@@ -267,6 +351,7 @@ fn retransmit_due(
         }
         session.pending.retain(|_, pending| pending.count < 8);
     }
+    prune_stale_sessions(sessions, now);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1033,5 +1118,28 @@ mod tests {
                 Some(account_hash.as_slice())
             );
         }
+    }
+
+    #[test]
+    fn peer_session_bounds_response_cache_and_prunes_stale_entries() {
+        let base = Instant::now();
+        let mut session = PeerSession::new(base);
+        for sn in 0..(MAX_CACHED_RESPONSES as u32 + 12) {
+            session.cache_response(sn, vec![sn as u8]);
+        }
+        assert_eq!(session.responses.len(), MAX_CACHED_RESPONSES);
+        assert!(!session.responses.contains_key(&0));
+        assert!(session.responses.contains_key(&(MAX_CACHED_RESPONSES as u32 + 11)));
+
+        let mut sessions = HashMap::new();
+        for i in 0..(MAX_PEER_SESSIONS + 20) {
+            let addr: SocketAddr = format!("192.168.1.2:{}", 40000 + i).parse().unwrap();
+            sessions.insert(addr, PeerSession::new(base));
+        }
+        prune_stale_sessions(&mut sessions, base + Duration::from_secs(1));
+        assert_eq!(sessions.len(), MAX_PEER_SESSIONS);
+
+        prune_stale_sessions(&mut sessions, base + SESSION_IDLE_TTL + Duration::from_secs(1));
+        assert!(sessions.is_empty());
     }
 }

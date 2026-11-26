@@ -49,31 +49,31 @@ public final class RootHardeningManager {
                 && ai.sourceDir != null
                 && ai.sourceDir.contains("/priv-app/");
 
-        CommandResult suProbe = runSu("id -u && (magisk -v 2>/dev/null || echo none)");
-        if (!suProbe.ok || !suProbe.output.contains("0")) {
+        String pkg = context.getPackageName();
+        String script = ""
+                + "echo \"UID=$(id -u)\"; "
+                + "echo \"MV=$(magisk -v 2>/dev/null || echo none)\"; "
+                + "echo \"WL=$(dumpsys deviceidle whitelist 2>/dev/null | grep -c " + pkg + ")\"; "
+                + "echo \"PP=$(settings get system perf_proc_protect_list 2>/dev/null | grep -c " + pkg + ")\"; "
+                + "if [ -d " + MODULE_DIR + " ] && [ ! -f " + MODULE_DIR + "/remove ] && [ ! -f " + MODULE_DIR + "/disable ]; then echo MOD=1; else echo MOD=0; fi; "
+                + "if [ -x " + MODULE_DIR + "/service.sh ] || [ -x " + GUARD_SCRIPT + " ]; then echo GRD=1; else echo GRD=0; fi";
+        CommandResult details = runSu(script);
+        boolean isRootUid = false;
+        for (String line : details.output.split("\\r?\\n")) {
+            String trimmed = line.trim();
+            if ("UID=0".equals(trimmed)) isRootUid = true;
+            else if (trimmed.startsWith("MV=") && !"MV=none".equals(trimmed)) st.magiskVersion = trimmed.substring(3).trim();
+            else if (trimmed.startsWith("WL=") && !"WL=0".equals(trimmed)) st.inDozeWhitelist = true;
+            else if (trimmed.startsWith("PP=") && !"PP=0".equals(trimmed)) st.inPerfProtectList = true;
+            else if ("MOD=1".equals(trimmed)) st.moduleInstalled = true;
+            else if ("GRD=1".equals(trimmed)) st.guardInstalled = true;
+        }
+        if (!details.ok || !isRootUid) {
             st.rootAvailable = false;
             st.summary = "未检测到 Root (su) 权限，当前使用标准 App 前台服务+防杀保护";
             return st;
         }
         st.rootAvailable = true;
-        String[] lines = suProbe.output.trim().split("\\r?\\n");
-        if (lines.length > 1 && !"none".equals(lines[1].trim())) {
-            st.magiskVersion = lines[1].trim();
-        }
-
-        String pkg = context.getPackageName();
-        String script = ""
-                + "echo \"WL=$(dumpsys deviceidle whitelist 2>/dev/null | grep -c " + pkg + ")\"; "
-                + "echo \"PP=$(settings get system perf_proc_protect_list 2>/dev/null | grep -c " + pkg + ")\"; "
-                + "if [ -d " + MODULE_DIR + " ] && [ ! -f " + MODULE_DIR + "/remove ]; then echo MOD=1; else echo MOD=0; fi; "
-                + "if [ -x " + GUARD_SCRIPT + " ]; then echo GRD=1; else echo GRD=0; fi";
-        CommandResult details = runSu(script);
-        for (String line : details.output.split("\\r?\\n")) {
-            if (line.startsWith("WL=") && !"WL=0".equals(line.trim())) st.inDozeWhitelist = true;
-            if (line.startsWith("PP=") && !"PP=0".equals(line.trim())) st.inPerfProtectList = true;
-            if ("MOD=1".equals(line.trim())) st.moduleInstalled = true;
-            if ("GRD=1".equals(line.trim())) st.guardInstalled = true;
-        }
 
         StringBuilder sb = new StringBuilder();
         sb.append("Root 已就绪").append(st.magiskVersion.isEmpty() ? "" : " (" + st.magiskVersion + ")");
@@ -124,17 +124,17 @@ public final class RootHardeningManager {
                     + "set -e; "
                     + "rm -rf " + MODULE_DIR + "; "
                     + "mkdir -p " + MODULE_DIR + "/system/product/priv-app/SoundFlowReceiver "
-                    + MODULE_DIR + "/system/product/etc/permissions /data/adb/service.d; "
+                    + MODULE_DIR + "/system/product/etc/permissions; "
+                    + "rm -f " + GUARD_SCRIPT + "; "
                     + "cp -f " + shellQuote(new File(stage, "module.prop").getAbsolutePath()) + " " + MODULE_DIR + "/module.prop; "
                     + "cp -f " + shellQuote(new File(permDir, "privapp-permissions-io.soundflow.receiver.xml").getAbsolutePath()) + " "
                     + MODULE_DIR + "/system/product/etc/permissions/privapp-permissions-io.soundflow.receiver.xml; "
                     + "cp -f " + shellQuote(srcApk) + " " + MODULE_DIR + "/system/product/priv-app/SoundFlowReceiver/SoundFlowReceiver.apk; "
                     + "cp -f " + shellQuote(new File(commonDir, "service.sh").getAbsolutePath()) + " " + MODULE_DIR + "/service.sh; "
-                    + "cp -f " + shellQuote(new File(commonDir, "service.sh").getAbsolutePath()) + " " + GUARD_SCRIPT + "; "
                     + "chmod 0755 " + MODULE_DIR + " " + MODULE_DIR + "/system " + MODULE_DIR + "/system/product "
                     + MODULE_DIR + "/system/product/priv-app " + MODULE_DIR + "/system/product/priv-app/SoundFlowReceiver "
                     + MODULE_DIR + "/system/product/etc " + MODULE_DIR + "/system/product/etc/permissions "
-                    + MODULE_DIR + "/service.sh " + GUARD_SCRIPT + "; "
+                    + MODULE_DIR + "/service.sh; "
                     + "chmod 0644 " + MODULE_DIR + "/module.prop "
                     + MODULE_DIR + "/system/product/priv-app/SoundFlowReceiver/SoundFlowReceiver.apk "
                     + MODULE_DIR + "/system/product/etc/permissions/privapp-permissions-io.soundflow.receiver.xml; "

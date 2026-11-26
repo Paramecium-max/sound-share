@@ -12,7 +12,7 @@ import zipfile
 
 PROJ = Path(__file__).resolve().parent
 ROOT = PROJ.parent.parent
-TOOLS = ROOT / "拆包内容/tools"
+TOOLS = Path(os.environ.get("SOUNDFLOW_TOOLS_DIR", str(ROOT / "拆包内容/tools")))
 JAVA_BIN = TOOLS / "jdk17/usr/lib/jvm/java-17-openjdk-amd64/bin"
 AAPT2 = TOOLS / "aapt2/aapt2"
 SDK_JAR = TOOLS / "android-sdk/android-35-public.jar"
@@ -21,14 +21,15 @@ APKSIGNER_JAR = TOOLS / "apksigner-local/usr/share/java/apksigner-31.0.2.jar"
 
 BUILD = PROJ / "build"
 BUILD.mkdir(exist_ok=True)
-OUT_APP = ROOT / "输出内容/应用"
-OUT_ZIP = ROOT / "输出内容/刷机包"
-DEBUG_DIR = ROOT / "调试文件/音流独立接收器"
+OUT_ROOT = Path(os.environ.get("SOUNDFLOW_OUT_DIR", str(ROOT / "输出内容")))
+OUT_APP = OUT_ROOT / "应用"
+OUT_ZIP = OUT_ROOT / "刷机包"
+DEBUG_DIR = Path(os.environ.get("SOUNDFLOW_DEBUG_DIR", str(ROOT / "调试文件/音流独立接收器")))
 OUT_APP.mkdir(parents=True, exist_ok=True)
 OUT_ZIP.mkdir(parents=True, exist_ok=True)
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-VERSION = "1.1.18"
+VERSION = "1.1.19"
 
 
 def run(*args, **kw):
@@ -243,7 +244,7 @@ def build_apk(so_path: Path) -> Path:
                    for p in (PROJ / "src").rglob("*.java"))
 
     out_apk = OUT_APP / f"音流独立音频接收器_v{VERSION}.apk"
-    tmp_signed.replace(out_apk)
+    shutil.move(str(tmp_signed), str(out_apk))
     return out_apk
 
 
@@ -264,7 +265,7 @@ def build_magisk_zip(apk_path: Path) -> Path:
         assert {"module.prop", "customize.sh", "service.sh", perm_rel, mod_priv_apk}.issubset(z.namelist())
 
     out_zip = OUT_ZIP / f"J716F_SoundFlow_独立音频接收器系统固化_v{VERSION}.zip"
-    tmp_zip.replace(out_zip)
+    shutil.move(str(tmp_zip), str(out_zip))
     return out_zip
 
 

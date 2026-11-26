@@ -788,9 +788,18 @@ window.SoundFlowStage = {
   },
 
   setArtworkBase64(base64Str) {
-    if (!base64Str || base64Str.length < 512) return;
+    if (!base64Str || base64Str.length < 128) return;
+    if (/^https?:\/\//i.test(base64Str)) return;
+    let url = base64Str;
+    if (!base64Str.startsWith("data:image/")) {
+      const mime = base64Str.startsWith("/9j/")
+        ? "image/jpeg"
+        : base64Str.startsWith("iVBOR")
+          ? "image/png"
+          : "image/webp";
+      url = `data:${mime};base64,${base64Str}`;
+    }
     const img = new Image();
-    const url = "data:image/webp;base64," + base64Str;
     img.onload = () => {
       hasCustomArtwork = true;
       const ctx = coverCanvas.getContext("2d");
@@ -892,7 +901,9 @@ window.SoundFlowStage = {
         if (matchedIdx >= 0) {
           lastMatchedLrcIdx = matchedIdx;
           const matched = fullLrcLines[matchedIdx];
-          currentTimeMs = Math.max(0, matched.startTime + 60);
+          // Compensate syncOffsetMs so effectiveClockMs() lands on the matched line
+          // instead of jumping backward when syncOffsetMs is negative (default -600ms).
+          currentTimeMs = Math.max(0, matched.startTime - syncOffsetMs + 60);
           if (usingNativeAmll()) {
             try {
               lyricPlayer.setCurrentTime(Math.round(effectiveClockMs()), false);

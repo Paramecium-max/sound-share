@@ -41,6 +41,7 @@ import android.widget.FrameLayout;
 
 import org.json.JSONObject;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -48,6 +49,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
@@ -67,9 +69,13 @@ public final class MainActivity extends Activity {
     };
     private final LyricOrchestrator lyricOrchestrator = new LyricOrchestrator();
     private final Messenger replyMessenger = new Messenger(new IncomingUiHandler());
+    private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
 
     private Messenger serviceMessenger;
     private boolean boundToService = false;
+    private int pendingOnsetSensitivity = -1;
+    private boolean rootInspectDone = false;
+    private String cachedRootSummary = "正在检测 su / Kitsune Magisk 状态…";
 
     private FrameLayout rootHost;
     private WebView webView;
@@ -126,6 +132,9 @@ public final class MainActivity extends Activity {
             boundToService = true;
             sendToService(ReceiverService.MSG_REGISTER);
             sendUiVisibilityToService(uiResumed);
+            if (pendingOnsetSensitivity >= 0) {
+                sendOnsetSensitivityToService(pendingOnsetSensitivity);
+            }
         }
 
         @Override
@@ -199,15 +208,36 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void applyConfig(String name, int deviceType, boolean enableDlna, boolean autoOnlineLyrics) {
             main.post(() -> {
+                String safeName = sanitizeDeviceName(name);
                 lyricOrchestrator.onOnlineLookupSettingChanged(autoOnlineLyrics);
-                Intent it = new Intent(MainActivity.this, ReceiverService.class)
-                        .setAction(ReceiverService.ACTION_UPDATE_CONFIG)
-                        .putExtra("name", sanitizeDeviceName(name))
-                        .putExtra("device_type", deviceType)
-                        .putExtra("enable_dlna", enableDlna)
-                        .putExtra("auto_online_lyrics", autoOnlineLyrics);
-                startServiceCompat(it);
-                refreshRootAndAntiKillStatus();
+                if (boundToService && serviceMessenger != null) {
+                    Message msg = Message.obtain(null, ReceiverService.MSG_UPDATE_CONFIG);
+                    Bundle b = new Bundle();
+                    b.putString("name", safeName);
+                    b.putInt("device_type", deviceType);
+                    b.putBoolean("enable_dlna", enableDlna);
+                    b.putBoolean("auto_online_lyrics", autoOnlineLyrics);
+                    msg.setData(b);
+                    try {
+                        serviceMessenger.send(msg);
+                    } catch (RemoteException ignored) {
+                        startServiceCompat(new Intent(MainActivity.this, ReceiverService.class)
+                                .setAction(ReceiverService.ACTION_UPDATE_CONFIG)
+                                .putExtra("name", safeName)
+                                .putExtra("device_type", deviceType)
+                                .putExtra("enable_dlna", enableDlna)
+                                .putExtra("auto_online_lyrics", autoOnlineLyrics));
+                    }
+                } else {
+                    Intent it = new Intent(MainActivity.this, ReceiverService.class)
+                            .setAction(ReceiverService.ACTION_UPDATE_CONFIG)
+                            .putExtra("name", safeName)
+                            .putExtra("device_type", deviceType)
+                            .putExtra("enable_dlna", enableDlna)
+                            .putExtra("auto_online_lyrics", autoOnlineLyrics);
+                    startServiceCompat(it);
+                }
+                refreshRootAndAntiKillStatus(false);
             });
         }
 
@@ -221,6 +251,16 @@ public final class MainActivity extends Activity {
                 else if ("resume".equals(cmd)) action = ReceiverService.ACTION_RESUME;
                 else if ("next".equals(cmd)) action = ReceiverService.ACTION_NEXT;
                 else return;
+                if (boundToService && serviceMessenger != null) {
+                    Message msg = Message.obtain(null, ReceiverService.MSG_CONTROL_ACTION);
+                    Bundle b = new Bundle();
+                    b.putString("cmd", cmd);
+                    msg.setData(b);
+                    try {
+                        serviceMessenger.send(msg);
+                        return;
+                    } catch (RemoteException ignored) {}
+                }
                 startServiceCompat(new Intent(MainActivity.this, ReceiverService.class).setAction(action));
             });
         }
@@ -228,28 +268,50 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void setVolume(int percent) {
             main.post(() -> {
+                int clamped = Math.max(0, Math.min(100, percent));
+                if (boundToService && serviceMessenger != null) {
+                    Message msg = Message.obtain(null, ReceiverService.MSG_SET_VOLUME, clamped, 0);
+                    try {
+                        serviceMessenger.send(msg);
+                        return;
+                    } catch (RemoteException ignored) {}
+                }
                 Intent it = new Intent(MainActivity.this, ReceiverService.class)
                         .setAction(ReceiverService.ACTION_VOLUME)
-                        .putExtra("value", Math.max(0, Math.min(100, percent)));
+                        .putExtra("value", clamped);
                 startServiceCompat(it);
             });
         }
 
         @JavascriptInterface
         public void setAudioSyncOffset(int millis) {
-            main.post(() -> startServiceCompat(new Intent(MainActivity.this, ReceiverService.class)
-                    .setAction(ReceiverService.ACTION_AUDIO_SYNC_OFFSET)
-                    .putExtra("value", Math.max(-400, Math.min(400, millis)))));
+            main.post(() -> {
+                int clamped = Math.max(-400, Math.min(400, millis));
+                if (boundToService && serviceMessenger != null) {
+                    Message msg = Message.obtain(null, ReceiverService.MSG_SET_AUDIO_SYNC_OFFSET, clamped, 0);
+                    try {
+                        serviceMessenger.send(msg);
+                        return;
+                    } catch (RemoteException ignored) {}
+                }
+                startServiceCompat(new Intent(MainActivity.this, ReceiverService.class)
+                        .setAction(ReceiverService.ACTION_AUDIO_SYNC_OFFSET)
+                        .putExtra("value", clamped));
+            });
         }
 
         @JavascriptInterface
         public void setRippleSensitivity(int value) {
-            NativeBridge.setOnsetSensitivity(Math.max(0, Math.min(100, value)));
+            int clamped = Math.max(0, Math.min(100, value));
+            main.post(() -> {
+                pendingOnsetSensitivity = clamped;
+                sendOnsetSensitivityToService(clamped);
+            });
         }
 
         @JavascriptInterface
         public void releasePortConflict() {
-            Executors.newSingleThreadExecutor().execute(() -> {
+            bgExecutor.execute(() -> {
                 RootHardeningManager.stopPortConflictReceiver();
                 main.postDelayed(() -> {
                     Intent it = new Intent(MainActivity.this, ReceiverService.class)
@@ -272,7 +334,7 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void runRootTask(String kind) {
             main.post(() -> showJsToast("正在执行 Root 配置…"));
-            Executors.newSingleThreadExecutor().execute(() -> {
+            bgExecutor.execute(() -> {
                 RootHardeningManager.CommandResult res;
                 if ("hot".equals(kind)) {
                     res = RootHardeningManager.applyHotProtection(MainActivity.this);
@@ -286,7 +348,7 @@ public final class MainActivity extends Activity {
                             ? ("install".equals(kind) ? "Magisk 系统特权固化成功（重启后完全生效）" : "操作成功")
                             : ("操作失败：" + res.output);
                     showJsToast(msg);
-                    refreshRootAndAntiKillStatus();
+                    refreshRootAndAntiKillStatus(true);
                 });
             });
         }
@@ -425,6 +487,8 @@ public final class MainActivity extends Activity {
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
         ws.setMediaPlaybackRequiresUserGesture(false);
+        ws.setAllowFileAccess(false);
+        ws.setAllowContentAccess(false);
         web.addJavascriptInterface(new JsBridge(), "SoundFlowBridge");
 
         web.setWebChromeClient(new WebChromeClient() {
@@ -445,6 +509,9 @@ public final class MainActivity extends Activity {
                 if (uri != null && APP_HOST.equals(uri.getHost())) {
                     String path = uri.getPath();
                     if (path == null || "/".equals(path)) path = "/index.html";
+                    if (path.contains("..") || path.contains("\\")) {
+                        return new WebResourceResponse("text/plain", "utf-8", 403, "Forbidden", null, new ByteArrayInputStream(new byte[0]));
+                    }
                     String assetPath = "ui" + path;
                     try {
                         InputStream is = getAssets().open(assetPath);
@@ -454,6 +521,14 @@ public final class MainActivity extends Activity {
                         return new WebResourceResponse(mime, "utf-8", is);
                     } catch (Throwable ex) {
                         Log.w(TAG, "Asset missing: " + assetPath, ex);
+                        return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, new ByteArrayInputStream(new byte[0]));
+                    }
+                }
+                if (uri != null) {
+                    String scheme = uri.getScheme();
+                    if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+                        // Keep the UI strictly offline; block external WebView requests.
+                        return new WebResourceResponse("text/plain", "utf-8", 403, "Offline Only", null, new ByteArrayInputStream(new byte[0]));
                     }
                 }
                 return super.shouldInterceptRequest(view, request);
@@ -519,9 +594,9 @@ public final class MainActivity extends Activity {
 
     private void handleLyricVisibility(boolean playing, boolean session, Bundle b) {
         currentPlaying = playing;
-        if (playing) {
-            main.removeCallbacks(pendingHideRunnable);
-            lyricOrchestrator.setPlayingState(true);
+        main.removeCallbacks(pendingHideRunnable);
+        if (session) {
+            lyricOrchestrator.setPlayingState(playing);
             lyricOrchestrator.onMediaUpdate(
                     b.getLong("media_seq", 0),
                     b.getString("title", ""),
@@ -537,14 +612,8 @@ public final class MainActivity extends Activity {
                     b.getBoolean("auto_online_lyrics", false)
             );
         } else {
-            main.removeCallbacks(pendingHideRunnable);
-            if (!session) {
-                lyricOrchestrator.clearStage();
-                eval("window.SoundFlowStage && window.SoundFlowStage.setVisibility(false)");
-            } else {
-                lyricOrchestrator.setPlayingState(false);
-                main.postDelayed(pendingHideRunnable, 900);
-            }
+            lyricOrchestrator.clearStage();
+            eval("window.SoundFlowStage && window.SoundFlowStage.setVisibility(false)");
         }
     }
 
@@ -553,12 +622,21 @@ public final class MainActivity extends Activity {
     }
 
     private void refreshRootAndAntiKillStatus() {
+        refreshRootAndAntiKillStatus(false);
+    }
+
+    private void refreshRootAndAntiKillStatus(boolean forceRootProbe) {
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         boolean ignoring = pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
-        int cachedLyrics = lyricOrchestrator.getOfflineCacheCount();
-        Executors.newSingleThreadExecutor().execute(() -> {
-            RootHardeningManager.Status st = RootHardeningManager.inspect(this);
-            main.post(() -> evalApp("updateGuardStatus(" + ignoring + "," + JSONObject.quote(st.summary) + "," + cachedLyrics + ")"));
+        bgExecutor.execute(() -> {
+            int cachedLyrics = lyricOrchestrator.getOfflineCacheCount();
+            if (!rootInspectDone || forceRootProbe) {
+                RootHardeningManager.Status st = RootHardeningManager.inspect(this);
+                cachedRootSummary = st.summary;
+                rootInspectDone = true;
+            }
+            final String summary = cachedRootSummary;
+            main.post(() -> evalApp("updateGuardStatus(" + ignoring + "," + JSONObject.quote(summary) + "," + cachedLyrics + ")"));
         });
     }
 
@@ -615,6 +693,13 @@ public final class MainActivity extends Activity {
         if (!boundToService || serviceMessenger == null) return;
         Message msg = Message.obtain(null, ReceiverService.MSG_UI_VISIBILITY);
         msg.arg1 = visible ? 1 : 0;
+        try { serviceMessenger.send(msg); } catch (RemoteException ignored) {}
+    }
+
+    private void sendOnsetSensitivityToService(int value) {
+        if (!boundToService || serviceMessenger == null) return;
+        Message msg = Message.obtain(null, ReceiverService.MSG_SET_ONSET_SENSITIVITY);
+        msg.arg1 = Math.max(0, Math.min(100, value));
         try { serviceMessenger.send(msg); } catch (RemoteException ignored) {}
     }
 
@@ -697,7 +782,7 @@ public final class MainActivity extends Activity {
             }
         } else if (req == 902 && res == RESULT_OK && data != null && data.getData() != null) {
             Uri uri = data.getData();
-            Executors.newSingleThreadExecutor().execute(() -> {
+            bgExecutor.execute(() -> {
                 try (InputStream in = getContentResolver().openInputStream(uri)) {
                     if (in == null) return;
                     ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -762,6 +847,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         main.removeCallbacksAndMessages(null);
+        bgExecutor.shutdownNow();
         lyricOrchestrator.destroy();
         if (boundToService) {
             sendToService(ReceiverService.MSG_UNREGISTER);

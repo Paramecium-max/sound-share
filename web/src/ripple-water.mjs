@@ -118,6 +118,20 @@ export class WaterRippleRenderer {
     this.program = null;
     this.uniforms = null;
     this.sprites = new Map();
+    this.colorCache = new Map();
+    this.waveData = new Float32Array(MAX_WAVES * 4);
+    this.colorData = new Float32Array(MAX_WAVES * 3);
+    if (this.canvas) {
+      this.canvas.addEventListener("webglcontextlost", (e) => {
+        e.preventDefault();
+        this.gl = null;
+        this.program = null;
+        this.uniforms = null;
+      });
+      this.canvas.addEventListener("webglcontextrestored", () => {
+        this.initWebGL();
+      });
+    }
     this.initWebGL();
   }
 
@@ -210,32 +224,44 @@ export class WaterRippleRenderer {
 
   renderWebGL(waves, width, height, originX, originY, maxDist) {
     const gl = this.gl;
+    if (gl.isContextLost && gl.isContextLost()) {
+      this.gl = null;
+      this.renderFallback2D(waves, width, height, originX * width, originY * height, maxDist);
+      return;
+    }
     gl.viewport(0, 0, width, height);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
-    const active = waves.slice(-MAX_WAVES);
-    const waveData = new Float32Array(MAX_WAVES * 4);
-    const colorData = new Float32Array(MAX_WAVES * 3);
-    for (let i = 0; i < active.length; i++) {
-      const w = active[i];
+    const start = Math.max(0, waves.length - MAX_WAVES);
+    const count = waves.length - start;
+    const waveData = this.waveData;
+    const colorData = this.colorData;
+    waveData.fill(0);
+    colorData.fill(0);
+    for (let i = 0; i < count; i++) {
+      const w = waves[start + i];
       const amp = (0.58 + 0.52 * w.opacity) * (w.thickness >= 1.1 ? 1.15 : 0.92);
       const bandWidth = (0.036 + 0.018 * w.thickness) * (1 + w.radius * 0.35);
       waveData[i * 4] = w.radius;
       waveData[i * 4 + 1] = amp;
       waveData[i * 4 + 2] = bandWidth;
       waveData[i * 4 + 3] = w.age;
-      const [r, g, b] = parseRgb(w.rgb);
-      colorData[i * 3] = r;
-      colorData[i * 3 + 1] = g;
-      colorData[i * 3 + 2] = b;
+      let rgb = this.colorCache.get(w.rgb);
+      if (!rgb) {
+        rgb = parseRgb(w.rgb);
+        this.colorCache.set(w.rgb, rgb);
+      }
+      colorData[i * 3] = rgb[0];
+      colorData[i * 3 + 1] = rgb[1];
+      colorData[i * 3 + 2] = rgb[2];
     }
 
     gl.useProgram(this.program);
     gl.uniform2f(this.uniforms.res, width, height);
     gl.uniform2f(this.uniforms.origin, originX, originY);
     gl.uniform1f(this.uniforms.maxDist, maxDist);
-    gl.uniform1i(this.uniforms.count, active.length);
+    gl.uniform1i(this.uniforms.count, count);
     gl.uniform4fv(this.uniforms.waves, waveData);
     gl.uniform3fv(this.uniforms.colors, colorData);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

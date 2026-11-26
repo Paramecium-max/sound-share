@@ -22,8 +22,13 @@ case ",$NEW," in *,"$PKG",*) ;; *) NEW="${NEW:+$NEW,}$PKG" ;; esac
 case ",$NEW," in *,"$PROC_SVC",*) ;; *) NEW="${NEW:+$NEW,}$PROC_SVC" ;; esac
 settings put system perf_proc_protect_list "$NEW" >/dev/null 2>&1
 
-# Auto-start :receiver service if user enabled persistence (default check on shared_prefs)
+# Auto-start :receiver service if user enabled persistence (wait for FBE user-0 unlock up to 120s)
 PREF_FILE="/data/user/0/$PKG/shared_prefs/soundflow_cfg.xml"
+WAIT=0
+while [ ! -f "$PREF_FILE" ] && [ "$WAIT" -lt 120 ]; do
+    sleep 2
+    WAIT=$((WAIT + 2))
+done
 if [ -f "$PREF_FILE" ] && grep -q 'name="enabled" value="true"' "$PREF_FILE"; then
     am start-foreground-service -n "$PKG/.ReceiverService" -a "io.soundflow.receiver.ACTION_START_RECEIVER" >/dev/null 2>&1
 fi

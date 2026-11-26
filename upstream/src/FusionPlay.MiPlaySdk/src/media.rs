@@ -2192,6 +2192,7 @@ type AndroidMiPlayOboeStream = oboe::AudioStreamAsync<oboe::Output, AndroidMiPla
 #[cfg(target_os = "android")]
 enum AndroidMiPlayAudioCommand {
     Restart(OboeError),
+    EmitEvent(Value),
     Shutdown,
 }
 
@@ -2623,7 +2624,6 @@ struct AndroidMiPlayAudioCallback {
     paused: Arc<AtomicBool>,
     presentation_clock: Arc<MiPlayPresentationClock>,
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
-    events: EventEmitter,
     commands: mpsc::Sender<AndroidMiPlayAudioCommand>,
     output_sample_rate: Arc<AtomicU32>,
     callback_started: bool,
@@ -2664,12 +2664,12 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         self.latency_telemetry.update_output_latency(endpoint_latency_millis);
         if !self.callback_started {
             self.callback_started = true;
-            (self.events)(json!({
+            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
                 "event": "audio_output_callback_started",
                 "protocol": "xiaomi_miplay",
                 "frames": callback_frames,
                 "channels": 2,
-            }));
+            })));
         }
         if self.paused.load(Ordering::Acquire) {
             self.playout = AndroidPlayout::Priming;
@@ -2776,7 +2776,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                     let now = Instant::now();
                     if self.last_underflow_report.is_none_or(|last| now - last >= StdDuration::from_secs(1)) {
                         self.last_underflow_report = Some(now);
-                        (self.events)(json!({
+                        let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
                             "event": "audio_queue_underflow",
                             "protocol": "xiaomi_miplay",
                             "total_underflows": self.underflow_count,
@@ -2786,7 +2786,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                             "server_now_us": server_now,
                             "schedule_error_us": schedule_error_micros,
                             "output_latency_ms": endpoint_latency_millis,
-                        }));
+                        })));
                     }
                 }
                 reset_live_output_peak();
@@ -2797,7 +2797,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         if !self.synchronization_started {
             self.synchronization_started = true;
             let queue_delay_millis = queue.buffered_frames() as f64 * 1_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
-            (self.events)(json!({
+            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
                 "event": "audio_synchronization_started",
                 "protocol": "xiaomi_miplay",
                 "group_target_delay_ms": MIPLAY_GROUP_PLAY_DELAY_MILLIS,
@@ -2810,16 +2810,16 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                 "synchronization_mode": synchronization_mode,
                 "dropped_frames": dropped_frames,
                 "alignment_error_us": alignment_error_micros,
-            }));
+            })));
         }
         if self.last_reported_offset_ms != offset_ms && queue.buffered_frames() >= 2 {
             self.last_reported_offset_ms = offset_ms;
-            (self.events)(json!({
+            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
                 "event": "audio_sync_offset_applied",
                 "protocol": "xiaomi_miplay",
                 "offset_ms": offset_ms,
                 "synchronization_mode": synchronization_mode,
-            }));
+            })));
         }
         output[..leading_silence_frames].fill((0.0, 0.0));
         let callback_peak =
@@ -2831,7 +2831,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             && self.last_recovery_report.is_none_or(|last| last.elapsed() >= StdDuration::from_secs(1))
         {
             self.last_recovery_report = Some(Instant::now());
-            (self.events)(json!({
+            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
                 "event": "audio_queue_recovered",
                 "protocol": "xiaomi_miplay",
                 "total_underflows": self.underflow_count,
@@ -2842,16 +2842,19 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                 "server_now_us": server_now,
                 "output_latency_ms": endpoint_latency_millis,
                 "synchronization_mode": synchronization_mode,
-            }));
+            })));
         }
         LIVE_OUTPUT_PEAK_BITS.store(callback_peak.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         crate::onset::tap_output(output, output_sample_rate, endpoint_latency_millis);
         let active_slice = &output[leading_silence_frames..];
+        let sr = output_sample_rate as f32;
+        let alpha_low = 1.0 - (-std::f32::consts::TAU * 250.0 / sr).exp();
+        let alpha_mid = 1.0 - (-std::f32::consts::TAU * 2000.0 / sr).exp();
         let (mut sum_low, mut sum_mid, mut sum_high) = (0.0_f32, 0.0_f32, 0.0_f32);
         for &(l, r) in active_slice {
             let mono = 0.5 * (l + r);
-            self.lp_low += 0.031 * (mono - self.lp_low);
-            self.lp_mid += 0.25 * (mono - self.lp_mid);
+            self.lp_low += alpha_low * (mono - self.lp_low);
+            self.lp_mid += alpha_mid * (mono - self.lp_mid);
             let bass = self.lp_low;
             let mid = self.lp_mid - self.lp_low;
             let high = mono - self.lp_mid;
@@ -2887,11 +2890,11 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         }
         if callback_peak > 0.000_01 && !self.signal_started {
             self.signal_started = true;
-            (self.events)(json!({
+            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
                 "event": "audio_output_signal_started",
                 "protocol": "xiaomi_miplay",
                 "peak": callback_peak,
-            }));
+            })));
         }
         DataCallbackResult::Continue
     }
@@ -2980,7 +2983,6 @@ fn open_android_miplay_stream(
         paused,
         presentation_clock,
         latency_telemetry,
-        events: Arc::clone(&events),
         commands,
         output_sample_rate: Arc::clone(&output_sample_rate),
         callback_started: false,
@@ -3073,6 +3075,7 @@ fn manage_android_miplay_output(
         };
         match command {
             AndroidMiPlayAudioCommand::Shutdown => break,
+            AndroidMiPlayAudioCommand::EmitEvent(payload) => events(payload),
             AndroidMiPlayAudioCommand::Restart(error) => {
                 stream.take();
                 latency = AndroidOutputLatency::default();

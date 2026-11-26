@@ -154,6 +154,7 @@ pub struct ControlHub {
     control_dispatch: Arc<Mutex<ControlDispatchState>>,
     volume_percent: Arc<AtomicU32>,
     output_suspended: Arc<AtomicBool>,
+    listener_worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 #[derive(Default)]
@@ -233,6 +234,18 @@ impl ControlHub {
             control_dispatch: Arc::new(Mutex::new(ControlDispatchState::default())),
             volume_percent,
             output_suspended: Arc::new(AtomicBool::new(false)),
+            listener_worker: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn stop_listener(&self) {
+        let worker = self
+            .listener_worker
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(worker) = worker {
+            let _ = worker.join();
         }
     }
 
@@ -870,7 +883,7 @@ pub fn start_control_server(
     listener.set_nonblocking(true)?;
     let hub = ControlHub::new(volume_percent);
     let server_hub = hub.clone();
-    thread::Builder::new()
+    let listener_handle = thread::Builder::new()
         .name("miplay-control-listener".to_owned())
         .spawn(move || {
             let ids = AtomicU64::new(1);
@@ -958,12 +971,20 @@ pub fn start_control_server(
                             "code": "miplay_control_accept_failed",
                             "message": format!("小米妙播控制端接受连接失败：{error}"),
                         }));
-                        thread::sleep(Duration::from_millis(250));
+                        for _ in 0..5 {
+                            if shutdown.load(Ordering::Acquire) {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
                     }
                 }
             }
         })
         .context("spawn Xiaomi MiPlay control listener")?;
+    if let Ok(mut guard) = hub.listener_worker.lock() {
+        *guard = Some(listener_handle);
+    }
     Ok(hub)
 }
 

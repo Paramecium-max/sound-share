@@ -38,3 +38,17 @@
 ## v1.1.7 输出缓冲与发现重试
 
 Android 接收服务将手动偏移传入妙播的时间戳排程和缓冲排程。Oboe 以实际采样率请求 50 ms 输出缓冲，并记录音频驱动返回的帧数。`discovery.rs` 的 mDNS 响应循环和对端发现循环收到 `Interrupted` 后继续监听，与 Lyra UDP 的重试行为一致。
+
+## v1.1.19 全栈代码审查修复（2026-11-26）
+
+- **Rust JNI 与原生协议栈**：
+  - 修复 `native/src/lib.rs::sanitize` 短子串 `"iv"` 误删 `session_active` / `receiver_name` 等字段的问题，并对 `lyrics`（64KB）与 `artwork`（256KB）豁免 2KB 截断；新增回归单元测试。
+  - `protocol.rs::ControlHub` 与 `lyra.rs::LyraControlServer` 保存监听线程句柄并在 `Drop` 中同步回收端口（Lyra UDP 开启 `SO_REUSEADDR`）；`lyra.rs` 增加空闲对端会话淘汰与响应缓存上限防止常驻内存泄漏。
+  - `media.rs` 中 Android Oboe 音频回调事件改由通道异步转发至 `miplay-audio-route` 监控线程发射，三频段分频滤波系数按实际硬件采样率动态计算。
+- **Android 双进程服务与安全加固**：
+  - 修复水波灵敏度误写 UI 进程 `.so` 的双进程 Bug，改经 Binder `Messenger` 同步至 `:receiver` 进程并持久化；已绑定状态下控制/配置指令优先走 `Messenger` IPC；使用进程级串行工作线程 + 实例代次防服务启停竞态。
+  - `DlnaRendererServer` 增加 `http/https` 非回环 URI 校验、`Content-Length` 非负下界、有界线程池、SOAP 命名空间前缀兼容及统一的 `Visualizer` 同步采样；修复双协议切换静音残留、DLNA 误发切歌和缺失 `MediaSession` 元数据。
+  - `MainActivity` 复用单线程池并节流单次 `su` 探测，加固 WebView 离线拦截与路径穿越防护，暂停态保留歌词舞台并持续同步曲目变更；`ReceiverService.readLogTail` 加锁并避免 UTF-8 截断乱码。
+- **前端、Magisk 与构建**：
+  - 修复完整 LRC 匹配实时句时重复叠加负同步偏移回跳上一句的问题，`setArtworkBase64` 兼容 JPEG/PNG/WebP；`ripple-water.mjs` 复用缓冲并支持 `webglcontextlost` 降级与恢复。
+  - 去除 Magisk 全局 `service.d` 重复部署并在 `service.sh` 中等待 FBE 解锁；统一版本号至 `1.1.19` / `129`，支持 `build.py` 环境变量覆盖与跨分区移动。

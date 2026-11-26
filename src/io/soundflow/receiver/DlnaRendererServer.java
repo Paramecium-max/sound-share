@@ -25,6 +25,7 @@ import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.HashMap;
@@ -34,7 +35,10 @@ import java.util.UUID;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -63,7 +67,11 @@ public final class DlnaRendererServer {
     private final String localIp;
     private final String ifaceName;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService pool = Executors.newCachedThreadPool();
+    private final ExecutorService pool = new ThreadPoolExecutor(
+            2, 10, 30L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(32),
+            new ThreadPoolExecutor.AbortPolicy()
+    );
 
     private volatile boolean running = false;
     private boolean closed;
@@ -79,65 +87,93 @@ public final class DlnaRendererServer {
     private MulticastSocket ssdpSocket;
     private MediaPlayer player;
     private boolean mediaPrepared = false;
+    private final Object visualizerLock = new Object();
     private Visualizer visualizer;
     private boolean visualizerUnavailable;
     private final byte[] fft = new byte[1024];
 
     private final float[] onsetBins = new float[512];
 
-    public int onsetSampleRate = 48000;
+    public volatile int onsetSampleRate = 48000;
+
+    /** Lazily attaches Visualizer to this player's output session only; never opens the microphone. */
+    private Visualizer ensureVisualizerLocked() {
+        if (!playing || !mediaPrepared || player == null
+                || context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            return null;
+        }
+        if (visualizer == null && !visualizerUnavailable) {
+            visualizer = new Visualizer(player.getAudioSessionId());
+            visualizer.setCaptureSize(fft.length);
+            visualizer.setScalingMode(Visualizer.SCALING_MODE_NORMALIZED);
+            visualizer.setEnabled(true);
+            listener.onDlnaLog("DLNA 实频谱已启用，音频会话 " + player.getAudioSessionId());
+        }
+        return visualizer;
+    }
 
     public float[] captureOnsetSpectrum() {
-        if (!playing || !mediaPrepared || visualizer == null) return null;
-        try {
-            if (visualizer.getFft(fft) != Visualizer.SUCCESS) return null;
-            for (int k = 1; k < fft.length / 2; k++) {
-                onsetBins[k] = (float) Math.hypot(fft[2*k], fft[2*k+1]) / 128f;
+        synchronized (visualizerLock) {
+            try {
+                Visualizer v = ensureVisualizerLocked();
+                if (v == null || v.getFft(fft) != Visualizer.SUCCESS) return null;
+                for (int k = 1; k < fft.length / 2; k++) {
+                    onsetBins[k] = (float) Math.hypot(fft[2 * k], fft[2 * k + 1]) / 128f;
+                }
+                onsetSampleRate = Math.max(8000, v.getSamplingRate() / 1000);
+                return onsetBins.clone();
+            } catch (RuntimeException e) {
+                releaseVisualizerLocked();
+                visualizerUnavailable = true;
+                listener.onDlnaLog("DLNA 频谱不可用，音频播放继续: " + e.getMessage());
+                return null;
             }
-            onsetSampleRate = visualizer.getSamplingRate() / 1000;
-            return onsetBins.clone();
-        } catch (RuntimeException e) { return null; }
+        }
     }
 
     /** Reads only this player's output session; never opens the microphone. */
     public int audioSpectrum() {
-        if (!playing || !mediaPrepared || player == null
-                || context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return 0;
-        try {
-            if (visualizer == null && !visualizerUnavailable) {
-                visualizer = new Visualizer(player.getAudioSessionId());
-                visualizer.setCaptureSize(fft.length);
-                visualizer.setScalingMode(Visualizer.SCALING_MODE_NORMALIZED);
-                visualizer.setEnabled(true);
-                listener.onDlnaLog("DLNA 实频谱已启用，音频会话 " + player.getAudioSessionId());
+        synchronized (visualizerLock) {
+            try {
+                Visualizer v = ensureVisualizerLocked();
+                if (v == null || v.getFft(fft) != Visualizer.SUCCESS) return 0;
+                double low = 0, mid = 0, high = 0;
+                int lc = 0, mc = 0, hc = 0;
+                double hzPerBin = v.getSamplingRate() / (1000.0 * fft.length);
+                for (int k = 1; k < fft.length / 2; k++) {
+                    double power = fft[2 * k] * fft[2 * k] + fft[2 * k + 1] * fft[2 * k + 1];
+                    if (k * hzPerBin < 250) { low += power; lc++; }
+                    else if (k * hzPerBin < 2000) { mid += power; mc++; }
+                    else { high += power; hc++; }
+                }
+                int b = Math.min(255, (int) (Math.sqrt(low / Math.max(1, lc)) * 12));
+                int m = Math.min(255, (int) (Math.sqrt(mid / Math.max(1, mc)) * 18));
+                int h = Math.min(255, (int) (Math.sqrt(high / Math.max(1, hc)) * 24));
+                return (Math.max(b, Math.max(m, h)) << 24) | (b << 16) | (m << 8) | h;
+            } catch (RuntimeException e) {
+                releaseVisualizerLocked();
+                visualizerUnavailable = true;
+                listener.onDlnaLog("DLNA 频谱不可用，音频播放继续: " + e.getMessage());
+                return 0;
             }
-            if (visualizer == null || visualizer.getFft(fft) != Visualizer.SUCCESS) return 0;
-            double low = 0, mid = 0, high = 0;
-            int lc = 0, mc = 0, hc = 0;
-            double hzPerBin = visualizer.getSamplingRate() / (1000.0 * fft.length);
-            for (int k = 1; k < fft.length / 2; k++) {
-                double power = fft[2 * k] * fft[2 * k] + fft[2 * k + 1] * fft[2 * k + 1];
-                if (k * hzPerBin < 250) { low += power; lc++; }
-                else if (k * hzPerBin < 2000) { mid += power; mc++; }
-                else { high += power; hc++; }
-            }
-            int b = Math.min(255, (int) (Math.sqrt(low / Math.max(1, lc)) * 12));
-            int m = Math.min(255, (int) (Math.sqrt(mid / Math.max(1, mc)) * 18));
-            int h = Math.min(255, (int) (Math.sqrt(high / Math.max(1, hc)) * 24));
-            return (Math.max(b, Math.max(m, h)) << 24) | (b << 16) | (m << 8) | h;
-        } catch (RuntimeException e) {
-            releaseVisualizer();
-            visualizerUnavailable = true;
-            listener.onDlnaLog("DLNA 频谱不可用，音频播放继续: " + e.getMessage());
-            return 0;
         }
     }
 
-    public void releaseVisualizer() {
+    private void releaseVisualizerLocked() {
         if (visualizer != null) {
             try { visualizer.release(); } catch (RuntimeException ignored) {}
             visualizer = null;
         }
+    }
+
+    public void releaseVisualizer() {
+        synchronized (visualizerLock) {
+            releaseVisualizerLocked();
+        }
+    }
+
+    public void stopPlayback() {
+        mainHandler.post(this::releasePlayer);
     }
 
     public DlnaRendererServer(Context context, String udnSeed, String friendlyName, String localIp, String ifaceName, int volumePercent, Listener listener) {
@@ -235,7 +271,12 @@ public final class DlnaRendererServer {
                 Socket client = httpServer.accept();
                 openClients.add(client);
                 if (!running) { client.close(); openClients.remove(client); break; }
-                pool.execute(() -> handleHttp(client));
+                try {
+                    pool.execute(() -> handleHttp(client));
+                } catch (RejectedExecutionException rejected) {
+                    try { client.close(); } catch (IOException ignored) {}
+                    openClients.remove(client);
+                }
             } catch (IOException e) {
                 if (running) Log.w(TAG, "HTTP accept", e);
                 break;
@@ -377,7 +418,9 @@ public final class DlnaRendererServer {
             }
             int contentLen = 0;
             try {
-                if (headers.containsKey("content-length")) contentLen = Math.min(262144, Integer.parseInt(headers.get("content-length")));
+                if (headers.containsKey("content-length")) {
+                    contentLen = Math.max(0, Math.min(262144, Integer.parseInt(headers.get("content-length"))));
+                }
             } catch (NumberFormatException ignored) {}
             byte[] bodyBytes = new byte[contentLen];
             int read = 0;
@@ -412,6 +455,10 @@ public final class DlnaRendererServer {
     private String handleAvTransport(String action, String body) {
         if (action.contains("SetAVTransportURI")) {
             String uri = xmlTag(body, "CurrentURI");
+            if (!isAllowedMediaUri(uri)) {
+                listener.onDlnaLog("DLNA 拒绝非 HTTP(S) 或受限目标 URI");
+                return soapResp("AVTransport", "SetAVTransportURI", "");
+            }
             String meta = unescapeXml(xmlTag(body, "CurrentURIMetaData"));
             if (!uri.equals(currentUri)) { title = ""; artist = ""; album = ""; }
             currentUri = uri;
@@ -614,8 +661,32 @@ public final class DlnaRendererServer {
         return null;
     }
 
+    private static boolean isAllowedMediaUri(String raw) {
+        if (raw == null || raw.isEmpty()) return false;
+        try {
+            URI u = URI.create(raw.trim());
+            String scheme = u.getScheme();
+            if (scheme == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+                return false;
+            }
+            String host = u.getHost();
+            if (host == null || host.isEmpty()) return false;
+            String lower = host.toLowerCase(Locale.ROOT);
+            if ("localhost".equals(lower) || "::1".equals(lower) || "[::1]".equals(lower)
+                    || "0.0.0.0".equals(lower) || lower.startsWith("127.")
+                    || "169.254.169.254".equals(lower)) {
+                return false;
+            }
+            return true;
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
     private static String xmlTag(String xml, String tag) {
-        Pattern p = Pattern.compile("<" + Pattern.quote(tag) + "(?:\\s[^>]*)?>([\\s\\S]*?)</" + Pattern.quote(tag) + ">", Pattern.CASE_INSENSITIVE);
+        String prefix = tag.contains(":") ? "" : "(?:[A-Za-z0-9_-]+:)?";
+        String quoted = Pattern.quote(tag);
+        Pattern p = Pattern.compile("<" + prefix + quoted + "(?:\\s[^>]*)?>([\\s\\S]*?)</" + prefix + quoted + ">", Pattern.CASE_INSENSITIVE);
         Matcher m = p.matcher(xml);
         return m.find() ? unescapeXml(m.group(1).trim()) : "";
     }

@@ -397,13 +397,21 @@ public final class LyricOrchestrator {
 
     private void flushLanRecordedToDisk() {
         if (cacheDir == null || currentSongName.isEmpty() || lanRecordedLines.size() < 6) return;
-        // Never overwrite curated/imported/online cached LRCs with auto-recorded stream
-        if (hasDiskVariant(currentSongName, currentArtistName, "imported")
-                || hasDiskVariant(currentSongName, currentArtistName, "embedded")
-                || hasDiskVariant(currentSongName, currentArtistName, "cached")) {
-            return;
-        }
-        saveDiskLrc(currentSongName, currentArtistName, "lanrec", formatLrc(lanRecordedLines));
+        final String song = currentSongName;
+        final String artist = currentArtistName;
+        final String body = formatLrc(new ArrayList<>(lanRecordedLines));
+        if (netPool.isShutdown()) return;
+        try {
+            netPool.execute(() -> {
+                // Never overwrite curated/imported/online cached LRCs with auto-recorded stream
+                if (hasDiskVariant(song, artist, "imported")
+                        || hasDiskVariant(song, artist, "embedded")
+                        || hasDiskVariant(song, artist, "cached")) {
+                    return;
+                }
+                saveDiskLrc(song, artist, "lanrec", body);
+            });
+        } catch (Throwable ignored) {}
     }
 
     private static final class OfflineHit {
@@ -744,7 +752,11 @@ public final class LyricOrchestrator {
         if (pageReady && webView != null) {
             eval(js);
         } else {
-            queuedJs = (queuedJs == null || queuedJs.isEmpty()) ? js : (queuedJs + ";" + js);
+            if (queuedJs == null || queuedJs.isEmpty() || queuedJs.length() > 65536) {
+                queuedJs = js;
+            } else {
+                queuedJs = queuedJs + ";" + js;
+            }
         }
     }
 

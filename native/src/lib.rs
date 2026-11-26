@@ -52,28 +52,73 @@ impl PendingEvents {
     }
 }
 
-fn sanitize(v: &mut Value) {
+fn is_sensitive_key(key: &str) -> bool {
+    // Split on non-alphanumeric separators and camelCase boundaries so short tokens
+    // like "iv" match "aes_iv" / "streamIv" without stripping "session_active",
+    // "receiver_name", or "arrival_residual_ms".
+    let check = |slice: &str| {
+        matches!(
+            slice.to_ascii_lowercase().as_str(),
+            "key" | "iv" | "hex" | "payload" | "packet" | "challenge" | "token" | "secret"
+        )
+    };
+    for part in key.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if part.is_empty() {
+            continue;
+        }
+        let bytes = part.as_bytes();
+        let mut start = 0usize;
+        for i in 1..bytes.len() {
+            if bytes[i].is_ascii_uppercase() && bytes[i - 1].is_ascii_lowercase() {
+                if check(&part[start..i]) {
+                    return true;
+                }
+                start = i;
+            }
+        }
+        if check(&part[start..]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sanitize_with_key(v: &mut Value, key_hint: Option<&str>) {
     match v {
         Value::Object(map) => {
-            map.retain(|k, _| {
-                !["key", "iv", "hex", "payload", "packet", "challenge", "token", "secret"]
-                    .iter()
-                    .any(|s| k.to_ascii_lowercase().contains(s))
-            });
-            for value in map.values_mut() {
-                sanitize(value);
+            map.retain(|k, _| !is_sensitive_key(k));
+            for (k, value) in map.iter_mut() {
+                sanitize_with_key(value, Some(k.as_str()));
             }
         }
         Value::Array(arr) => {
             for value in arr {
-                sanitize(value);
+                sanitize_with_key(value, None);
             }
         }
-        Value::String(s) if s.len() > 2048 => {
-            *s = s.chars().take(512).collect();
-        }
+        Value::String(s) => match key_hint {
+            Some("lyrics") => {
+                if s.len() > 65_536 {
+                    *s = s.chars().take(16_384).collect();
+                }
+            }
+            Some("artwork") => {
+                if s.len() > 262_144 {
+                    s.clear();
+                }
+            }
+            _ => {
+                if s.len() > 2048 {
+                    *s = s.chars().take(512).collect();
+                }
+            }
+        },
         _ => {}
     }
+}
+
+fn sanitize(v: &mut Value) {
+    sanitize_with_key(v, None);
 }
 
 fn emit(receiver_epoch: u64, mut value: Value) {
@@ -259,15 +304,40 @@ mod tests {
         let mut payload = json!({
             "event": "auth",
             "streamKey": "secret123",
+            "aes_iv": "deadbeef",
             "nested": { "iv": "abc", "token": "xyz", "stage": "ok" },
             "title": "Song"
         });
         sanitize(&mut payload);
         assert!(payload.get("streamKey").is_none());
+        assert!(payload.get("aes_iv").is_none());
         assert!(payload["nested"].get("iv").is_none());
         assert!(payload["nested"].get("token").is_none());
         assert_eq!(payload["nested"]["stage"], "ok");
         assert_eq!(payload["title"], "Song");
+    }
+
+    #[test]
+    fn sanitize_preserves_session_active_lyrics_and_artwork() {
+        let long_lrc = "[00:01.00]这是一段测试完整歌词内容\n".repeat(120);
+        let long_art = "A".repeat(8192);
+        let long_misc = "X".repeat(3000);
+        let mut payload = json!({
+            "event": "media_info",
+            "session_active": false,
+            "receiver_name": "SoundFlow-Pad",
+            "arrival_residual_ms": 12.5,
+            "lyrics": long_lrc,
+            "artwork": long_art,
+            "misc": long_misc
+        });
+        sanitize(&mut payload);
+        assert_eq!(payload["session_active"], false);
+        assert_eq!(payload["receiver_name"], "SoundFlow-Pad");
+        assert_eq!(payload["arrival_residual_ms"], 12.5);
+        assert_eq!(payload["lyrics"].as_str().unwrap(), long_lrc);
+        assert_eq!(payload["artwork"].as_str().unwrap(), long_art);
+        assert_eq!(payload["misc"].as_str().unwrap().chars().count(), 512);
     }
 
     #[test]

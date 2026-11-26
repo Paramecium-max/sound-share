@@ -279,6 +279,8 @@ impl MiPlayReceiver {
             Ok(server) => server,
             Err(error) => {
                 shutdown.store(true, Ordering::Release);
+                hub.shutdown_sessions();
+                hub.stop_listener();
                 return Err(error);
             }
         };
@@ -309,6 +311,8 @@ impl MiPlayReceiver {
             Ok(advertisement) => advertisement,
             Err(error) => {
                 shutdown.store(true, Ordering::Release);
+                hub.shutdown_sessions();
+                hub.stop_listener();
                 return Err(error);
             }
         };
@@ -358,6 +362,7 @@ impl MiPlayReceiver {
 impl Drop for MiPlayReceiver {
     fn drop(&mut self) {
         self.controller.stop();
+        self.controller.hub.stop_listener();
     }
 }
 
