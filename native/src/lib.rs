@@ -247,6 +247,9 @@ pub extern "system" fn Java_io_soundflow_receiver_NativeBridge_poll(
         .lock()
         .map(|mut pending| pending.queue.drain(..).collect::<Vec<_>>())
         .unwrap_or_default();
+    if events.is_empty() {
+        return std::ptr::null_mut();
+    }
     java_str(
         &mut env,
         serde_json::to_string(&events).unwrap_or_else(|_| "[]".into()),
@@ -396,37 +399,94 @@ mod tests {
     }
 }
 
-fn onset_json(events: Vec<fusionplay_miplay_sdk::onset::OnsetEvent>) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
+use fusionplay_miplay_sdk::onset::{self, OnsetEvent};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+thread_local! {
+    static ONSETS: RefCell<Vec<OnsetEvent>> = RefCell::new(Vec::with_capacity(48));
+    static SPECTRUM: RefCell<[f32; 4096]> = const { RefCell::new([0.0; 4096]) };
+}
+
+fn send_onsets(env: &mut JNIEnv, events: &[OnsetEvent]) -> jstring {
+    use std::fmt::Write;
     static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-    let now = fusionplay_miplay_sdk::onset::now_ms();
-    let values: Vec<_> = events.into_iter().filter(|e| now - e.time_ms < 260.0).map(|e| serde_json::json!({
-        "id": SEQUENCE.fetch_add(1, Ordering::Relaxed),
-        "band": (["bass", "mid", "high", "drum"][e.band]),
-        "strength": e.strength, "percussion": e.percussion,
-        "delay": e.time_ms - now,
-    })).collect();
-    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_owned())
+    #[cfg(target_os = "android")]
+    let bias = onset::monotonic_bias();
+    #[cfg(not(target_os = "android"))]
+    let bias = 0.0;
+    let now = onset::now_ms();
+    let mut json = String::new();
+    for event in events.iter().filter(|e| e.time_ms.is_finite() && e.strength.is_finite() && now - e.time_ms < 100.0) {
+        let prefix = if json.is_empty() { '[' } else { ',' };
+        let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let band = ["bass", "mid", "high", "drum"][event.band];
+        let strength = event.strength.clamp(0.0, 1.0);
+        let percussion = event.percussion;
+        let target = event.time_ms + bias;
+        let _ = write!(json, r#"{prefix}{{"id":{id},"band":"{band}","strength":{strength:.4},"percussion":{percussion},"targetMs":{target:.3}}}"#);
+    }
+    if json.is_empty() {
+        return std::ptr::null_mut();
+    }
+    json.push(']');
+    java_str(env, json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_soundflow_receiver_NativeBridge_setAudioMeterEnabled(
+    _: JNIEnv, _: JClass, enabled: jni::sys::jboolean,
+) {
+    #[cfg(target_os = "android")]
+    fusionplay_miplay_sdk::set_audio_meter_enabled(enabled != 0);
+    #[cfg(not(target_os = "android"))]
+    let _ = enabled;
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_soundflow_receiver_NativeBridge_setOnsetCapture(
+    _: JNIEnv, _: JClass, enabled: jni::sys::jboolean, monotonic_nanos: jni::sys::jlong,
+) {
+    #[cfg(target_os = "android")]
+    onset::align_monotonic_clock(monotonic_nanos);
+    #[cfg(not(target_os = "android"))]
+    let _ = monotonic_nanos;
+    onset::set_capture(enabled != 0);
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_soundflow_receiver_NativeBridge_audioOnsets(
-    mut env: JNIEnv, _: JClass, active: jni::sys::jboolean,
+    mut env: JNIEnv, _: JClass,
 ) -> jstring {
-    java_str(&mut env, onset_json(fusionplay_miplay_sdk::onset::poll(active != 0)))
+    ONSETS.with(|scratch| {
+        let mut events = scratch.borrow_mut();
+        onset::poll_into(true, &mut events);
+        send_onsets(&mut env, &events)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_soundflow_receiver_NativeBridge_spectrumOnsets(
-    mut env: JNIEnv, _: JClass, bins: jni::objects::JFloatArray, rate: jint,
+    mut env: JNIEnv, _: JClass, bins: jni::objects::JFloatArray, rate: jint, stamp_nanos: jni::sys::jlong,
 ) -> jstring {
-    let count = env.get_array_length(&bins).unwrap_or(0).clamp(0, 4096);
-    let mut values = vec![0.0; count as usize];
-    if env.get_float_array_region(&bins, 0, &mut values).is_err() {
-        return java_str(&mut env, "[]".to_owned());
-    }
-    let events = fusionplay_miplay_sdk::onset::external_spectrum(&values, rate.max(1) as u32);
-    java_str(&mut env, onset_json(events))
+    let count = env.get_array_length(&bins).unwrap_or(0).clamp(0, 4096) as usize;
+    if count == 0 { return std::ptr::null_mut(); }
+    let _ = stamp_nanos;
+    #[cfg(target_os = "android")]
+    let stamp = stamp_nanos as f64 / 1e6 - onset::monotonic_bias();
+    #[cfg(not(target_os = "android"))]
+    let stamp = onset::now_ms();
+    SPECTRUM.with(|scratch| {
+        let mut values = scratch.borrow_mut();
+        if env.get_float_array_region(&bins, 0, &mut values[..count]).is_err() {
+            return std::ptr::null_mut();
+        }
+        ONSETS.with(|scratch| {
+            let mut events = scratch.borrow_mut();
+            onset::external_spectrum_into(&values[..count], rate.max(1) as u32, stamp, &mut events);
+            send_onsets(&mut env, &events)
+        })
+    })
 }
 
 #[unsafe(no_mangle)]

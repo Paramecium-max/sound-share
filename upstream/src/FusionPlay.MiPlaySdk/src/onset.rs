@@ -1,13 +1,21 @@
 // Rendered PCM analysis runs on the host analysis thread. The audio callback
 // only copies samples into this preallocated single-producer ring.
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 const CAPACITY: usize = 32768;
 const WINDOW: usize = 2048;
 const HOP: usize = 256;
+const MAX_HOPS_PER_POLL: usize = 12;
+const MAX_BINS: usize = 4096;
+static CAPTURING: AtomicBool = AtomicBool::new(!cfg!(target_os = "android"));
+static TAP_BUSY: AtomicBool = AtomicBool::new(false);
+static STREAM: AtomicU64 = AtomicU64::new(0);
+static RESET_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "android")]
+static MONOTONIC_BIAS: AtomicU64 = AtomicU64::new(0);
 static SAMPLES: [AtomicU32; CAPACITY] = [const { AtomicU32::new(0) }; CAPACITY];
 static TIMES: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -50,12 +58,56 @@ fn sensitivity_norm() -> f32 {
     SENSITIVITY.load(Ordering::Relaxed).min(100) as f32 / 100.0
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn capture_enabled() -> bool {
+    CAPTURING.load(Ordering::Relaxed)
+}
+
+pub fn set_capture(enabled: bool) {
+    CAPTURING.store(enabled, Ordering::Release);
+    if !enabled {
+        poll_into(false, &mut Vec::new());
+        if let Ok(mut detector) = EXTERNAL.lock() {
+            detector.reset();
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn align_monotonic_clock(nanos: i64) {
+    MONOTONIC_BIAS.store((nanos as f64 / 1e6 - now_ms()).to_bits(), Ordering::Release);
+}
+
+#[cfg(target_os = "android")]
+pub fn monotonic_bias() -> f64 {
+    f64::from_bits(MONOTONIC_BIAS.load(Ordering::Acquire))
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn begin_output_stream() -> u64 {
+    STREAM.fetch_add(1, Ordering::AcqRel) + 1
+}
+
 pub fn tap_output(frames: &[(f32, f32)], rate: u32, latency_ms: f64) {
-    if frames.is_empty() {
+    tap_output_at(frames, rate, now_ms() + latency_ms.max(0.0), 0, false);
+}
+
+pub(crate) fn tap_output_at(
+    frames: &[(f32, f32)], rate: u32, time: f64, stream: u64, discontinuity: bool,
+) {
+    if frames.is_empty() || !CAPTURING.load(Ordering::Relaxed)
+        || TAP_BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    if stream != STREAM.load(Ordering::Acquire) {
+        TAP_BUSY.store(false, Ordering::Release);
         return;
     }
     let start = WRITTEN.load(Ordering::Relaxed);
-    let time = now_ms() + latency_ms.max(0.0);
+    if discontinuity {
+        RESET_AT.store(start + 1, Ordering::Release);
+    }
     RATE.store(rate.max(1), Ordering::Relaxed);
     let inv_rate_ms = 1000.0 / rate.max(1) as f64;
     for (i, &(left, right)) in frames.iter().enumerate() {
@@ -67,6 +119,7 @@ pub fn tap_output(frames: &[(f32, f32)], rate: u32, latency_ms: f64) {
         );
     }
     WRITTEN.store(start + frames.len() as u64, Ordering::Release);
+    TAP_BUSY.store(false, Ordering::Release);
 }
 
 #[derive(Clone, Debug)]
@@ -78,33 +131,58 @@ pub struct OnsetEvent {
 }
 
 pub fn poll(active: bool) -> Vec<OnsetEvent> {
+    let mut events = Vec::new();
+    poll_into(active, &mut events);
+    events
+}
+
+pub fn poll_into(active: bool, events: &mut Vec<OnsetEvent>) {
+    events.clear();
     let Ok(mut state) = ANALYSIS.lock() else {
-        return Vec::new();
+        return;
     };
     let end = WRITTEN.load(Ordering::Acquire);
     if !active {
         state.reset(end);
-        return Vec::new();
+        return;
     }
     let rate = RATE.load(Ordering::Relaxed).max(1);
-    if rate != state.rate || end.saturating_sub(state.read) > (CAPACITY / 2) as u64 {
-        state.reset(end);
-        state.rate = rate;
-        return Vec::new();
+    let marker = RESET_AT.load(Ordering::Acquire);
+    if marker > state.reset_marker && marker <= end {
+        let start = state.read.max(marker - 1);
+        state.reset(start);
+        state.reset_marker = marker;
     }
+    if rate != state.rate {
+        let start = state.read;
+        state.reset(start);
+        state.rate = rate;
+    }
+    if end.saturating_sub(state.read) > (WINDOW + HOP * MAX_HOPS_PER_POLL) as u64 {
+        state.reset(end - (WINDOW + HOP * (MAX_HOPS_PER_POLL - 1)) as u64);
+    }
+    let mut remaining_hops = MAX_HOPS_PER_POLL;
+    let state = &mut *state;
     // SuperFlux log-difference peaks once the transient advances ~3/8 of the Hann window
     // past the right edge (~16 ms at 48 kHz), aligning time_ms directly to the attack start.
     let window_attack_lag_ms = (WINDOW * 3 / 8) as f64 * 1000.0 / rate as f64;
-    let mut events = Vec::new();
-    while state.read < end {
+    while state.read < end && remaining_hops != 0 {
         let at = state.read as usize % CAPACITY;
         let sample = f32::from_bits(SAMPLES[at].load(Ordering::Relaxed));
         let time = TIMES[at].load(Ordering::Relaxed) as f64 / 1000.0;
         state.read += 1;
         state.window.push_back(sample);
         if state.window.len() == WINDOW {
-            let spec = spectrum(&state.window);
-            events.extend(state.detector.process(&spec, rate, time - window_attack_lag_ms));
+            let spec = state.fft.spectrum(&state.window);
+            // Detector windows and refractory periods live on the PCM sample clock.
+            // Updating the speaker timestamp anchor must not rewind detector time.
+            let sample_time = (state.read - 1) as f64 * 1000.0 / rate as f64;
+            let first_event = events.len();
+            state.detector.process_into(spec, rate, sample_time - window_attack_lag_ms, events);
+            for event in &mut events[first_event..] {
+                event.time_ms += time - sample_time;
+            }
+            remaining_hops -= 1;
             state.window.drain(..HOP);
         }
     }
@@ -114,20 +192,27 @@ pub fn poll(active: bool) -> Vec<OnsetEvent> {
         state.reset(latest);
         events.clear();
     }
-    events
 }
 
 pub fn external_spectrum(magnitudes: &[f32], rate: u32) -> Vec<OnsetEvent> {
-    let Ok(mut detector) = EXTERNAL.lock() else {
-        return Vec::new();
-    };
-    detector.process(magnitudes, rate, now_ms())
+    let mut events = Vec::new();
+    external_spectrum_into(magnitudes, rate, now_ms(), &mut events);
+    events
+}
+
+pub fn external_spectrum_into(magnitudes: &[f32], rate: u32, time: f64, events: &mut Vec<OnsetEvent>) {
+    events.clear();
+    if let Ok(mut detector) = EXTERNAL.lock() {
+        detector.process_into(magnitudes, rate, time, events);
+    }
 }
 
 struct PcmAnalysis {
     read: u64,
+    reset_marker: u64,
     rate: u32,
     window: VecDeque<f32>,
+    fft: Fft,
     detector: Detector,
 }
 
@@ -135,8 +220,10 @@ impl PcmAnalysis {
     fn new() -> Self {
         Self {
             read: 0,
+            reset_marker: 0,
             rate: 48000,
             window: VecDeque::with_capacity(WINDOW),
+            fft: Fft::new(),
             detector: Detector::new(),
         }
     }
@@ -144,75 +231,65 @@ impl PcmAnalysis {
     fn reset(&mut self, end: u64) {
         self.read = end;
         self.window.clear();
-        self.detector = Detector::new();
+        self.detector.reset();
     }
 }
 
-// Radix-2 FFT over a Hann window. Allocations occur on the analysis thread.
-fn spectrum(samples: &VecDeque<f32>) -> Vec<f32> {
-    let n = samples.len();
-    let mut real: Vec<f32> = if n == WINDOW {
+struct Fft {
+    real: Vec<f32>,
+    imag: Vec<f32>,
+    magnitudes: Vec<f32>,
+    twiddles: Vec<(f32, f32)>,
+}
+
+impl Fft {
+    fn new() -> Self {
+        Self {
+            real: vec![0.0; WINDOW],
+            imag: vec![0.0; WINDOW],
+            magnitudes: vec![0.0; WINDOW / 2],
+            twiddles: (0..WINDOW / 2).map(|i| {
+                (-std::f32::consts::TAU * i as f32 / WINDOW as f32).sin_cos()
+            }).collect(),
+        }
+    }
+
+    fn spectrum(&mut self, samples: &VecDeque<f32>) -> &[f32] {
         let hann = &*HANN_TABLE;
-        samples
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| x * hann[i])
-            .collect()
-    } else {
-        samples
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| {
-                x * (0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1).max(1) as f32).cos())
-            })
-            .collect()
-    };
-    let mut imag = vec![0.0f32; n];
-    if n == WINDOW {
-        let rev = &*BIT_REV_TABLE;
-        for i in 1..n {
-            let j = rev[i];
-            if i < j {
-                real.swap(i, j);
-            }
+        let reverse = &*BIT_REV_TABLE;
+        for (i, &sample) in samples.iter().enumerate() {
+            self.real[reverse[i]] = sample * hann[i];
         }
-    } else {
-        let mut j = 0;
-        for i in 1..n {
-            let mut bit = n >> 1;
-            while j & bit != 0 {
-                j ^= bit;
-                bit >>= 1;
+        self.imag.fill(0.0);
+        let mut size = 2;
+        while size <= WINDOW {
+            let step = WINDOW / size;
+            for base in (0..WINDOW).step_by(size) {
+                for k in 0..size / 2 {
+                    let (im, re) = self.twiddles[k * step];
+                    let a = base + k;
+                    let b = a + size / 2;
+                    let tr = re * self.real[b] - im * self.imag[b];
+                    let ti = re * self.imag[b] + im * self.real[b];
+                    self.real[b] = self.real[a] - tr;
+                    self.imag[b] = self.imag[a] - ti;
+                    self.real[a] += tr;
+                    self.imag[a] += ti;
+                }
             }
-            j ^= bit;
-            if i < j {
-                real.swap(i, j);
-            }
+            size *= 2;
         }
+        for (i, bin) in self.magnitudes.iter_mut().enumerate() {
+            let (re, im) = (self.real[i], self.imag[i]);
+            *bin = (re * re + im * im).sqrt() * (2.0 / WINDOW as f32);
+        }
+        &self.magnitudes
     }
-    let mut size = 2;
-    while size <= n {
-        let angle = -std::f32::consts::TAU / size as f32;
-        let (wi, wr) = angle.sin_cos();
-        for base in (0..n).step_by(size) {
-            let (mut r, mut im) = (1.0f32, 0.0f32);
-            for k in 0..size / 2 {
-                let a = base + k;
-                let b = a + size / 2;
-                let tr = r * real[b] - im * imag[b];
-                let ti = r * imag[b] + im * real[b];
-                real[b] = real[a] - tr;
-                imag[b] = imag[a] - ti;
-                real[a] += tr;
-                imag[a] += ti;
-                (r, im) = (r * wr - im * wi, r * wi + im * wr);
-            }
-        }
-        size *= 2;
-    }
-    (0..n / 2)
-        .map(|i| (real[i].hypot(imag[i]) * 2.0 / n as f32).max(0.0))
-        .collect()
+}
+
+#[cfg(test)]
+fn spectrum(samples: &VecDeque<f32>) -> Vec<f32> {
+    Fft::new().spectrum(samples).to_vec()
 }
 
 fn median(values: impl Iterator<Item = f32>) -> f32 {
@@ -226,8 +303,7 @@ fn median(values: impl Iterator<Item = f32>) -> f32 {
         return 0.0;
     }
     let sorted = &mut storage[..count];
-    sorted.sort_unstable_by(f32::total_cmp);
-    sorted[count / 2]
+    *sorted.select_nth_unstable_by(count / 2, f32::total_cmp).1
 }
 
 #[derive(Clone, Copy)]
@@ -239,7 +315,11 @@ struct PendingBandPeak {
 }
 
 struct Detector {
-    ref_frames: VecDeque<(f64, Vec<f32>)>,
+    ref_frames: [(f64, Vec<f32>); 4],
+    ref_count: usize,
+    ref_next: usize,
+    bins: usize,
+    log: Vec<f32>,
     history: [VecDeque<f32>; 3],
     last_hit: [f64; 3],
     armed: [bool; 3],
@@ -254,8 +334,9 @@ struct Detector {
 impl Detector {
     fn new() -> Self {
         Self {
-            ref_frames: VecDeque::with_capacity(4),
-            history: std::array::from_fn(|_| VecDeque::with_capacity(192)),
+            ref_frames: std::array::from_fn(|_| (0.0, vec![0.0; MAX_BINS])),
+            ref_count: 0, ref_next: 0, bins: 0, log: vec![0.0; MAX_BINS],
+            history: std::array::from_fn(|_| VecDeque::with_capacity(221)),
             last_hit: [-1000.0; 3],
             armed: [true; 3],
             release_since: [None; 3],
@@ -267,44 +348,54 @@ impl Detector {
         }
     }
 
-    fn reference_spectrum<'a>(&'a self, time: f64) -> Option<&'a [f32]> {
-        let mut best: Option<&(f64, Vec<f32>)> = None;
-        for entry in &self.ref_frames {
-            if time - entry.0 >= 8.5 {
-                best = Some(entry);
-            }
-        }
-        best.or_else(|| self.ref_frames.front())
-            .map(|(_, spec)| spec.as_slice())
+    fn reset(&mut self) {
+        self.ref_count = 0;
+        self.ref_next = 0;
+        self.bins = 0;
+        for history in &mut self.history { history.clear(); }
+        self.last_hit = [-1000.0; 3];
+        self.armed = [true; 3];
+        self.release_since = [None; 3];
+        self.attack_energy = [0.0; 3];
+        self.pending = [None; 3];
+        self.last_time = -1000.0;
+        self.history_time = None;
+        self.drums.reset();
     }
 
+    #[cfg(test)]
     fn process(&mut self, input: &[f32], rate: u32, time: f64) -> Vec<OnsetEvent> {
-        if input.len() < 16 || rate == 0 {
-            return Vec::new();
-        }
-        let reset_needed = time - self.last_time > 500.0
-            || time < self.last_time
-            || self
-                .ref_frames
-                .back()
-                .is_some_and(|(_, prev)| prev.len() != input.len());
-        if reset_needed {
-            *self = Self::new();
-            self.ref_frames.push_back((time - 10.67, vec![0.0; input.len()]));
-        } else if self.ref_frames.is_empty() {
-            self.ref_frames.push_back((time - 10.67, vec![0.0; input.len()]));
+        let mut events = Vec::new();
+        self.process_into(input, rate, time, &mut events);
+        events
+    }
+
+    fn process_into(&mut self, input: &[f32], rate: u32, time: f64, events: &mut Vec<OnsetEvent>) {
+        if !(16..=MAX_BINS).contains(&input.len()) || rate == 0 { return; }
+        if time - self.last_time > 500.0 || time < self.last_time || self.bins != input.len() {
+            self.reset();
+            self.bins = input.len();
+            self.ref_frames[0].0 = time - 10.67;
+            self.ref_frames[0].1[..self.bins].fill(0.0);
+            self.ref_count = 1;
+            self.ref_next = 1;
         }
         self.last_time = time;
-
-        let log: Vec<f32> = input
-            .iter()
-            .map(|&x| (1.0 + 100.0 * x.max(0.0)).ln())
-            .collect();
+        let log = &mut self.log[..self.bins];
+        for (out, &sample) in log.iter_mut().zip(input) {
+            *out = (1.0 + 100.0 * sample.max(0.0)).ln();
+        }
+        let oldest = (self.ref_next + 4 - self.ref_count) % 4;
+        let reference = (0..self.ref_count).rev()
+            .map(|i| (oldest + i) % 4)
+            .find(|&i| time - self.ref_frames[i].0 >= 8.5)
+            .unwrap_or(oldest);
+        let ref_spec = &self.ref_frames[reference].1[..self.bins];
 
         let mut flux = [0.0f32; 3];
         let mut energy = [0.0f32; 3];
         let mut counts = [0usize; 3];
-        if let Some(ref_spec) = self.reference_spectrum(time) {
+        {
             for k in 1..input.len() - 1 {
                 let hz = k as f32 * rate as f32 / (input.len() * 2) as f32;
                 if !(22.0..12500.0).contains(&hz) {
@@ -332,7 +423,6 @@ impl Detector {
         let min_thresh = [0.0048f32, 0.0058, 0.0115];
         let band_holdoff = [92.0f64, 96.0, 110.0];
 
-        let mut events = Vec::new();
         for band in 0..3 {
             if time - self.last_hit[band] < 65.0 {
                 self.attack_energy[band] = self.attack_energy[band].max(energy[band]);
@@ -413,18 +503,13 @@ impl Detector {
             }
         }
 
-        if let Some(ref_spec) = self.reference_spectrum(time) {
-            let ref_copy = ref_spec.to_vec();
-            if let Some(drum) = self.drums.process(input, &log, &ref_copy, rate, time) {
-                events.push(drum);
-            }
+        if let Some(drum) = self.drums.process(input, log, ref_spec, rate, time) {
+            events.push(drum);
         }
-
-        self.ref_frames.push_back((time, log));
-        while self.ref_frames.len() > 4 {
-            self.ref_frames.pop_front();
-        }
-        events
+        self.ref_frames[self.ref_next].0 = time;
+        self.ref_frames[self.ref_next].1[..self.bins].copy_from_slice(log);
+        self.ref_next = (self.ref_next + 1) % 4;
+        self.ref_count = (self.ref_count + 1).min(4);
     }
 }
 
@@ -563,6 +648,7 @@ struct PendingKick {
     peak_high: f32,
     peak_flux: f32,
     sustained_beater: bool,
+    mixed_attack_at: Option<f64>,
     hops: u8,
 }
 
@@ -608,6 +694,20 @@ impl PercussionDetector {
         }
     }
 
+    fn reset(&mut self) {
+        self.frames_seen = 0;
+        self.sub_flux_hist.clear();
+        self.sub_pow_hist.clear();
+        self.perc_flux_hist.clear();
+        self.air_flux_hist.clear();
+        self.ref_powers.clear();
+        self.pending_kick = None;
+        self.pending_impact = None;
+        self.last_hit = -1000.0;
+        self.hit_sub_power = 0.0;
+        self.hit_perc_power = 0.0;
+    }
+
     fn adaptive_thresh(hist: &VecDeque<f32>, k: f32, min_val: f32) -> f32 {
         let floor = median(hist.iter().copied());
         let mad = median(hist.iter().map(|&v| (v - floor).abs()));
@@ -626,7 +726,7 @@ impl PercussionDetector {
         self.frames_seen = self.frames_seen.saturating_add(1);
         let sens = sensitivity_norm();
         let strict = 1.38 - 0.72 * sens; // 0%: 1.38, 55%: 0.98, 100%: 0.66
-        let holdoff_ms = (158.0 - 50.0 * sens) as f64; // 0%: 158ms, 55%: 130.5ms, 100%: 108ms
+        let holdoff_ms = (98.0 - 30.0 * sens) as f64;
         let since_hit = (time - self.last_hit).max(0.0);
         let perc_power = f.body_power + f.crack_power + f.air_power;
         let high_impact_power = f.crack_power + f.air_power;
@@ -636,8 +736,8 @@ impl PercussionDetector {
             self.hit_perc_power = self.hit_perc_power.max(perc_power);
         }
 
-        let sub_tail_mask = self.hit_sub_power * 0.085 * (-since_hit / 320.0).exp() as f32;
-        let perc_tail_mask = self.hit_perc_power * 0.085 * (-since_hit / 280.0).exp() as f32;
+        let sub_tail_mask = self.hit_sub_power * 0.25 * (-since_hit / 145.0).exp() as f32;
+        let perc_tail_mask = self.hit_perc_power * 0.18 * (-since_hit / 140.0).exp() as f32;
 
         let sub_flux_th = Self::adaptive_thresh(&self.sub_flux_hist, 2.35 * strict, 0.032 * strict);
         let sub_pow_floor = median(self.sub_pow_hist.iter().copied());
@@ -663,6 +763,15 @@ impl PercussionDetector {
         let mid_burst = (f.body_flux + f.crack_flux) > perc_flux_th * 1.10
             && (f.active_mid_ratio > 0.16 || f.body_flux > sub_flux_th * 0.65);
 
+        // Distinguish a renewed attack from beating between the old kick and
+        // the bass bed. A falling instantaneous power alone cannot reject it.
+        let mixed_attack = since_hit < 220.0
+            && sub_pow_floor > 0.002
+            && mid_burst
+            && upper_jump > 0.00018
+            && f.sub_flux > (sub_flux_th * 1.15).max(0.18 * strict)
+            && f.sub_power > sub_pow_floor * 0.78;
+
         let mut fired: Option<PendingImpact> = None;
         if self.frames_seen >= 3 {
             // --- Lane A: Kick / 808 / Low-Tom (causal 3-hop = 16.0 ms confirmation) ---
@@ -673,6 +782,9 @@ impl PercussionDetector {
                 pk.peak_high = pk.peak_high.max(high_jump);
                 pk.peak_flux = pk.peak_flux.max(f.sub_flux);
                 pk.init_peak_hz = pk.init_peak_hz.max(f.sub_centroid);
+                if mixed_attack && pk.mixed_attack_at.is_none() {
+                    pk.mixed_attack_at = Some(time);
+                }
                 if pk.hops == 1 {
                     pk.hop1_peak_hz = f.sub_peak_hz;
                 }
@@ -691,13 +803,16 @@ impl PercussionDetector {
                         && pk.sustained_beater
                         && pk.peak_upper > pk.peak_sub * 0.065
                         && f.sub_centroid < 165.0;
-                    if pitch_swept || beater_kick {
+                    let renewed_attack = pk.mixed_attack_at.is_some()
+                        && pk.init_peak_hz > 79.0
+                        && pk.peak_upper > pk.peak_sub * 0.020;
+                    if pitch_swept || beater_kick || renewed_attack {
                         let strength = (0.48
                             + (pk.peak_flux / (sub_flux_th * 3.0)) * 0.42
                             + pk.peak_sub.sqrt() * 0.35)
                             .clamp(0.46, 1.0);
                         fired = Some(PendingImpact {
-                            at: pk.at,
+                            at: pk.mixed_attack_at.filter(|_| renewed_attack).unwrap_or(pk.at),
                             score: pk.peak_flux / sub_flux_th.max(1e-6),
                             strength,
                             sub_power: pk.peak_sub,
@@ -711,13 +826,14 @@ impl PercussionDetector {
                 }
             }
 
+            let sub_power_rising = sub_jump > body_jump * 0.15
+                && f.sub_power > ref_sub_pow * (1.24 - 0.12 * sens)
+                && f.sub_power > sub_pow_floor * (1.35 - 0.28 * sens);
             let sub_surge = f.sub_flux > sub_flux_th
                 && f.sub_power > 0.0012f32.max(sub_tail_mask)
                 && f.sub_power > f.body_power * 0.12
-                && sub_jump > body_jump * 0.15
-                && f.sub_power > ref_sub_pow * (1.24 - 0.12 * sens)
-                && f.sub_power > sub_pow_floor * (1.35 - 0.28 * sens)
-                && f.sub_centroid < 178.0;
+                && f.sub_centroid < 178.0
+                && (sub_power_rising || mixed_attack);
 
             if fired.is_none() && self.pending_kick.is_none() && sub_surge {
                 self.pending_kick = Some(PendingKick {
@@ -729,6 +845,7 @@ impl PercussionDetector {
                     peak_high: high_jump,
                     peak_flux: f.sub_flux,
                     sustained_beater: mid_burst && upper_jump > f.sub_power * 0.065,
+                    mixed_attack_at: mixed_attack.then_some(time),
                     hops: 0,
                 });
             }
@@ -1055,7 +1172,7 @@ mod tests {
             (0.55, 1),      // sustained compressed pop kick
             (0.90, 2),      // crisp clap / woodblock percussion
             (1.25, 1),      // syncopated kick 1
-            (1.39, 1),      // syncopated kick 2 (140ms later)
+            (1.362, 1),     // syncopated kick 2 (112 ms later)
         ];
         for i in 0..96000 {
             let t = i as f32 / 48000.0;
@@ -1112,7 +1229,53 @@ mod tests {
     }
 
     #[test]
+    fn mixed_double_kicks_are_kept_and_quieter_echoes_are_rejected() {
+        fn detect(schedule: &[(f32, f32)]) -> Vec<f64> {
+            let mut detector = Detector::new();
+            let mut window = VecDeque::new();
+            let mut times = Vec::new();
+            let tau = std::f32::consts::TAU;
+            for i in 0..57600 {
+                let t = i as f32 / 48000.0;
+                let bed = 0.24 * (tau * 82.4 * t).sin()
+                    + 0.40 * (tau * 330.0 * t).sin()
+                    + 0.28 * (tau * 554.0 * t).sin()
+                    + 0.20 * (tau * 880.0 * t).sin();
+                let drum = schedule.iter().map(|&(start, amplitude)| {
+                    let dt = t - start;
+                    if !(0.0..0.42).contains(&dt) {
+                        return 0.0;
+                    }
+                    let phase = tau * (52.0 * dt + 78.0 * 0.024 * (1.0 - (-dt / 0.024).exp()));
+                    amplitude * (0.64 * (-dt / 0.11).exp() * phase.sin()
+                        + 0.18 * (tau * 260.0 * dt).sin() * (-dt / 0.009).exp())
+                }).sum::<f32>();
+                window.push_back(bed + drum);
+                if window.len() == WINDOW {
+                    let stamp = i as f64 / 48.0 - (WINDOW * 3 / 8) as f64 / 48.0;
+                    times.extend(detector.process(&spectrum(&window), 48000, stamp)
+                        .into_iter().filter(|event| event.percussion).map(|event| event.time_ms));
+                    window.drain(..HOP);
+                }
+            }
+            times
+        }
+
+        for interval in [90.0, 112.0, 125.0, 140.0] {
+            let times = detect(&[(0.42, 1.0), (0.42 + interval as f32 / 1000.0, 1.0)]);
+            assert_eq!(times.len(), 2, "{interval} ms: {times:?}");
+            for (actual, expected) in times.iter().zip([420.0, 420.0 + interval]) {
+                assert!((actual - expected).abs() <= 15.0, "{interval} ms: {times:?}");
+            }
+        }
+        let times = detect(&[(0.42, 1.0), (0.475, 0.35), (0.53, 0.22)]);
+        assert_eq!(times.len(), 1, "echoes: {times:?}");
+        assert!((times[0] - 420.0).abs() <= 15.0, "{times:?}");
+    }
+
+    #[test]
     fn tap_output_and_poll_preserve_acoustic_speaker_time_within_12ms() {
+        set_capture(true);
         let _ = poll(false);
         set_sensitivity(55);
         let latency_ms = 65.0;

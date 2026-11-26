@@ -810,15 +810,14 @@ impl ControlHub {
 }
 
 fn allocate_notification_sequence(counter: &AtomicU32) -> u32 {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            Some(if current >= u32::from(u16::MAX) {
-                1
-            } else {
-                current + 1
-            })
-        })
-        .expect("notification sequence update cannot fail")
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = if current >= u32::from(u16::MAX) { 1 } else { current + 1 };
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return previous,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn drain_matching_effects(
@@ -1142,7 +1141,9 @@ fn run_session(
     let mut initial_media_info_notification_sent = false;
     loop {
         let frame = read_frame(&mut reader, &mut cipher)?;
+        #[cfg(not(target_os = "android"))]
         let (payload_key, payload_type, payload_text) = diagnostic_payload(&frame.body);
+        #[cfg(not(target_os = "android"))]
         events(json!({
             "event": "protocol_trace",
             "direction": "in",
@@ -1214,6 +1215,7 @@ fn run_session(
                     emit_media_info(&frame.body, &events);
                 }
                 _ => {
+                    #[cfg(not(target_os = "android"))]
                     events(json!({
                         "event": "protocol_trace",
                         "direction": "unhandled",
@@ -1711,6 +1713,7 @@ fn run_session(
                 }
             }
             _ => {
+                #[cfg(not(target_os = "android"))]
                 events(json!({
                     "event": "protocol_trace",
                     "direction": "unhandled",
@@ -1730,12 +1733,15 @@ fn writer_loop(
     stream: &mut TcpStream,
     receiver: Receiver<Outgoing>,
     key: [u8; 16],
-    events: &EventEmitter,
+    _events: &EventEmitter,
 ) -> Result<()> {
     let mut cipher = ControlCipher::new(key);
     while let Ok(outgoing) = receiver.recv() {
+        #[cfg(not(target_os = "android"))]
         let plaintext_body_hex = diagnostic_hex(&outgoing.body);
+        #[cfg(not(target_os = "android"))]
         let plaintext_body_utf8 = diagnostic_utf8(&outgoing.body);
+        #[cfg(not(target_os = "android"))]
         let wrapper_key = outgoing.wrapper_key;
         let (default_outer_type, body) = match outgoing.mode {
             WireMode::Raw => (0x00, outgoing.body),
@@ -1751,7 +1757,8 @@ fn writer_loop(
             }
         };
         let outer_type = outgoing.outer_type_override.unwrap_or(default_outer_type);
-        events(json!({
+        #[cfg(not(target_os = "android"))]
+        _events(json!({
             "event": "protocol_trace",
             "direction": "out",
             "outer_type": outer_type,
@@ -1798,7 +1805,9 @@ struct Incoming {
     sequence: u32,
     encrypted: bool,
     body: Vec<u8>,
+    #[cfg(not(target_os = "android"))]
     wire_body_length: usize,
+    #[cfg(not(target_os = "android"))]
     wire_body_prefix: Vec<u8>,
 }
 
@@ -1824,7 +1833,9 @@ fn read_frame(stream: &mut TcpStream, cipher: &mut ControlCipher) -> Result<Inco
     stream
         .read_exact(&mut body)
         .context("read MiPlay control body")?;
+    #[cfg(not(target_os = "android"))]
     let wire_body_length = body.len();
+    #[cfg(not(target_os = "android"))]
     let wire_body_prefix = body[..body.len().min(DIAGNOSTIC_BYTE_LIMIT)].to_vec();
     let encrypted = body.starts_with(&[0x00, 0x07, 0x01, 0xe0]);
     if encrypted {
@@ -1838,7 +1849,9 @@ fn read_frame(stream: &mut TcpStream, cipher: &mut ControlCipher) -> Result<Inco
         sequence: u32::from(u16::from_be_bytes([header[3], header[4]])),
         encrypted,
         body,
+        #[cfg(not(target_os = "android"))]
         wire_body_length,
+        #[cfg(not(target_os = "android"))]
         wire_body_prefix,
     })
 }
@@ -1850,10 +1863,12 @@ fn diagnostic_hex(bytes: &[u8]) -> String {
     hex::encode(&bytes[..bytes.len().min(DIAGNOSTIC_BYTE_LIMIT)])
 }
 
+#[cfg(not(target_os = "android"))]
 fn diagnostic_utf8(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..bytes.len().min(DIAGNOSTIC_BYTE_LIMIT)]).into_owned()
 }
 
+#[cfg(not(target_os = "android"))]
 fn diagnostic_payload(body: &[u8]) -> (Option<String>, Option<u32>, String) {
     if let Ok((key, payload_type, payload)) = unwrap_payload(body) {
         return (Some(key), Some(payload_type), diagnostic_utf8(&payload));

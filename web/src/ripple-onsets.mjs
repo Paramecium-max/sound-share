@@ -15,7 +15,7 @@ export class RippleOnsetQueue {
     this.lastTime = -Infinity;
   }
 
-  accept(events, mode, now, elapsed = 0) {
+  accept(events, mode, now, elapsed = 0, clockBias = null) {
     if (!Array.isArray(events)) return;
     const bridgeLag = Math.max(0, Number(elapsed) || 0);
     for (const event of events) {
@@ -34,12 +34,13 @@ export class RippleOnsetQueue {
         continue;
       }
 
+      const target = Number(event.targetMs);
       const delay = Number(event.delay);
-      if (!Number.isFinite(delay)) continue;
-      const at = now + delay - bridgeLag - VISUAL_LEAD_MS;
-      if (at < now - 220 || at > now + 750) continue;
+      const at = (clockBias != null && Number.isFinite(target)
+        ? target + clockBias : now + delay - bridgeLag) - VISUAL_LEAD_MS;
+      if (!Number.isFinite(at) || at < now - 100 || at > now + 750) continue;
 
-      const near = this.pending.find((other) => Math.abs(other.at - at) < 48);
+      const near = this.pending.find((other) => Math.abs(other.at - at) < (mode === "classic" && other.band !== event.band ? 48 : 34));
       if (near) {
         const curIsDrum = event.band === "drum";
         const nearIsDrum = near.band === "drum";
@@ -49,7 +50,7 @@ export class RippleOnsetQueue {
           near.strength = Math.max(near.strength, strength);
         }
       } else if (this.pending.length < 40) {
-        const gap = mode === "percussion" ? 115 : mode === "classic" ? 110 : 95;
+        const gap = event.band === "drum" ? 55 : 90;
         this.pending.push({ at, band: event.band, strength, gap });
       }
     }
@@ -60,7 +61,7 @@ export class RippleOnsetQueue {
     let chosen = null;
     while (this.pending.length && this.pending[0].at <= now) {
       const candidate = this.pending.shift();
-      if (now - candidate.at > 200) continue;
+      if (now - candidate.at > 100) continue;
       if (candidate.at - this.lastTime < candidate.gap) continue;
       chosen = candidate;
     }

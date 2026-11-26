@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 #[cfg(target_os = "android")]
@@ -48,6 +48,16 @@ pub fn set_audio_sync_offset_ms(offset_ms: i32) {
 
 static LIVE_OUTPUT_PEAK_BITS: AtomicU32 = AtomicU32::new(0);
 static LIVE_OUTPUT_SPECTRUM_PACKED: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "android")]
+static AUDIO_METER_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "android")]
+pub fn set_audio_meter_enabled(enabled: bool) {
+    AUDIO_METER_ENABLED.store(enabled, Ordering::Release);
+    if !enabled {
+        LIVE_OUTPUT_SPECTRUM_PACKED.store(0, Ordering::Relaxed);
+    }
+}
 
 /// Returns the smoothed/recent normalized audio output peak `[0.0, 1.0]`
 /// reported directly from the real-time audio callback with zero allocations.
@@ -277,7 +287,6 @@ struct RtpTelemetryState {
     bitrate_samples: VecDeque<(Instant, usize)>,
     bitrate_bytes: usize,
     bitrate_bps: u64,
-    arrival_residual_millis: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -299,7 +308,6 @@ impl MiPlayLatencyTelemetry {
                 bitrate_samples: VecDeque::new(),
                 bitrate_bytes: 0,
                 bitrate_bps: 0,
-                arrival_residual_millis: 0.0,
             }),
             buffered_frames: AtomicU64::new(0),
             output_latency_micros: AtomicU64::new(0),
@@ -336,9 +344,6 @@ impl MiPlayLatencyTelemetry {
         while state.regression_samples.len() > MIPLAY_RTP_REGRESSION_SAMPLES {
             state.regression_samples.pop_front();
         }
-        state.arrival_residual_millis =
-            rtp_arrival_residual_millis(&state.regression_samples).unwrap_or(0.0);
-
         state.bitrate_samples.push_back((arrival, packet_bytes));
         state.bitrate_bytes = state.bitrate_bytes.saturating_add(packet_bytes);
         while state
@@ -394,7 +399,7 @@ impl MiPlayLatencyTelemetry {
                 .unwrap_or(u32::MAX),
             bitrate_bps: state.bitrate_bps,
             rtp_packet_number,
-            arrival_residual_millis: state.arrival_residual_millis,
+            arrival_residual_millis: rtp_arrival_residual_millis(&state.regression_samples).unwrap_or(0.0),
         })
     }
 }
@@ -631,39 +636,34 @@ impl MiPlayPresentationClock {
         self.local_epoch.elapsed().as_micros().min(i64::MAX as u128) as i64
     }
 
+    #[cfg(not(target_os = "android"))]
     fn synchronized_server_now_micros(&self) -> Option<i64> {
+        self.server_now(self.clock_model_snapshot()?)
+    }
+
+    fn server_now(&self, (base_local, offset_at_base, rate_ppb): (i64, i64, i64)) -> Option<i64> {
         if !self.server_clock_valid.load(Ordering::Acquire) {
             return None;
         }
         let local_now = self.local_now_micros();
-        let (base_local, offset_at_base, rate_ppb) = self.clock_model_snapshot();
         let elapsed = local_now.saturating_sub(base_local);
-        let frequency_adjustment = (i128::from(elapsed) * i128::from(rate_ppb) / 1_000_000_000_i128)
+        let adjustment = (i128::from(elapsed) * i128::from(rate_ppb) / 1_000_000_000)
             .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-        Some(
-            local_now
-                .saturating_add(offset_at_base)
-                .saturating_add(frequency_adjustment),
-        )
+        Some(local_now.saturating_add(offset_at_base).saturating_add(adjustment))
     }
 
-    fn clock_model_snapshot(&self) -> (i64, i64, i64) {
-        loop {
-            let before = self.clock_model_revision.load(Ordering::Acquire);
-            if before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let snapshot = (
-                self.clock_base_local_micros.load(Ordering::Relaxed),
-                self.clock_offset_at_base_micros.load(Ordering::Relaxed),
-                self.clock_rate_ppb.load(Ordering::Relaxed),
-            );
-            let after = self.clock_model_revision.load(Ordering::Acquire);
-            if before == after {
-                return snapshot;
-            }
+    fn clock_model_snapshot(&self) -> Option<(i64, i64, i64)> {
+        let before = self.clock_model_revision.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return None;
         }
+        let snapshot = (
+            self.clock_base_local_micros.load(Ordering::Relaxed),
+            self.clock_offset_at_base_micros.load(Ordering::Relaxed),
+            self.clock_rate_ppb.load(Ordering::Relaxed),
+        );
+        std::sync::atomic::fence(Ordering::Acquire);
+        (before == self.clock_model_revision.load(Ordering::Relaxed)).then_some(snapshot)
     }
 
     fn update_server_clock(&self, estimate: ClockEstimate) -> AppliedClockModel {
@@ -677,7 +677,8 @@ impl MiPlayPresentationClock {
             .round()
             .clamp(i64::MIN as f64, i64::MAX as f64) as i64;
         let initialized = self.server_clock_valid.load(Ordering::Acquire);
-        let (current_base, current_offset_at_base, current_rate_ppb) = self.clock_model_snapshot();
+        let (current_base, current_offset_at_base, current_rate_ppb) =
+            self.clock_model_snapshot().unwrap_or_default();
         let current_offset_now = if initialized {
             let elapsed = local_now.saturating_sub(current_base);
             let adjustment = (i128::from(elapsed) * i128::from(current_rate_ppb)
@@ -1341,7 +1342,7 @@ fn spawn_media_reader(
 }
 
 fn run_media_reader(
-    mut stream: TcpStream,
+    stream: TcpStream,
     keys: Option<StreamKeys>,
     output_device: Option<String>,
     paused: Arc<AtomicBool>,
@@ -1377,6 +1378,7 @@ fn run_media_reader(
     // RTP packet every few milliseconds, so allocating a fresh Vec for every
     // packet creates avoidable allocator traffic on the audio reader thread.
     let mut rtp = Vec::with_capacity(2_048);
+    let mut stream = BufReader::with_capacity(8192, stream);
     loop {
         let mut header = [0_u8; 4];
         if !read_exact_for_generation(
@@ -1412,8 +1414,7 @@ fn run_media_reader(
             arrival,
         );
         for packet in rtp_packet.payload.chunks_exact(188) {
-            for audio_pes in demuxer.push_ts_at(packet, Some(rtp_packet.timestamp_micros))? {
-                let aac = &audio_pes.payload;
+            demuxer.visit_ts(packet, Some(rtp_packet.timestamp_micros), |aac, pts| {
                 if first_packet {
                     first_packet = false;
                     let source_sample_rate = adts_sample_rate(aac).unwrap_or(0);
@@ -1430,8 +1431,8 @@ fn run_media_reader(
                         "transport": "RTP/MP2T/TCP",
                     }));
                 }
-                player.decode_adts(aac, audio_pes.pts_micros)?;
-            }
+                player.decode_adts(aac, pts)
+            })?;
         }
     }
 }
@@ -1500,6 +1501,7 @@ fn rtp_payload(packet: &[u8]) -> Option<&[u8]> {
     parse_rtp_packet(packet).map(|packet| packet.payload)
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct AudioPes {
     payload: Vec<u8>,
@@ -1515,7 +1517,7 @@ struct TsDemuxer {
 impl TsDemuxer {
     fn new(keys: Option<StreamKeys>) -> Self {
         Self {
-            pes: Vec::new(),
+            pes: Vec::with_capacity(4096),
             pes_rtp_pts_micros: None,
             keys,
         }
@@ -1526,53 +1528,79 @@ impl TsDemuxer {
         self.push_ts_at(packet, None)
     }
 
+    #[cfg(test)]
     fn push_ts_at(&mut self, packet: &[u8], rtp_pts_micros: Option<i64>) -> Result<Vec<AudioPes>> {
+        let mut result = Vec::new();
+        self.visit_ts(packet, rtp_pts_micros, |payload, pts_micros| {
+            result.push(AudioPes { payload: payload.to_vec(), pts_micros });
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    fn visit_ts(
+        &mut self, packet: &[u8], rtp_pts_micros: Option<i64>,
+        mut consume: impl FnMut(&[u8], Option<i64>) -> Result<()>,
+    ) -> Result<()> {
         if packet.len() != 188 || packet[0] != 0x47 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
         if pid != 0x1100 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let adaptation = (packet[3] >> 4) & 0x03;
         if adaptation == 0 || adaptation == 2 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let mut offset = 4_usize;
         if adaptation == 3 {
             offset = 5 + usize::from(packet[4]);
         }
         if offset >= packet.len() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let mut output = Vec::new();
         if packet[1] & 0x40 != 0 {
-            if !self.pes.is_empty()
-                && let Some(aac) = self.finish_pes()?
-            {
-                output.push(aac);
+            if !self.pes.is_empty() {
+                self.consume_pes(&mut consume)?;
             }
             self.pes_rtp_pts_micros = rtp_pts_micros;
         }
         self.pes.extend_from_slice(&packet[offset..]);
         if self.pes.len() >= 6 {
             let declared = u16::from_be_bytes([self.pes[4], self.pes[5]]) as usize;
-            if declared > 0
-                && self.pes.len() >= declared + 6
-                && let Some(aac) = self.finish_pes()?
-            {
-                output.push(aac);
+            if declared > 0 && self.pes.len() >= declared + 6 {
+                self.consume_pes(&mut consume)?;
             }
         }
-        Ok(output)
+        Ok(())
     }
 
+    #[cfg(test)]
     fn finish_pes(&mut self) -> Result<Option<AudioPes>> {
+        let mut result = None;
+        self.consume_pes(&mut |payload, pts_micros| {
+            result = Some(AudioPes { payload: payload.to_vec(), pts_micros });
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    fn consume_pes(&mut self, consume: &mut impl FnMut(&[u8], Option<i64>) -> Result<()>) -> Result<()> {
         let mut pes = std::mem::take(&mut self.pes);
-        let rtp_pts_micros = self.pes_rtp_pts_micros.take();
+        let result = Self::decode_pes(&mut pes, self.pes_rtp_pts_micros.take(), &mut self.keys, consume);
+        pes.clear();
+        self.pes = pes;
+        result
+    }
+
+    fn decode_pes(
+        pes: &mut Vec<u8>, rtp_pts_micros: Option<i64>, keys: &mut Option<StreamKeys>,
+        consume: &mut impl FnMut(&[u8], Option<i64>) -> Result<()>,
+    ) -> Result<()> {
         if pes.len() < 9 || pes[..4] != [0, 0, 1, 0xc0] {
-            return Ok(None);
+            return Ok(());
         }
         let declared = u16::from_be_bytes([pes[4], pes[5]]) as usize;
         if declared > 0 && declared + 6 < pes.len() {
@@ -1580,30 +1608,24 @@ impl TsDemuxer {
         }
         let payload_offset = 9 + usize::from(pes[8]);
         if payload_offset >= pes.len() {
-            return Ok(None);
+            return Ok(());
         }
         // Xiaomi's presentation offset is defined against the MPEG-TS/PES
         // timeline. The RTP timestamp uses a separate 48 kHz transport clock
         // and can have an unrelated epoch, so using it while PES PTS is
         // available can schedule valid audio arbitrarily far in the future.
         // Keep RTP time only as a compatibility fallback for malformed PES.
-        let pts_micros = pes_pts_micros(&pes).or(rtp_pts_micros);
-        let mut elementary = pes[payload_offset..].to_vec();
-        if is_adts(&elementary) {
-            return Ok(Some(AudioPes {
-                payload: elementary,
-                pts_micros,
-            }));
+        let pts_micros = pes_pts_micros(pes).or(rtp_pts_micros);
+        if is_adts(&pes[payload_offset..]) {
+            return consume(&pes[payload_offset..], pts_micros);
         }
-        let Some(keys) = self.keys.as_mut() else {
-            return Ok(Some(AudioPes {
-                payload: elementary,
-                pts_micros,
-            }));
+        let Some(keys) = keys.as_mut() else {
+            return consume(&pes[payload_offset..], pts_micros);
         };
-        if let Some(iv) = pes_private_data_iv(&pes, payload_offset) {
+        if let Some(iv) = pes_private_data_iv(pes, payload_offset) {
             keys.stream_iv = iv;
         }
+        let elementary = &mut pes[payload_offset..];
         let encrypted_len = elementary.len().min(256) / 16 * 16;
         if encrypted_len > 0 {
             let decryptor =
@@ -1613,10 +1635,7 @@ impl TsDemuxer {
                 .decrypt_padded::<NoPadding>(&mut elementary[..encrypted_len])
                 .map_err(|_| anyhow::anyhow!("decrypt media AES-CBC prefix"))?;
         }
-        Ok(Some(AudioPes {
-            payload: elementary,
-            pts_micros,
-        }))
+        consume(elementary, pts_micros)
     }
 }
 
@@ -1713,6 +1732,7 @@ fn adts_bitrate(data: &[u8]) -> Option<u64> {
     Some(bytes as u64 * 8 * u64::from(sample_rate) / 1024)
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 struct PcmQueue {
     samples: VecDeque<f32>,
     capacity: usize,
@@ -1723,6 +1743,7 @@ struct PcmQueue {
     continuity: u64,
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 impl PcmQueue {
     fn new() -> Self {
         let capacity_ms = MIPLAY_MAX_BUFFER_MILLIS;
@@ -1932,6 +1953,188 @@ impl PcmQueue {
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+trait PlayoutQueue {
+    fn buffered_frames(&self) -> usize;
+    fn drop_frames(&mut self, frames: usize) -> usize;
+}
+
+#[cfg(test)]
+impl PlayoutQueue for PcmQueue {
+    fn buffered_frames(&self) -> usize { self.buffered_frames() }
+    fn drop_frames(&mut self, frames: usize) -> usize { self.drop_frames(frames) }
+}
+
+#[cfg(any(target_os = "android", test))]
+struct PcmRing {
+    frames: Box<[AtomicU64]>,
+    pts: Box<[AtomicU64]>,
+    read: AtomicU64,
+    written: AtomicU64,
+    reset_at: AtomicU64,
+    overflowed: AtomicBool,
+    route: AtomicU64,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl PcmRing {
+    fn new(capacity: usize) -> Self {
+        let slots = || (0..capacity.next_power_of_two()).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            frames: slots(), pts: slots(), read: AtomicU64::new(0),
+            written: AtomicU64::new(0), reset_at: AtomicU64::new(0),
+            overflowed: AtomicBool::new(false), route: AtomicU64::new(0),
+        }
+    }
+
+}
+
+#[cfg(any(target_os = "android", test))]
+struct PcmProducer {
+    ring: Arc<PcmRing>,
+    next_pts: Option<f64>,
+    pending_discontinuity: bool,
+    route: u64,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl PcmProducer {
+    fn new(ring: Arc<PcmRing>) -> Self {
+        Self { ring, next_pts: None, pending_discontinuity: false, route: 0 }
+    }
+
+    fn push(&mut self, input: &[f32], pts: Option<f64>) {
+        let count = input.len() / 2;
+        let start = self.ring.written.load(Ordering::Relaxed);
+        let read = self.ring.read.load(Ordering::Acquire);
+        let route = self.ring.route.load(Ordering::Acquire);
+        if route != self.route || start == read {
+            self.next_pts = None;
+        }
+        self.route = route;
+        let discontinuity = matches!((self.next_pts, pts), (Some(expected), Some(actual))
+            if (actual - expected).abs() > MIPLAY_PTS_DISCONTINUITY_MICROS);
+        let step = 1_000_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
+        let origin = if discontinuity { pts } else { self.next_pts.or(pts) };
+        self.next_pts = origin.map(|pts| pts + count as f64 * step);
+        if count > self.ring.frames.len().saturating_sub((start - read) as usize) {
+            // Keep already-published PCM intact. Only the consumer may advance read.
+            self.pending_discontinuity |= discontinuity;
+            self.ring.overflowed.store(true, Ordering::Release);
+            return;
+        }
+        if discontinuity || self.pending_discontinuity {
+            self.ring.reset_at.store(start, Ordering::Release);
+            self.pending_discontinuity = false;
+        }
+        for (i, stereo) in input.chunks_exact(2).enumerate() {
+            let at = (start as usize + i) & (self.ring.frames.len() - 1);
+            let samples = u64::from(stereo[0].to_bits()) | (u64::from(stereo[1].to_bits()) << 32);
+            self.ring.frames[at].store(samples, Ordering::Relaxed);
+            let stamp = origin.map_or(f64::NAN, |pts| pts + i as f64 * step);
+            self.ring.pts[at].store(stamp.to_bits(), Ordering::Relaxed);
+        }
+        self.ring.written.store(start + count as u64, Ordering::Release);
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+struct PcmConsumer {
+    ring: Arc<PcmRing>,
+    read: u64,
+    end: u64,
+    reset_at: u64,
+    phase: f64,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl PcmConsumer {
+    fn new(ring: Arc<PcmRing>) -> Self {
+        let read = ring.read.load(Ordering::Acquire);
+        Self { ring, read, end: read, reset_at: read, phase: 0.0 }
+    }
+
+    fn discard_route_backlog(&mut self) {
+        self.refresh();
+        self.clear();
+        self.ring.overflowed.store(false, Ordering::Release);
+    }
+
+    fn trim_after_overflow(&mut self, keep_frames: usize) -> usize {
+        if !self.ring.overflowed.swap(false, Ordering::AcqRel) {
+            return 0;
+        }
+        self.drop_frames(self.buffered_frames().saturating_sub(keep_frames))
+    }
+
+    fn refresh(&mut self) -> bool {
+        self.end = self.ring.written.load(Ordering::Acquire);
+        let reset = self.ring.reset_at.load(Ordering::Acquire);
+        if reset >= self.end || reset <= self.reset_at {
+            return false;
+        }
+        self.reset_at = reset;
+        self.consume(reset.saturating_sub(self.read) as usize);
+        self.phase = 0.0;
+        true
+    }
+
+    fn consume(&mut self, frames: usize) {
+        self.read += frames as u64;
+        self.ring.read.store(self.read, Ordering::Release);
+    }
+
+    fn clear(&mut self) {
+        self.consume(self.buffered_frames());
+        self.phase = 0.0;
+    }
+
+    fn front_pts_micros(&self) -> Option<f64> {
+        if self.read == self.end { return None; }
+        let stamp = f64::from_bits(self.ring.pts[self.read as usize & (self.ring.pts.len() - 1)].load(Ordering::Relaxed));
+        stamp.is_finite().then_some(stamp)
+    }
+
+    fn stereo(&self, frame: u64) -> (f32, f32) {
+        let bits = self.ring.frames[frame as usize & (self.ring.frames.len() - 1)].load(Ordering::Relaxed);
+        (f32::from_bits(bits as u32), f32::from_bits((bits >> 32) as u32))
+    }
+
+    fn render_stereo_block(&mut self, output: &mut [(f32, f32)], rate: f64) -> f32 {
+        let available = self.buffered_frames();
+        let mut position = self.phase;
+        let mut peak = 0.0f32;
+        for frame in output {
+            let offset = position as usize;
+            if offset + 1 >= available {
+                *frame = (0.0, 0.0);
+                continue;
+            }
+            let (left, right) = self.stereo(self.read + offset as u64);
+            let frac = (position - offset as f64) as f32;
+            let (next_left, next_right) = self.stereo(self.read + offset as u64 + 1);
+            *frame = (left + (next_left - left) * frac, right + (next_right - right) * frac);
+            peak = peak.max(frame.0.abs()).max(frame.1.abs());
+            position += rate;
+        }
+        let consumed = (position as usize).min(available.saturating_sub(1));
+        self.consume(consumed);
+        self.phase = (position - consumed as f64).min(1.0);
+        peak
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+impl PlayoutQueue for PcmConsumer {
+    fn buffered_frames(&self) -> usize { (self.end - self.read) as usize }
+
+    fn drop_frames(&mut self, frames: usize) -> usize {
+        let dropped = frames.min(self.buffered_frames().saturating_sub(2));
+        self.consume(dropped);
+        dropped
+    }
+}
+
 fn synchronized_buffer_frames(output_latency_millis: f64) -> usize {
     let queue_latency_millis = (MIPLAY_GROUP_PLAY_DELAY_MILLIS as f64 - output_latency_millis)
         .max(MIPLAY_MINIMUM_QUEUE_DELAY_MILLIS as f64);
@@ -1974,7 +2177,7 @@ enum AndroidPlayoutAction {
 impl AndroidPlayout {
     fn plan(
         &mut self,
-        queue: &mut PcmQueue,
+        queue: &mut impl PlayoutQueue,
         schedule_error_micros: Option<f64>,
         buffer_window_frames: usize,
         callback_frames: usize,
@@ -2165,7 +2368,10 @@ const MIPLAY_OUTPUT_LATENCY_SMOOTHING: f64 = 0.2;
 
 struct AacPlayer {
     decoder: AacDecoder,
+    #[cfg(not(target_os = "android"))]
     queue: Arc<Mutex<PcmQueue>>,
+    #[cfg(target_os = "android")]
+    queue: PcmProducer,
     _stream: NativeAudioStream,
     adts_framer: AdtsFramer,
     timestamp: i64,
@@ -2176,6 +2382,7 @@ struct AacPlayer {
     pcm_input_window: (Instant, usize),
     non_silent_diagnostic_emitted: bool,
     pes_layout_diagnostic_emitted: bool,
+    #[cfg(not(target_os = "android"))]
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
 }
@@ -2192,7 +2399,6 @@ type AndroidMiPlayOboeStream = oboe::AudioStreamAsync<oboe::Output, AndroidMiPla
 #[cfg(target_os = "android")]
 enum AndroidMiPlayAudioCommand {
     Restart(OboeError),
-    EmitEvent(Value),
     Shutdown,
 }
 
@@ -2247,6 +2453,7 @@ impl AacPlayer {
             pcm_input_window: (Instant::now(), 0),
             non_silent_diagnostic_emitted: false,
             pes_layout_diagnostic_emitted: false,
+            #[cfg(not(target_os = "android"))]
             latency_telemetry,
             events,
         })
@@ -2256,15 +2463,18 @@ impl AacPlayer {
         if let Some(pts) = pes_pts_micros {
             self.next_media_pts_micros = Some(pts as f64);
         }
-        let frames = self.adts_framer.push(adts);
-        let frames_in_pes = frames.len() as u32;
-        for frame in frames {
-            let frame_pts = self.next_media_pts_micros;
-            self.decode_adts_frame(&frame, frame_pts)?;
+        let mut framer = std::mem::take(&mut self.adts_framer);
+        let mut frames_in_pes = 0;
+        let result = framer.visit_frames(adts, |frame| {
+            self.decode_adts_frame(frame, self.next_media_pts_micros)?;
             if let Some(pts) = self.next_media_pts_micros.as_mut() {
                 *pts += MIPLAY_AAC_FRAME_MICROS;
             }
-        }
+            frames_in_pes += 1;
+            Ok(())
+        });
+        self.adts_framer = framer;
+        result?;
         if !self.pes_layout_diagnostic_emitted {
             self.pes_layout_diagnostic_emitted = true;
             (self.events)(json!({
@@ -2339,26 +2549,30 @@ impl AacPlayer {
                 }));
             }
         }
+        #[cfg(target_os = "android")]
+        {
+            self.queue.push(&self.decoded_samples, media_pts_micros);
+            let ring = &self.queue.ring;
+            let buffered_frames = ring.written.load(Ordering::Relaxed)
+                .saturating_sub(ring.read.load(Ordering::Acquire)) as usize;
+            let (started_at, frame_count) = &mut self.pcm_input_window;
+            *frame_count += self.decoded_samples.len() / MIPLAY_SOURCE_CHANNELS;
+            let elapsed = started_at.elapsed();
+            if elapsed >= StdDuration::from_secs(5) {
+                (self.events)(json!({
+                    "event": "audio_pcm_input_rate",
+                    "protocol": "xiaomi_miplay",
+                    "pcm_frames_per_second": *frame_count as f64 / elapsed.as_secs_f64(),
+                    "buffered_frames": buffered_frames,
+                }));
+                self.pcm_input_window = (Instant::now(), 0);
+            }
+        }
+        #[cfg(not(target_os = "android"))]
         if let Ok(mut queue) = self.queue.lock() {
             queue.push_timed(&self.decoded_samples, media_pts_micros);
             let buffered_frames = queue.buffered_frames();
             self.latency_telemetry.update_buffered_frames(buffered_frames);
-            drop(queue);
-            #[cfg(target_os = "android")]
-            {
-                let (started_at, frame_count) = &mut self.pcm_input_window;
-                *frame_count += self.decoded_samples.len() / MIPLAY_SOURCE_CHANNELS;
-                let elapsed = started_at.elapsed();
-                if elapsed >= StdDuration::from_secs(5) {
-                    (self.events)(json!({
-                        "event": "audio_pcm_input_rate",
-                        "protocol": "xiaomi_miplay",
-                        "pcm_frames_per_second": *frame_count as f64 / elapsed.as_secs_f64(),
-                        "buffered_frames": buffered_frames,
-                    }));
-                    self.pcm_input_window = (Instant::now(), 0);
-                }
-            }
         }
         Ok(())
     }
@@ -2372,9 +2586,33 @@ struct AdtsFramer {
 }
 
 impl AdtsFramer {
+    #[cfg(test)]
     fn push(&mut self, input: &[u8]) -> Vec<Vec<u8>> {
-        self.pending.extend_from_slice(input);
         let mut frames = Vec::new();
+        self.visit_frames(input, |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        }).unwrap();
+        frames
+    }
+
+    fn visit_frames(
+        &mut self, mut input: &[u8], mut consume: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        if self.pending.is_empty() {
+            while input.len() >= 7 && has_adts_sync(input) {
+                let Some(frame_len) = adts_frame_len(input) else { break };
+                if frame_len > input.len() || frame_len <= adts_header_len(input).unwrap_or(7) {
+                    break;
+                }
+                consume(&input[..frame_len])?;
+                input = &input[frame_len..];
+            }
+            if input.is_empty() {
+                return Ok(());
+            }
+        }
+        self.pending.extend_from_slice(input);
         let mut consumed = 0;
 
         loop {
@@ -2422,7 +2660,7 @@ impl AdtsFramer {
             if remaining.len() < frame_len {
                 break;
             }
-            frames.push(remaining[..frame_len].to_vec());
+            consume(&remaining[..frame_len])?;
             consumed += frame_len;
         }
 
@@ -2442,7 +2680,7 @@ impl AdtsFramer {
                 self.pending.push(0xff);
             }
         }
-        frames
+        Ok(())
     }
 
     fn buffered_len(&self) -> usize {
@@ -2619,14 +2857,61 @@ impl AndroidOutputLatency {
 }
 
 #[cfg(target_os = "android")]
+#[derive(Default)]
+struct CallbackDiagnostics {
+    frames: AtomicU64,
+    underflows: AtomicU64,
+    synchronized: AtomicU64,
+    offset: AtomicU64,
+    recovered: AtomicU64,
+    signal: AtomicU64,
+}
+
+#[cfg(target_os = "android")]
+impl CallbackDiagnostics {
+    fn flush(&self, events: &EventEmitter) {
+        let frames = self.frames.swap(0, Ordering::AcqRel);
+        if frames != 0 {
+            events(json!({"event":"audio_output_callback_started","protocol":"xiaomi_miplay","frames":frames,"channels":2}));
+        }
+        if self.synchronized.swap(0, Ordering::AcqRel) != 0 {
+            events(json!({"event":"audio_synchronization_started","protocol":"xiaomi_miplay"}));
+        }
+        let offset = self.offset.swap(0, Ordering::AcqRel);
+        if offset != 0 {
+            events(json!({"event":"audio_sync_offset_applied","protocol":"xiaomi_miplay","offset_ms": offset as i64 - 401}));
+        }
+        let underflows = self.underflows.swap(0, Ordering::AcqRel);
+        if underflows != 0 {
+            events(json!({"event":"audio_queue_underflow","protocol":"xiaomi_miplay","total_underflows":underflows}));
+        }
+        let recovered = self.recovered.swap(0, Ordering::AcqRel);
+        if recovered != 0 {
+            events(json!({"event":"audio_queue_recovered","protocol":"xiaomi_miplay","total_underflows":recovered}));
+        }
+        let signal = self.signal.swap(0, Ordering::AcqRel);
+        if signal != 0 {
+            events(json!({"event":"audio_output_signal_started","protocol":"xiaomi_miplay","peak":f32::from_bits(signal as u32)}));
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
 struct AndroidMiPlayAudioCallback {
-    queue: Arc<Mutex<PcmQueue>>,
+    queue: PcmConsumer,
     paused: Arc<AtomicBool>,
     presentation_clock: Arc<MiPlayPresentationClock>,
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     commands: mpsc::Sender<AndroidMiPlayAudioCommand>,
     output_sample_rate: Arc<AtomicU32>,
     actual_buffer_frames: Arc<AtomicU32>,
+    diagnostics: Arc<CallbackDiagnostics>,
+    clock_model: Option<(i64, i64, i64)>,
+    output_epoch_nanos: Arc<AtomicI64>,
+    output_frame: u64,
+    onset_stream: u64,
+    next_onset_ms: Option<f64>,
+    onset_uses_hardware: bool,
     callback_started: bool,
     signal_started: bool,
     synchronization_started: bool,
@@ -2638,7 +2923,6 @@ struct AndroidMiPlayAudioCallback {
     last_recovery_report: Option<Instant>,
     last_offset_ms: i64,
     last_reported_offset_ms: i64,
-    queue_continuity: u64,
     lp_low: f32,
     lp_mid: f32,
 }
@@ -2653,6 +2937,8 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         output: &mut [(f32, f32)],
     ) -> DataCallbackResult {
         let callback_frames = output.len();
+        let first_frame = self.output_frame;
+        self.output_frame += callback_frames as u64;
         let output_sample_rate = self.output_sample_rate.load(Ordering::Acquire).max(1);
         let route_playback_rate = f64::from(MIPLAY_SAMPLE_RATE_HZ) / f64::from(output_sample_rate);
         let measured_latency_us = self.measured_latency_us.load(Ordering::Relaxed);
@@ -2665,44 +2951,29 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         self.latency_telemetry.update_output_latency(endpoint_latency_millis);
         if !self.callback_started {
             self.callback_started = true;
-            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
-                "event": "audio_output_callback_started",
-                "protocol": "xiaomi_miplay",
-                "frames": callback_frames,
-                "channels": 2,
-            })));
+            self.diagnostics.frames.store(callback_frames as u64, Ordering::Release);
         }
         if self.paused.load(Ordering::Acquire) {
+            self.next_onset_ms = None;
             self.playout = AndroidPlayout::Priming;
             self.synchronization_started = false;
             self.first_buffered_at = None;
             LIVE_OUTPUT_PEAK_BITS.store(0, Ordering::Relaxed);
             LIVE_OUTPUT_SPECTRUM_PACKED.store(0, Ordering::Relaxed);
-            if let Ok(mut queue) = self.queue.lock() {
-                queue.clear();
-            }
+            self.queue.refresh();
+            self.queue.clear();
             self.latency_telemetry.update_buffered_frames(0);
             output.fill((0.0, 0.0));
             return DataCallbackResult::Continue;
         }
-        // The decoder holds this lock only while appending one already-decoded
-        // AAC frame. Skipping a callback on contention inserts a 4 ms block of
-        // silence roughly at the AAC cadence, which is much more audible than
-        // waiting for the short append to finish.
-        let Ok(mut queue) = self.queue.lock() else {
-            LIVE_OUTPUT_PEAK_BITS.store(0, Ordering::Relaxed);
-            LIVE_OUTPUT_SPECTRUM_PACKED.store(0, Ordering::Relaxed);
-            output.fill((0.0, 0.0));
-            return DataCallbackResult::Continue;
-        };
-        self.latency_telemetry
-            .update_buffered_frames(queue.buffered_frames());
-        if self.queue_continuity != queue.continuity {
-            self.queue_continuity = queue.continuity;
+        let queue = &mut self.queue;
+        if queue.refresh() {
+            self.next_onset_ms = None;
             self.playout = AndroidPlayout::Priming;
             self.synchronization_started = false;
             self.first_buffered_at = None;
         }
+        self.latency_telemetry.update_buffered_frames(queue.buffered_frames());
         if queue.buffered_frames() >= 2 {
             self.first_buffered_at.get_or_insert_with(Instant::now);
         }
@@ -2716,7 +2987,16 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         let offset_change_ms = offset_ms - std::mem::replace(&mut self.last_offset_ms, offset_ms);
         let synchronized_frames =
             offset_buffer_frames(synchronized_buffer_frames(endpoint_latency_millis), offset_ms);
-        let server_now = self.presentation_clock.synchronized_server_now_micros();
+        let callback_reserve = (callback_frames as f64 * route_playback_rate).ceil() as usize
+            + MIPLAY_ANDROID_PLAYOUT_RESERVE_FRAMES + 4;
+        if queue.trim_after_overflow(synchronized_frames.max(callback_reserve)) != 0 {
+            self.next_onset_ms = None;
+            self.latency_telemetry.update_buffered_frames(queue.buffered_frames());
+        }
+        if let Some(model) = self.presentation_clock.clock_model_snapshot() {
+            self.clock_model = Some(model);
+        }
+        let server_now = self.clock_model.and_then(|model| self.presentation_clock.server_now(model));
         let front_pts = queue.front_pts_micros();
         let schedule_error_micros = if self.presentation_clock.synchronization_ready()
             && let (Some(front_pts), Some(server_now)) = (front_pts, server_now)
@@ -2731,11 +3011,10 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         } else {
             None
         };
-        let synchronization_mode = if schedule_error_micros.is_some() {
+        if schedule_error_micros.is_some() {
             if offset_change_ms != 0 {
                 self.playout = AndroidPlayout::Priming;
             }
-            "sender_clock"
         } else {
             if offset_change_ms > 0 {
                 self.playout = AndroidPlayout::Priming;
@@ -2754,11 +3033,10 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                 output.fill((0.0, 0.0));
                 return DataCallbackResult::Continue;
             }
-            "buffer_window"
-        };
+        }
         let previous_playout = self.playout;
-        let (leading_silence_frames, dropped_frames, alignment_error_micros) = match self.playout.plan(
-            &mut queue,
+        let leading_silence_frames = match self.playout.plan(
+            queue,
             schedule_error_micros,
             synchronized_frames,
             callback_frames,
@@ -2766,28 +3044,16 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         ) {
             AndroidPlayoutAction::Render {
                 leading_silence_frames,
-                dropped_frames,
-                alignment_error_micros,
-            } => (leading_silence_frames, dropped_frames, alignment_error_micros),
+                ..
+            } => leading_silence_frames,
             action => {
-                let buffered_frames = queue.buffered_frames();
-                drop(queue);
                 if action == AndroidPlayoutAction::Underflow {
+                    self.next_onset_ms = None;
                     self.underflow_count = self.underflow_count.saturating_add(1);
                     let now = Instant::now();
                     if self.last_underflow_report.is_none_or(|last| now - last >= StdDuration::from_secs(1)) {
                         self.last_underflow_report = Some(now);
-                        let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
-                            "event": "audio_queue_underflow",
-                            "protocol": "xiaomi_miplay",
-                            "total_underflows": self.underflow_count,
-                            "buffered_frames": buffered_frames,
-                            "output_callback_frames": callback_frames,
-                            "front_pts_us": front_pts,
-                            "server_now_us": server_now,
-                            "schedule_error_us": schedule_error_micros,
-                            "output_latency_ms": endpoint_latency_millis,
-                        })));
+                        self.diagnostics.underflows.store(self.underflow_count, Ordering::Release);
                     }
                 }
                 reset_live_output_peak();
@@ -2797,70 +3063,74 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         };
         if !self.synchronization_started {
             self.synchronization_started = true;
-            let queue_delay_millis = queue.buffered_frames() as f64 * 1_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
-            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
-                "event": "audio_synchronization_started",
-                "protocol": "xiaomi_miplay",
-                "group_target_delay_ms": MIPLAY_GROUP_PLAY_DELAY_MILLIS,
-                "queue_delay_ms": queue_delay_millis,
-                "output_latency_ms": endpoint_latency_millis,
-                "output_latency_source": if latency_measured { "hardware_timestamp" } else { "callback_size" },
-                "output_callback_frames": callback_frames,
-                "sync_offset_ms": offset_ms,
-                "output_sample_rate": output_sample_rate,
-                "synchronization_mode": synchronization_mode,
-                "dropped_frames": dropped_frames,
-                "alignment_error_us": alignment_error_micros,
-            })));
+            self.diagnostics.synchronized.store(1, Ordering::Release);
         }
         if self.last_reported_offset_ms != offset_ms && queue.buffered_frames() >= 2 {
             self.last_reported_offset_ms = offset_ms;
-            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
-                "event": "audio_sync_offset_applied",
-                "protocol": "xiaomi_miplay",
-                "offset_ms": offset_ms,
-                "synchronization_mode": synchronization_mode,
-            })));
+            self.diagnostics.offset.store((offset_ms + 401) as u64, Ordering::Release);
         }
         output[..leading_silence_frames].fill((0.0, 0.0));
+        let playback_rate = if self.playout == (AndroidPlayout::Playing { sender_clock: false })
+            && queue.buffered_frames() > callback_reserve
+        {
+            let excess = queue.buffered_frames() as f64 - synchronized_frames as f64;
+            let correction = excess / (MIPLAY_SAMPLE_RATE_HZ as f64 * 12.0);
+            route_playback_rate * (1.0 + correction.clamp(-0.002, 0.002))
+        } else {
+            route_playback_rate
+        };
         let callback_peak =
-            queue.render_stereo_block(&mut output[leading_silence_frames..], route_playback_rate);
+            queue.render_stereo_block(&mut output[leading_silence_frames..], playback_rate);
         let buffered_frames = queue.buffered_frames();
         self.latency_telemetry.update_buffered_frames(buffered_frames);
-        drop(queue);
         if previous_playout == AndroidPlayout::Rebuffering
             && self.last_recovery_report.is_none_or(|last| last.elapsed() >= StdDuration::from_secs(1))
         {
             self.last_recovery_report = Some(Instant::now());
-            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
-                "event": "audio_queue_recovered",
-                "protocol": "xiaomi_miplay",
-                "total_underflows": self.underflow_count,
-                "buffered_frames": buffered_frames,
-                "dropped_frames": dropped_frames,
-                "alignment_error_us": alignment_error_micros,
-                "front_pts_us": front_pts,
-                "server_now_us": server_now,
-                "output_latency_ms": endpoint_latency_millis,
-                "synchronization_mode": synchronization_mode,
-            })));
+            self.diagnostics.recovered.store(self.underflow_count, Ordering::Release);
         }
         LIVE_OUTPUT_PEAK_BITS.store(callback_peak.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         let active_slice = &output[leading_silence_frames..];
-        if !active_slice.is_empty() {
-            let tap_latency_millis = if latency_measured {
-                endpoint_latency_millis
+        if !active_slice.is_empty() && crate::onset::capture_enabled() {
+            let frame_ms = 1000.0 / f64::from(output_sample_rate);
+            let hardware_epoch = self.output_epoch_nanos.load(Ordering::Acquire);
+            let bias = crate::onset::monotonic_bias();
+            let first_active_frame = first_frame + leading_silence_frames as u64;
+            let uses_hardware = hardware_epoch != 0 && bias != 0.0;
+            let estimated_ms = if uses_hardware {
+                hardware_epoch as f64 / 1e6 - bias + first_active_frame as f64 * frame_ms
             } else {
-                let buf_frames = self.actual_buffer_frames.load(Ordering::Relaxed);
-                let buf_ms = if buf_frames > 0 {
-                    f64::from(buf_frames) * 1_000.0 / f64::from(output_sample_rate)
-                } else {
-                    f64::from(ANDROID_OUTPUT_BUFFER_MS)
-                };
-                buf_ms.max(endpoint_latency_millis) + 24.0
+                let buffered = self.actual_buffer_frames.load(Ordering::Relaxed);
+                let fallback = if buffered == 0 { f64::from(ANDROID_OUTPUT_BUFFER_MS) }
+                    else { f64::from(buffered) * frame_ms };
+                crate::onset::now_ms()
+                    + if latency_measured { endpoint_latency_millis } else { fallback.max(endpoint_latency_millis) }
+                    + leading_silence_frames as f64 * frame_ms
             };
-            let silence_ms = leading_silence_frames as f64 * 1_000.0 / f64::from(output_sample_rate);
-            crate::onset::tap_output(active_slice, output_sample_rate, tap_latency_millis + silence_ms);
+            let duration_ms = active_slice.len() as f64 * frame_ms;
+            let pcm_discontinuous = self.next_onset_ms.is_none();
+            let previous = self.next_onset_ms.filter(|next| {
+                self.onset_uses_hardware == uses_hardware && (next - estimated_ms).abs() <= 40.0
+            });
+            let correction = duration_ms * 0.05;
+            let first_ms = previous.map_or(estimated_ms, |next| {
+                next + (estimated_ms - next).clamp(-correction, correction)
+            });
+            self.onset_uses_hardware = uses_hardware;
+            crate::onset::tap_output_at(active_slice, output_sample_rate, first_ms,
+                self.onset_stream, pcm_discontinuous);
+            self.next_onset_ms = Some(first_ms + duration_ms);
+        } else {
+            self.next_onset_ms = None;
+        }
+        if callback_peak > 0.000_01 && !self.signal_started {
+            self.signal_started = true;
+            self.diagnostics.signal.store(u64::from(callback_peak.to_bits()), Ordering::Release);
+        }
+        if !AUDIO_METER_ENABLED.load(Ordering::Relaxed) {
+            self.lp_low = 0.0;
+            self.lp_mid = 0.0;
+            return DataCallbackResult::Continue;
         }
         let sr = output_sample_rate as f32;
         let alpha_low = 1.0 - (-std::f32::consts::TAU * 250.0 / sr).exp();
@@ -2888,12 +3158,12 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         let h_b = pack_band(sum_high, 2.35).min(255);
         // Lock-free byte-wise max hold so transients between 85ms UI polls are preserved
         let mut prev = LIVE_OUTPUT_SPECTRUM_PACKED.load(Ordering::Relaxed);
-        loop {
+        for _ in 0..2 {
             let next = ((prev >> 24).max(p_b) << 24)
                 | (((prev >> 16) & 0xff).max(b_b) << 16)
                 | (((prev >> 8) & 0xff).max(m_b) << 8)
                 | ((prev & 0xff).max(h_b));
-            match LIVE_OUTPUT_SPECTRUM_PACKED.compare_exchange_weak(
+            match LIVE_OUTPUT_SPECTRUM_PACKED.compare_exchange(
                 prev,
                 next,
                 Ordering::Relaxed,
@@ -2902,14 +3172,6 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                 Ok(_) => break,
                 Err(cur) => prev = cur,
             }
-        }
-        if callback_peak > 0.000_01 && !self.signal_started {
-            self.signal_started = true;
-            let _ = self.commands.send(AndroidMiPlayAudioCommand::EmitEvent(json!({
-                "event": "audio_output_signal_started",
-                "protocol": "xiaomi_miplay",
-                "peak": callback_peak,
-            })));
         }
         DataCallbackResult::Continue
     }
@@ -2929,19 +3191,26 @@ fn open_native_audio_output(
     presentation_clock: Arc<MiPlayPresentationClock>,
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
-) -> Result<(Arc<Mutex<PcmQueue>>, NativeAudioStream)> {
-    let queue = Arc::new(Mutex::new(PcmQueue::new()));
+) -> Result<(PcmProducer, NativeAudioStream)> {
+    let capacity = MIPLAY_SOURCE_SAMPLE_RATE
+        * (MIPLAY_MAX_BUFFER_MILLIS + MAX_AUDIO_SYNC_OFFSET_MS as usize) / 1_000;
+    let queue = Arc::new(PcmRing::new(capacity));
     let output_sample_rate = Arc::new(AtomicU32::new(MIPLAY_SAMPLE_RATE_HZ));
     let actual_buffer_frames = Arc::new(AtomicU32::new(0));
     let measured_latency_us = Arc::new(AtomicU64::new(ANDROID_UNKNOWN_LATENCY_US));
     let (commands, command_receiver) = mpsc::channel();
-    let initial_stream = open_android_miplay_stream(
+    let diagnostics = Arc::new(CallbackDiagnostics::default());
+    let output_epoch_nanos = Arc::new(AtomicI64::new(0));
+    crate::onset::now_ms();
+    let (initial_stream, initial_xruns) = open_android_miplay_stream(
         Arc::clone(&queue),
         Arc::clone(&paused),
         Arc::clone(&presentation_clock),
         Arc::clone(&latency_telemetry),
         Arc::clone(&events),
         commands.clone(),
+        Arc::clone(&diagnostics),
+        Arc::clone(&output_epoch_nanos),
         Arc::clone(&output_sample_rate),
         Arc::clone(&actual_buffer_frames),
         Arc::clone(&measured_latency_us),
@@ -2959,8 +3228,11 @@ fn open_native_audio_output(
         .spawn(move || {
             manage_android_miplay_output(
                 initial_stream,
+                initial_xruns,
                 command_receiver,
                 route_commands,
+                diagnostics,
+                output_epoch_nanos,
                 route_queue,
                 route_paused,
                 route_clock,
@@ -2983,29 +3255,43 @@ fn open_native_audio_output(
         "channels": 2,
         "sample_format": "f32",
     }));
-    Ok((queue, stream))
+    Ok((PcmProducer::new(queue), stream))
 }
 
 #[cfg(target_os = "android")]
 fn open_android_miplay_stream(
-    queue: Arc<Mutex<PcmQueue>>,
+    queue: Arc<PcmRing>,
     paused: Arc<AtomicBool>,
     presentation_clock: Arc<MiPlayPresentationClock>,
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
     commands: mpsc::Sender<AndroidMiPlayAudioCommand>,
+    diagnostics: Arc<CallbackDiagnostics>,
+    output_epoch_nanos: Arc<AtomicI64>,
     output_sample_rate: Arc<AtomicU32>,
     actual_buffer_frames: Arc<AtomicU32>,
     measured_latency_us: Arc<AtomicU64>,
-) -> Result<AndroidMiPlayOboeStream> {
+) -> Result<(AndroidMiPlayOboeStream, Option<i32>)> {
+    let reopened = queue.route.load(Ordering::Acquire) != 0;
+    let mut consumer = PcmConsumer::new(queue);
+    if reopened {
+        consumer.discard_route_backlog();
+    }
     let callback = AndroidMiPlayAudioCallback {
-        queue,
+        queue: consumer,
         paused,
         presentation_clock,
         latency_telemetry,
         commands,
         output_sample_rate: Arc::clone(&output_sample_rate),
         actual_buffer_frames: Arc::clone(&actual_buffer_frames),
+        diagnostics,
+        clock_model: None,
+        output_epoch_nanos,
+        output_frame: 0,
+        onset_stream: crate::onset::begin_output_stream(),
+        next_onset_ms: None,
+        onset_uses_hardware: false,
         callback_started: false,
         signal_started: false,
         synchronization_started: false,
@@ -3017,7 +3303,6 @@ fn open_android_miplay_stream(
         last_recovery_report: None,
         last_offset_ms: AUDIO_SYNC_OFFSET_MS.load(Ordering::Relaxed),
         last_reported_offset_ms: 0,
-        queue_continuity: 0,
         lp_low: 0.0,
         lp_mid: 0.0,
     };
@@ -3055,15 +3340,21 @@ fn open_android_miplay_stream(
         "error": buffer_result.err().map(|error| error.to_string()),
     }));
     stream.start().context("start Android audio output")?;
-    Ok(stream)
+    let xruns = stream.get_xrun_count().ok();
+    events(json!({"event": "audio_output_xruns", "baseline": true,
+        "count": xruns, "delta": xruns.map(|_| 0), "api": format!("{:?}", stream.get_audio_api())}));
+    Ok((stream, xruns))
 }
 
 #[cfg(target_os = "android")]
 fn manage_android_miplay_output(
     initial_stream: AndroidMiPlayOboeStream,
+    initial_xruns: Option<i32>,
     receiver: mpsc::Receiver<AndroidMiPlayAudioCommand>,
     commands: mpsc::Sender<AndroidMiPlayAudioCommand>,
-    queue: Arc<Mutex<PcmQueue>>,
+    diagnostics: Arc<CallbackDiagnostics>,
+    output_epoch_nanos: Arc<AtomicI64>,
+    queue: Arc<PcmRing>,
     paused: Arc<AtomicBool>,
     presentation_clock: Arc<MiPlayPresentationClock>,
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
@@ -3074,6 +3365,8 @@ fn manage_android_miplay_output(
 ) {
     let mut stream = Some(initial_stream);
     let mut latency = AndroidOutputLatency::default();
+    let mut xruns = initial_xruns;
+    let mut next_xrun_sample = Instant::now();
     loop {
         let command = match receiver.recv_timeout(ANDROID_LATENCY_POLL_INTERVAL) {
             Ok(command) => command,
@@ -3081,6 +3374,25 @@ fn manage_android_miplay_output(
                 // AAudio's timestamp query can block. Keep it off the render
                 // thread, including when the system requests very short blocks.
                 if let Some(active) = stream.as_mut() {
+                    diagnostics.flush(&events);
+                    if Instant::now() >= next_xrun_sample {
+                        next_xrun_sample = Instant::now() + StdDuration::from_secs(1);
+                        if let Ok(count) = active.get_xrun_count()
+                            && xruns != Some(count)
+                        {
+                            events(json!({"event": "audio_output_xruns", "count": count,
+                                "delta": xruns.map(|previous| count.saturating_sub(previous)),
+                                "api": format!("{:?}", active.get_audio_api())}));
+                            xruns = Some(count);
+                        }
+                    }
+                    if let Ok(stamp) = active.get_timestamp(1 /* CLOCK_MONOTONIC */) {
+                        let rate = i128::from(output_sample_rate.load(Ordering::Acquire).max(1));
+                        let nanos = i128::from(stamp.timestamp) - i128::from(stamp.position) * 1_000_000_000 / rate;
+                        if let Ok(nanos) = i64::try_from(nanos) {
+                            output_epoch_nanos.store(nanos, Ordering::Release);
+                        }
+                    }
                     latency.observe(active.calculate_latency_millis().ok());
                     if let Some(delay_ms) = latency.measured_delay() {
                         let updated = (delay_ms * 1_000.0).round() as u64;
@@ -3100,14 +3412,12 @@ fn manage_android_miplay_output(
         };
         match command {
             AndroidMiPlayAudioCommand::Shutdown => break,
-            AndroidMiPlayAudioCommand::EmitEvent(payload) => events(payload),
             AndroidMiPlayAudioCommand::Restart(error) => {
                 stream.take();
                 latency = AndroidOutputLatency::default();
                 measured_latency_us.store(ANDROID_UNKNOWN_LATENCY_US, Ordering::Relaxed);
-                if let Ok(mut queued) = queue.lock() {
-                    queued.clear();
-                }
+                queue.route.fetch_add(1, Ordering::Release);
+                output_epoch_nanos.store(0, Ordering::Release);
                 events(json!({
                     "event": "audio_output_route_restarting",
                     "protocol": "xiaomi_miplay",
@@ -3122,12 +3432,16 @@ fn manage_android_miplay_output(
                         Arc::clone(&latency_telemetry),
                         Arc::clone(&events),
                         commands.clone(),
+                        Arc::clone(&diagnostics),
+                        Arc::clone(&output_epoch_nanos),
                         Arc::clone(&output_sample_rate),
                         Arc::clone(&actual_buffer_frames),
                         Arc::clone(&measured_latency_us),
                     ) {
-                        Ok(replacement) => {
+                        Ok((replacement, baseline)) => {
                             stream = Some(replacement);
+                            xruns = baseline;
+                            next_xrun_sample = Instant::now();
                             events(json!({
                                 "event": "audio_output_route_recovered",
                                 "protocol": "xiaomi_miplay",
@@ -3522,6 +3836,71 @@ mod tests {
             self.bytes = &self.bytes[length..];
             Ok(length)
         }
+    }
+
+    #[test]
+    fn pcm_ring_wraps_without_overwriting_unread_frames() {
+        use super::{PcmConsumer, PcmProducer, PcmRing, PlayoutQueue};
+        let ring = std::sync::Arc::new(PcmRing::new(4));
+        let mut producer = PcmProducer::new(ring.clone());
+        let mut consumer = PcmConsumer::new(ring);
+        producer.push(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(1_000.0));
+        consumer.refresh();
+        let mut out = [(0.0, 0.0); 2];
+        consumer.render_stereo_block(&mut out, 1.0);
+        assert_eq!(out, [(1.0, 2.0), (3.0, 4.0)]);
+        producer.push(&[7.0, 8.0, 9.0, 10.0], None);
+        assert_eq!(consumer.buffered_frames(), 1);
+        consumer.refresh();
+        consumer.render_stereo_block(&mut out, 1.0);
+        assert_eq!(out, [(5.0, 6.0), (7.0, 8.0)]);
+    }
+
+    #[test]
+    fn pcm_overflow_trims_backlog_without_resetting_playout() {
+        use super::{PcmConsumer, PcmProducer, PcmRing, PlayoutQueue, MIPLAY_SOURCE_SAMPLE_RATE};
+        let ring = std::sync::Arc::new(PcmRing::new(8));
+        let mut producer = PcmProducer::new(ring.clone());
+        let mut consumer = PcmConsumer::new(ring.clone());
+        let dt = 1_000_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
+        for i in 0..4 {
+            producer.push(&[i as f32; 4], Some(1000.0 + 2.0 * i as f64 * dt));
+        }
+        producer.push(&[4.0; 4], Some(1000.0 + 8.0 * dt));
+        assert!(!consumer.refresh());
+        assert_eq!(consumer.trim_after_overflow(5), 3);
+        assert_eq!(consumer.buffered_frames(), 5);
+        producer.push(&[5.0; 4], Some(1000.0 + 10.0 * dt));
+        assert!(!consumer.refresh());
+        assert_eq!(consumer.trim_after_overflow(5), 0);
+        assert_eq!(consumer.buffered_frames(), 7);
+        assert_eq!(consumer.stereo(8), (5.0, 5.0));
+        drop(consumer);
+        let mut reopened = PcmConsumer::new(ring);
+        reopened.discard_route_backlog();
+        assert_eq!(reopened.buffered_frames(), 0);
+    }
+
+    #[test]
+    fn pcm_ring_changes_epoch_only_after_new_frames_are_published() {
+        use super::{PcmConsumer, PcmProducer, PcmRing, PlayoutQueue};
+        let ring = std::sync::Arc::new(PcmRing::new(4));
+        let mut producer = PcmProducer::new(ring.clone());
+        let mut consumer = PcmConsumer::new(ring);
+        producer.push(&[1.0; 4], Some(1_000.0));
+        consumer.refresh();
+        producer.push(&[9.0; 4], Some(500_000.0));
+        assert_eq!(consumer.buffered_frames(), 2);
+        assert!(consumer.refresh());
+        assert_eq!(consumer.buffered_frames(), 2);
+        assert_eq!(consumer.front_pts_micros(), Some(500_000.0));
+        let mut out = [(0.0, 0.0)];
+        consumer.render_stereo_block(&mut out, 1.0);
+        assert_eq!(out, [(9.0, 9.0)]);
+        consumer.clear();
+        producer.push(&[3.0; 4], Some(5_000.0));
+        consumer.refresh();
+        assert_eq!(consumer.front_pts_micros(), Some(5_000.0));
     }
 
     #[test]

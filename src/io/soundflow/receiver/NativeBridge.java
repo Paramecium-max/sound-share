@@ -22,9 +22,13 @@ public final class NativeBridge {
 
     public static native int audioSpectrum();
 
-    public static native String audioOnsets(boolean active);
+    public static native String audioOnsets();
 
-    public static native String spectrumOnsets(float[] bins, int sampleRate);
+    public static native String spectrumOnsets(float[] bins, int sampleRate, long stampNanos);
+
+    public static native void setAudioMeterEnabled(boolean enabled);
+
+    public static native void setOnsetCapture(boolean enabled, long monotonicNanos);
 
     public static native void setOnsetSensitivity(int value);
 }

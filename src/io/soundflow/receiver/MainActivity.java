@@ -81,6 +81,8 @@ public final class MainActivity extends Activity {
     private WebView webView;
     private boolean jsReady = false;
     private boolean uiResumed = false;
+    private int visualDemand;
+    private long lastVisualGeneration = -1;
     private boolean currentPlaying = false;
     private boolean isFullscreenLyrics = false;
     private boolean isModalOpen = false;
@@ -114,7 +116,11 @@ public final class MainActivity extends Activity {
                 }
             } else if (msg.what == ReceiverService.MSG_AUDIO_ONSETS) {
                 Bundle data = msg.getData();
-                lyricOrchestrator.updateAudioOnsets(data.getString("events", "[]"), data.getLong("captured_at"));
+                long epoch = data.getLong("visual_generation", 0);
+                if (!uiResumed || epoch < lastVisualGeneration) return;
+                lastVisualGeneration = epoch;
+                lyricOrchestrator.updateAudioSample(data.getString("events"), data.getInt("spectrum", -1),
+                        data.containsKey("spectrum"), data.getLong("position_ms", 0), epoch);
             } else if (msg.what == ReceiverService.MSG_LOG_TEXT) {
                 Bundle b = msg.getData();
                 pendingLogText = b != null ? b.getString("logs", "暂无运行日志") : "暂无运行日志";
@@ -127,6 +133,8 @@ public final class MainActivity extends Activity {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
             serviceMessenger = new Messenger(binder);
+            lastVisualGeneration = -1;
+            eval("window.SoundFlowStage?.resetAudioGeneration()");
             boundToService = true;
             sendToService(ReceiverService.MSG_REGISTER);
             sendUiVisibilityToService(uiResumed);
@@ -151,6 +159,16 @@ public final class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void setVisualDemand(boolean motion, boolean ripples) {
+            main.post(() -> {
+                int next = (motion ? 1 : 0) | (ripples ? 2 : 0);
+                if (next == visualDemand) return;
+                visualDemand = next;
+                sendUiVisibilityToService(uiResumed);
+            });
+        }
+
+        @JavascriptInterface
         public void onRenderStats(String stats) {
             if (stats != null && stats.length() < 300) Log.i("SoundFlowFrames", stats);
         }
@@ -170,6 +188,7 @@ public final class MainActivity extends Activity {
         public void onJsReady() {
             main.post(() -> {
                 jsReady = true;
+                eval("window.SoundFlowStage?.resetAudioGeneration()");
                 lyricOrchestrator.markPageReady();
                 pushInsetsAndTheme();
                 pushMotionPreference();
@@ -504,7 +523,7 @@ public final class MainActivity extends Activity {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
-                if (uri != null && APP_HOST.equals(uri.getHost())) {
+                if (isLocalWebOrigin(uri)) {
                     String path = uri.getPath();
                     if (path == null || "/".equals(path)) path = "/index.html";
                     if (path.contains("..") || path.contains("\\")) {
@@ -522,14 +541,16 @@ public final class MainActivity extends Activity {
                         return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, new ByteArrayInputStream(new byte[0]));
                     }
                 }
-                if (uri != null) {
-                    String scheme = uri.getScheme();
-                    if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
-                        // Keep the UI strictly offline; block external WebView requests.
-                        return new WebResourceResponse("text/plain", "utf-8", 403, "Offline Only", null, new ByteArrayInputStream(new byte[0]));
-                    }
-                }
-                return super.shouldInterceptRequest(view, request);
+                if (uri != null && "data".equalsIgnoreCase(uri.getScheme())) return null;
+                return new WebResourceResponse("text/plain", "utf-8", 403, "Offline Only", null,
+                        new ByteArrayInputStream(new byte[0]));
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri uri = request.getUrl();
+                return !request.isForMainFrame() || !isLocalWebOrigin(uri)
+                        || !"/index.html".equals(uri.getPath());
             }
 
             @Override
@@ -539,6 +560,12 @@ public final class MainActivity extends Activity {
         });
 
         web.loadUrl("https://" + APP_HOST + "/index.html");
+    }
+
+    private static boolean isLocalWebOrigin(Uri uri) {
+        return uri != null && "https".equalsIgnoreCase(uri.getScheme())
+                && APP_HOST.equals(uri.getHost()) && uri.getUserInfo() == null
+                && (uri.getPort() == -1 || uri.getPort() == 443);
     }
 
     private void pushInsetsAndTheme() {
@@ -555,6 +582,13 @@ public final class MainActivity extends Activity {
 
     private void applySnapshot(Bundle b) {
         if (b == null) return;
+        if (!b.containsKey("lyrics_lrc") && b.getBoolean("session_active")
+                && latestSnapshot.getLong("media_seq", -1) == b.getLong("media_seq")) {
+            for (String key : new String[]{"lyrics_lrc", "lyric_line", "artwork"}) {
+                if (latestSnapshot.containsKey(key)) b.putString(key, latestSnapshot.getString(key));
+            }
+        }
+        lastVisualGeneration = Math.max(lastVisualGeneration, b.getLong("visual_generation"));
         latestSnapshot = b;
         pushSnapshotToJs(b);
         handleLyricVisibility(b.getBoolean("playing", false), b.getBoolean("session_active", false), b);
@@ -562,6 +596,7 @@ public final class MainActivity extends Activity {
 
     private void applyMediaEvent(Bundle b) {
         if (b == null) return;
+        lastVisualGeneration = Math.max(lastVisualGeneration, b.getLong("visual_generation"));
         latestSnapshot = b;
         handleLyricVisibility(b.getBoolean("playing", false), b.getBoolean("session_active", false), b);
     }
@@ -687,6 +722,7 @@ public final class MainActivity extends Activity {
         if (!boundToService || serviceMessenger == null) return;
         Message msg = Message.obtain(null, ReceiverService.MSG_UI_VISIBILITY);
         msg.arg1 = visible ? 1 : 0;
+        msg.arg2 = visualDemand;
         try { serviceMessenger.send(msg); } catch (RemoteException ignored) {}
     }
 

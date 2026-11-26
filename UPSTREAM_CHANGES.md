@@ -56,7 +56,7 @@ Android 接收服务将手动偏移传入妙播的时间戳排程和缓冲排程
 ## v1.1.20 水波鼓点声画对齐与全栈整改（2026-11-26）
 
 - **原生音频延迟校准与因果鼓点识别（Rust）**：
-  - `upstream/src/FusionPlay.MiPlaySdk/src/onset.rs`：步长加密至 `HOP = 256`（`5.33 ms`），预计算 2048 点 Hann 窗与位反转表；修复 `PendingBandPeak` 强度饱和导致重拍滞后的问题；重构因果多通道 `PercussionDetector`（底鼓/808 下扫频 + 锤头瞬态、军鼓/木鱼宽频冲击、高频打击乐，确认窗口收敛至 `≤ 16 ms`，抑制持续低音与纯音阶跃假阳性），校准 `-16 ms` 汉宁窗重心偏移，端到端扬声器出声时刻误差收敛至 `±12 ms`。
+  - `upstream/src/FusionPlay.MiPlaySdk/src/onset.rs`：步长加密至 `HOP = 256`（`5.33 ms`），预计算 2048 点 Hann 窗与位反转表；修复 `PendingBandPeak` 强度饱和导致重拍滞后的问题；重构因果多通道 `PercussionDetector`（底鼓/808 下扫频 + 锤头瞬态、军鼓/木鱼宽频冲击、高频打击乐，确认窗口收敛至 `≤ 16 ms`，抑制持续低音与纯音阶跃假阳性），校准 `-16 ms` 汉宁窗重心偏移，合成单击测试的输出时间戳误差通过 `±12 ms` 断言。
   - `upstream/src/FusionPlay.MiPlaySdk/src/media.rs`：记录 Oboe 实际输出缓冲帧数用于未收敛阶段的回退延迟估算，跳过回调前导静音帧并叠加对应延迟后再送入 `onset::tap_output`。
   - `native/src/lib.rs`：在 `emit()` 入口拦截高频诊断 trace 事件，防止高吞吐下冲掉 `media_info`/`playback_state`/`progress` 等关键控制事件。
 - **Android 双进程服务、歌词时钟与 DLNA 频谱**：
@@ -65,3 +65,15 @@ Android 接收服务将手动偏移传入妙播的时间戳排程和缓冲排程
 - **前端水波零遮挡渲染与 `DESIGN.md` 合规**：
   - `web/src/{ripple-onsets.mjs,ripple-water.mjs,stage-app.js}`：默认启用 `percussion`（鼓点）模式并将 `classic`（融合节奏）接入原生起音队列，删除伪周期 `quietCadenceMs` 定时器；`rippleCoverRadius` 对齐 `#platter-disc` 真实外缘，WebGL 波包相位外移 `0.42 * width` 并缩短淡入至 `16 ms`，配合 `10 ms` 扫描提前量实现鼓点出声瞬间亮峰即刻跃出封面边缘；打通系统 `setReducedMotion` 与 WebGL 暂停联动。
   - `assets/ui/{index.html,tokens.css,redesign.css}`：按 `DESIGN.md` 将偏好设置重构为「歌词」「接收」「外观」三组双栏结构，补齐所有 `.lg-slider` 滑块的 `44 CSS px` 触控热区高度、浅色 `--label-2` 色值与 Android 系统优先字体栈；版本升至 `1.1.20`（`versionCode = 130`）。
+
+## v1.1.21 实时链路、双协议与舞台修复（2026-11-27）
+
+- Android 音频回调使用预分配 PCM 队列和有界时钟快照。路由线程负责诊断、Oboe XRun 与硬件帧时间映射。桌面继续使用 CPAL。
+- 起音分析复用 FFT、参考谱和 JNI 缓冲，在积压时只处理最近窗口。可视需求控制频谱统计与采样，空批次不发往 UI。DLNA 复用同一次 Visualizer 采样，媒体控制与日志、歌词文件操作移出相应主线程。
+- 目标拍点使用单调时钟时间戳，WebGL 用缓存几何与到期时间绘制。默认鼓点的 112 ms 合成双击回归通过，绝对声光偏差与有权限的 DLNA 真机播放由后续集成验收测定。
+
+
+- 满环时只由 PCM 消费端裁剪超出目标窗的旧帧，真实 PTS 断层才重置播放。输出路由重开清理旧 PCM，并分别报告 XRun 初值与运行期增量。硬件帧时间映射可以重锚，检测器仍沿连续样本时钟推进。
+- 新增合成混音起音回归，验证 90、112、125、140 ms 双底鼓与 55/110 ms 衰减回声。DLNA 频谱按 60 ms 估算输出延迟，等待有权限的设备测量。
+- 暂停或停止 DLNA 后，已建立的妙播会话可通过明确的播放状态或有效元数据恢复。按通知内容和播放状态节流 Android 媒体更新。DLNA 将监听与 HTTP 请求拆到不同线程池，跳转发出后立刻更新位置查询，回调到达时与播放器实际位置对齐。
+- AMLL 直接接收本地封面图片元素，避免库内部走 CSP 禁止的下载路径。调谐面板的开合只在布局变化时刷新水波圆心缓存。Pad 6 验证了底色和 DLNA 基本播控。

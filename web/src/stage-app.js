@@ -78,7 +78,10 @@ const rippleOnsets = new RippleOnsetQueue();
 const rippleRenderer = new WaterRippleRenderer(rippleCanvas);
 let rippleTriggerMode = localStorage.getItem("sf_ripple_trigger") || "percussion";
 if (!RIPPLE_TRIGGER_MODES.includes(rippleTriggerMode)) rippleTriggerMode = "percussion";
-let rippleSensitivity = Math.max(0, Math.min(100, Number(localStorage.getItem("sf_ripple_sens") ?? 55) || 55));
+const storedSensitivity = Number(localStorage.getItem("sf_ripple_sens") ?? 55);
+let rippleSensitivity = Number.isFinite(storedSensitivity) ? Math.max(0, Math.min(100, storedSensitivity)) : 55;
+let audioGeneration = -1;
+let reducedClockTimer = 0;
 let lastNativeOnsetFeedTs = -Infinity;
 let rippleWidth = 0;
 let rippleHeight = 0;
@@ -171,9 +174,17 @@ function paintGenerativeCover(seedText) {
   ctx.fill();
   ctx.globalAlpha = 1;
 
-  try {
-    bgRender.setAlbum(coverCanvas.toDataURL("image/png"), false);
-  } catch (_) {}
+  const image = new Image();
+  image.src = coverCanvas.toDataURL("image/png");
+  setStageBackground(image);
+}
+
+function setStageBackground(image) {
+  // AMLL fetches string sources internally. An image element keeps the
+  // decoded cover local and works with the WebView's connect-src 'none'.
+  bgRender.setAlbum(image, false).catch((error) => {
+    console.warn("AMLL could not render the local cover", error);
+  });
 }
 
 function buildWordsForLine(text, startMs, endMs) {
@@ -347,7 +358,6 @@ function stepCoverThump(dt) {
 
 function spawnCenterRipple(kind, strength) {
   if (!centerRippleEnabled || !isPlaying || reduceMotion) return;
-  measureRippleOrigin();
   if (rippleField.spawn(ripplePalette(kind), strength, 0, kind === "drum", rippleCoverRadius)) {
     triggerCoverThump(strength ?? 0.65);
   }
@@ -411,10 +421,8 @@ function processSpectrumOnset(peak, bass, mid, high) {
   }
 }
 
-function measureRippleOrigin() {
-  if (!stageCard) return;
-  const cardRect = stageCard.getBoundingClientRect();
-  const target = platterDisc || platterWrapEl;
+function measureRippleOrigin(cardRect) {
+  const target = platterWrapEl || platterDisc;
   if (target && cardRect.width > 0 && cardRect.height > 0) {
     const r = target.getBoundingClientRect();
     if (r.width > 4 && r.height > 4) {
@@ -428,7 +436,8 @@ function measureRippleOrigin() {
         Math.hypot(cx, cardRect.height - cy),
         Math.hypot(cardRect.width - cx, cardRect.height - cy),
       );
-      rippleCoverRadius = Math.max(0.04, Math.min(0.28, (Math.max(r.width, r.height) * 0.50) / Math.max(1, maxDist)));
+      const discRadius = Math.max(platterDisc.offsetWidth, platterDisc.offsetHeight) * 0.5;
+      rippleCoverRadius = Math.max(0.04, Math.min(0.28, discRadius / Math.max(1, maxDist)));
       return;
     }
   }
@@ -448,33 +457,31 @@ function resizeRippleCanvas() {
     rippleCanvas.height = rippleHeight;
     canvasNeedsClear = true;
   }
-  measureRippleOrigin();
+  measureRippleOrigin(rect);
 }
 
-function stepAndDrawCenterRipples(rawDeltaSec) {
+function stepAndDrawCenterRipples(rawDeltaSec, now = performance.now()) {
   stepCoverThump(Math.max(0, Math.min(0.05, rawDeltaSec)));
   if (!rippleCanvas) return;
   if (!centerRippleEnabled) rippleField.clear();
   if (!rippleField.waves.length && !canvasNeedsClear && !rippleOnsets.pending.length) return;
-  if (!rippleWidth || !rippleHeight) resizeRippleCanvas();
-  const now = performance.now();
+  if (!rippleWidth || !rippleHeight) return;
+  rippleField.step(rawDeltaSec);
   let event;
   while ((event = rippleOnsets.takeDue(now)) !== null) {
     if (isPlaying && centerRippleEnabled && !reduceMotion) {
-      measureRippleOrigin();
       if (rippleField.spawn(
         ripplePalette(event.band),
         event.strength,
         Math.max(0, now - event.at) / 1000,
         event.band === "drum" || rippleTriggerMode === "percussion",
-        rippleCoverRadius,
+        rippleCoverRadius * platterPulse.current,
       )) {
         triggerCoverThump(event.strength);
       }
     }
   }
-  rippleField.step(rawDeltaSec);
-  measureRippleOrigin();
+  if (!rippleField.waves.length && !canvasNeedsClear) return;
   rippleRenderer.render(rippleField.waves, rippleWidth, rippleHeight, rippleOriginX, rippleOriginY);
   canvasNeedsClear = rippleField.waves.length > 0;
   rippleCanvas.classList.toggle("active", centerRippleEnabled && (isPlaying || rippleField.waves.length > 0));
@@ -546,14 +553,15 @@ function tick(ts) {
     frameSamples = [];
     statsWindowStart = ts;
   }
-  const rawDelta = Math.min(50, Math.max(4, ts - lastFrameTs));
+  const elapsed = Math.max(0, ts - lastFrameTs);
+  const rawDelta = Math.min(50, Math.max(4, elapsed));
   lastFrameTs = ts;
 
-  stepAndDrawCenterRipples(rawDelta * 0.001);
+  stepAndDrawCenterRipples(rawDelta * 0.001, ts);
 
   if (isPlaying) {
     flushPendingLineQueue(performance.now());
-    currentTimeMs += rawDelta;
+    currentTimeMs += elapsed;
     const lerpK = 1 - Math.exp(-rawDelta * 0.012);
     smoothedEnergy += (audioEnergy - smoothedEnergy) * lerpK;
 
@@ -578,20 +586,46 @@ function tick(ts) {
 
 if (typeof ResizeObserver !== "undefined") {
   new ResizeObserver(() => scheduleStageRelayout()).observe(stageRight);
-  new ResizeObserver(resizeRippleCanvas).observe(stageCard);
+  const rippleResize = new ResizeObserver(resizeRippleCanvas);
+  rippleResize.observe(stageCard);
+  rippleResize.observe(platterDisc);
 }
-window.addEventListener("resize", scheduleStageRelayout);
+window.addEventListener("resize", () => { resizeRippleCanvas(); scheduleStageRelayout(); });
+stageCard.querySelector(".stage-split")?.addEventListener("transitionend", (event) => {
+  if (event.target === event.currentTarget) resizeRippleCanvas();
+});
+function updateVisualDemand() {
+  window.SoundFlowBridge?.setVisualDemand?.(isStageShown && !document.hidden && !reduceMotion, centerRippleEnabled);
+}
+
 function syncVisualActivity() {
   const active = isPlaying && isStageShown && !document.hidden;
   if (active && !reduceMotion) bgRender.resume();
   else bgRender.pause();
-  if (active && usingNativeAmll()) lyricPlayer.resume();
+  if (active && usingNativeAmll() && !reduceMotion) lyricPlayer.resume();
   else lyricPlayer.pause();
-  if (active || rippleField.waves.length > 0) ensureRaf();
+  if (!reduceMotion && (active || rippleField.waves.length > 0)) ensureRaf();
   else if (rafId) {
     cancelAnimationFrame(rafId);
     rafId = 0;
   }
+  if (active && reduceMotion && !reducedClockTimer) {
+    let previous = performance.now();
+    reducedClockTimer = setInterval(() => {
+      const now = performance.now();
+      currentTimeMs += now - previous;
+      previous = now;
+      flushPendingLineQueue(now);
+      if (usingNativeAmll()) {
+        lyricPlayer.setCurrentTime(Math.round(effectiveClockMs()), false);
+        lyricPlayer.update(0);
+      } else syncSmoothRailHighlight(false);
+    }, 100);
+  } else if ((!active || !reduceMotion) && reducedClockTimer) {
+    clearInterval(reducedClockTimer);
+    reducedClockTimer = 0;
+  }
+  updateVisualDemand();
 }
 
 reduceMotionQuery.addEventListener("change", (event) => {
@@ -609,7 +643,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function ensureRaf() {
-  if (!document.hidden && isStageShown && (isPlaying || rippleField.waves.length > 0) && !rafId) {
+  if (!reduceMotion && !document.hidden && isStageShown && (isPlaying || rippleField.waves.length > 0) && !rafId) {
     lastFrameTs = 0;
     rafId = requestAnimationFrame(tick);
   }
@@ -655,6 +689,7 @@ function setTunerOpen(open) {
   document.getElementById("stage-tuner-btn").classList.toggle("active", tunerOpen);
   document.getElementById("stage-tuner-btn").setAttribute("aria-expanded", String(tunerOpen));
   scheduleStageRelayout();
+  requestAnimationFrame(resizeRippleCanvas);
   if (tunerOpen) requestAnimationFrame(() => window.LiquidGlassRefraction?.refresh());
 }
 
@@ -674,6 +709,7 @@ function toggleFullscreen(forceState, fromUser = false) {
     ? '<polyline points="4 14 10 14 10 20"></polyline><polyline points="20 10 14 10 14 4"></polyline><line x1="14" y1="10" x2="21" y2="3"></line><line x1="3" y1="21" x2="10" y2="14"></line>'
     : '<polyline points="15 3 21 3 21 9"></polyline><polyline points="9 21 3 21 3 15"></polyline><line x1="21" y1="3" x2="14" y2="10"></line><line x1="3" y1="21" x2="10" y2="14"></line>';
   window.SoundFlowBridge?.fullscreenChanged?.(next);
+  requestAnimationFrame(resizeRippleCanvas);
   scheduleStageRelayout();
 }
 
@@ -704,6 +740,28 @@ function commitStreamLineNow(clean) {
 }
 
 window.SoundFlowStage = {
+  resetAudioGeneration() {
+    audioGeneration = -1;
+    rippleOnsets.reset();
+    rippleField.clear();
+    canvasNeedsClear = true;
+  },
+  onAudioSample(generation, events, bias, nativeNow, meter) {
+    if (generation < audioGeneration) return;
+    if (generation !== audioGeneration) {
+      audioGeneration = generation;
+      rippleOnsets.reset();
+      rippleField.clear();
+      canvasNeedsClear = true;
+    }
+    if (Array.isArray(events) && isPlaying && centerRippleEnabled && !reduceMotion) {
+      lastNativeOnsetFeedTs = performance.now();
+      const offset = bias ?? lastNativeOnsetFeedTs - nativeNow;
+      rippleOnsets.accept(events, rippleTriggerMode, lastNativeOnsetFeedTs, 0, offset);
+      ensureRaf();
+    }
+    if (meter) this.onTick(...meter);
+  },
   onAudioOnsets(events, bridgeElapsed = 0) {
     if (!isPlaying || !centerRippleEnabled || reduceMotion || !Array.isArray(events)) return;
     lastNativeOnsetFeedTs = performance.now();
@@ -737,13 +795,13 @@ window.SoundFlowStage = {
       rippleOnsets.reset();
       // Do NOT clear active ripples on pause/stop; let existing waves finish expanding off screen!
       ensureRaf();
-      bgRender.pause();
-      lyricPlayer.pause();
+      syncVisualActivity();
     }
   },
 
   setVisibility(show) {
     setStageVisible(!!show);
+    updateVisualDemand();
   },
 
   setAudioEnergy(level) {
@@ -798,7 +856,7 @@ window.SoundFlowStage = {
       const ctx = coverCanvas.getContext("2d");
       ctx.clearRect(0, 0, coverCanvas.width, coverCanvas.height);
       ctx.drawImage(img, 0, 0, coverCanvas.width, coverCanvas.height);
-      try { bgRender.setAlbum(url, false); } catch (_) {}
+      setStageBackground(img);
     };
     img.src = url;
   },
@@ -1158,13 +1216,13 @@ function applyCenterRipple(enabled) {
   centerRippleEnabled = !!enabled;
   window.SoundFlowBridge?.onUiState?.("ripple", centerRippleEnabled);
   localStorage.setItem("sf_center_ripple", centerRippleEnabled ? "1" : "0");
+  updateVisualDemand();
   rippleCanvas?.classList.toggle("active", centerRippleEnabled && isPlaying);
   if (!centerRippleEnabled) {
     rippleField.clear();
     canvasNeedsClear = true;
     stepAndDrawCenterRipples(0);
-  } else if (rippleTriggerMode === "classic" && isPlaying && rippleField.waves.length === 0) {
-    spawnCenterRipple("bass", Math.max(0.45, audioEnergy));
+
   }
   const sw = document.getElementById("sw-ripple");
   if (sw) sw.setAttribute("aria-checked", String(centerRippleEnabled));

@@ -1,7 +1,7 @@
 id=soundflow_receiver
 name=SoundFlow 独立音频接收器 · 系统服务固化模块
-version=v1.1.20
-versionCode=130
+version=v1.1.21
+versionCode=131
 author=SoundFlow
 description=将独立局域网音频接收器固化为特权系统应用并注入开机防杀守护与白名单，免手动重开且划卡不断流。
 

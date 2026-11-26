@@ -58,7 +58,7 @@ void main() {
     float sn = sin(phase);
     float dWave = env * (-2.05 * sn - 2.0 * k * s * c);
 
-    float fadeIn = smoothstep(0.0, 0.016, age);
+    float fadeIn = mix(0.58, 1.0, smoothstep(0.0, 0.012, age));
     float radialAtten = 1.0 / pow(1.0 + d * 2.4, 0.65);
     float edgeFade = 1.0 - smoothstep(0.94, 1.20, d);
     float amp = A * fadeIn * radialAtten * edgeFade;

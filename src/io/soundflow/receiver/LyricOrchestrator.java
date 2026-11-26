@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -53,6 +54,7 @@ public final class LyricOrchestrator {
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService netPool = Executors.newSingleThreadExecutor();
+    private final ExecutorService lyricFiles = Executors.newSingleThreadExecutor();
     private final Map<String, List<LrcLine>> lrcCache = new ConcurrentHashMap<>();
     private final List<LrcLine> lanRecordedLines = new ArrayList<>();
 
@@ -77,12 +79,18 @@ public final class LyricOrchestrator {
     private long rememberedTrackDurSec = -1;
     private long songStartElapsedMs = 0;
     private boolean hasFullLrcForCurrentSong = false;
-    private boolean autoOnlineEnabled = false;
+    private volatile boolean autoOnlineEnabled = false;
     private float lastTickPeak = -1f;
     private int lastTickSpectrum = -1;
     private long lastTickPosMs = -1L;
     private long lastMediaSeq = -1;
-    private long lookupTicket = 0;
+    private volatile long lookupTicket = 0;
+    private final AtomicReference<HttpURLConnection> activeLookup = new AtomicReference<>();
+    private double webClockBias = Double.NaN;
+    private double webClockRtt = Double.POSITIVE_INFINITY;
+    private int webClockEpoch;
+    private boolean destroyed;
+    private long offlineTicket;
     private String queuedJs = null;
 
     public void attachContext(Context ctx) {
@@ -127,9 +135,19 @@ public final class LyricOrchestrator {
         return removed;
     }
 
+    private void invalidateOnlineLookup() {
+        lookupTicket++;
+        HttpURLConnection pending = activeLookup.getAndSet(null);
+        if (pending != null) lyricFiles.execute(pending::disconnect);
+    }
+
+    private boolean lookupIsCurrent(long ticket) {
+        return autoOnlineEnabled && ticket == lookupTicket;
+    }
+
     public void onOnlineLookupSettingChanged(boolean enabled) {
         this.autoOnlineEnabled = enabled;
-        lookupTicket++;
+        invalidateOnlineLookup();
         if (enabled && playing && !hasFullLrcForCurrentSong && !currentSongName.isEmpty()) {
             fetchOnlineLrcAsync(lookupTicket, currentSongKey, currentSongName, currentArtistName, currentDurationMs);
         }
@@ -137,6 +155,7 @@ public final class LyricOrchestrator {
 
     public void markPageReady() {
         this.pageReady = true;
+        startWebClockCalibration();
         eval("window.SoundFlowStage && window.SoundFlowStage.setPlaying(" + (playing && uiVisible) + ")");
         if (queuedJs != null) {
             eval(queuedJs);
@@ -155,6 +174,8 @@ public final class LyricOrchestrator {
 
     public void setUiVisible(boolean visible) {
         uiVisible = visible;
+        if (visible) startWebClockCalibration();
+        else webClockEpoch++;
         eval("window.SoundFlowStage && window.SoundFlowStage.setPlaying(" + (playing && visible) + ")");
     }
 
@@ -165,18 +186,46 @@ public final class LyricOrchestrator {
         return currentDurationMs > 0 ? Math.min(currentDurationMs, position) : position;
     }
 
-    public void updateAudioOnsets(String events, long capturedAt) {
-        if (!playing || !uiVisible || !pageReady || webView == null) return;
-        main.post(() -> {
-            if (!playing || !uiVisible || webView == null) return;
-            long elapsed = Math.max(0L, SystemClock.elapsedRealtime() - capturedAt) + 3L;
-            webView.evaluateJavascript("window.SoundFlowStage && window.SoundFlowStage.onAudioOnsets("
-                    + events + "," + elapsed + ")", null);
+    private void startWebClockCalibration() {
+        if (!uiVisible || !pageReady || webView == null) return;
+        webClockRtt = Double.POSITIVE_INFINITY;
+        calibrateWebClock(++webClockEpoch, 3);
+    }
+
+    private void calibrateWebClock(int epoch, int attempts) {
+        if (attempts == 0 || epoch != webClockEpoch || webView == null) return;
+        double start = System.nanoTime() / 1e6;
+        webView.evaluateJavascript("performance.now()", value -> {
+            if (epoch != webClockEpoch) return;
+            double end = System.nanoTime() / 1e6;
+            try {
+                double sample = Double.parseDouble(value);
+                if (Double.isFinite(sample) && end - start < webClockRtt) {
+                    webClockBias = sample - (start + end) * 0.5;
+                    webClockRtt = end - start;
+                }
+            } catch (NumberFormatException | NullPointerException ignored) {}
+            calibrateWebClock(epoch, attempts - 1);
         });
+    }
+
+    public void updateAudioSample(String events, int spectrum, boolean hasMeter, long positionMs, long generation) {
+        if (!playing || !uiVisible || !pageReady || webView == null) return;
+        String meter = hasMeter ? audioMeterArguments(((spectrum >>> 24) & 0xff) / 255f, positionMs, spectrum) : null;
+        if (events == null && meter == null) return;
+        String bias = Double.isFinite(webClockBias) && webClockRtt <= 16 ? Double.toString(webClockBias) : "null";
+        webView.evaluateJavascript("window.SoundFlowStage && window.SoundFlowStage.onAudioSample("
+                + generation + "," + (events == null ? "null" : events) + "," + bias + ","
+                + System.nanoTime() / 1e6 + "," + (meter == null ? "null" : "[" + meter + "]") + ")", null);
     }
 
     public void updateAudioEnergy(float peak, long positionMs, int spectrumPacked) {
         if (!playing || !uiVisible || !pageReady || webView == null) return;
+        String meter = audioMeterArguments(peak, positionMs, spectrumPacked);
+        if (meter != null) eval("window.SoundFlowStage && window.SoundFlowStage.onTick(" + meter + ")");
+    }
+
+    private String audioMeterArguments(float peak, long positionMs, int spectrumPacked) {
         long posArg = -1L;
         if (hasFullLrcForCurrentSong && positionMs > 0
                 && Math.abs(positionMs - currentPlaybackPosition()) >= 320L) {
@@ -187,7 +236,7 @@ public final class LyricOrchestrator {
         if (Math.abs(peak - lastTickPeak) < 0.025f
                 && spectrumPacked == lastTickSpectrum
                 && posArg < 0) {
-            return;
+            return null;
         }
         lastTickPeak = peak;
         lastTickSpectrum = spectrumPacked;
@@ -195,8 +244,7 @@ public final class LyricOrchestrator {
         float bass = ((spectrumPacked >>> 16) & 0xff) / 255f;
         float mid = ((spectrumPacked >>> 8) & 0xff) / 255f;
         float high = (spectrumPacked & 0xff) / 255f;
-        eval("window.SoundFlowStage && window.SoundFlowStage.onTick("
-                + peak + "," + posArg + "," + bass + "," + mid + "," + high + ")");
+        return peak + "," + posArg + "," + bass + "," + mid + "," + high;
     }
 
     public void onMediaUpdate(
@@ -213,7 +261,10 @@ public final class LyricOrchestrator {
             long positionMs,
             boolean autoOnlineLookup
     ) {
-        this.autoOnlineEnabled = autoOnlineLookup;
+        if (this.autoOnlineEnabled != autoOnlineLookup) {
+            this.autoOnlineEnabled = autoOnlineLookup;
+            invalidateOnlineLookup();
+        }
         useSenderClock = "dlna".equals(protocol) || positionMs > 0;
         if (positionMs >= 0 && positionMs != lastSenderPositionMs) {
             playbackPositionMs = positionMs;
@@ -281,7 +332,8 @@ public final class LyricOrchestrator {
 
         if (songChanged) {
             flushLanRecordedToDisk();
-            lookupTicket++;
+            invalidateOnlineLookup();
+            offlineTicket++;
             currentSongKey = newSongKey;
             currentSongName = songName;
             currentArtistName = artistName;
@@ -320,22 +372,10 @@ public final class LyricOrchestrator {
             }
         }
 
-        // Priority 1: Explicit full LRC payload pushed over local LAN (100% offline)
-        if (!isEmpty(explicitLrc) && !explicitLrc.equals(lastLrcPayload)) {
-            lastLrcPayload = explicitLrc;
-            List<LrcLine> parsed = parseLrc(explicitLrc);
-            if (!parsed.isEmpty()) {
-                saveDiskLrc(songName, artistName, "embedded", formatLrc(parsed));
-                pushFullLyricsToStage(parsed, positionMs, "纯离线 · 投送内嵌 LRC");
-            }
-        }
-
-        // Priority 2: Local offline disk cache (imported .lrc -> previously cached -> auto-recorded LAN .lrc)
-        if (songChanged && !hasFullLrcForCurrentSong && !songName.isEmpty()) {
-            OfflineHit localHit = loadOfflineDiskLrc(songName, artistName);
-            if (localHit != null && localHit.lines.size() >= 3) {
-                pushFullLyricsToStage(localHit.lines, positionMs, localHit.badgeLabel);
-            }
+        boolean newEmbedded = !isEmpty(explicitLrc) && !explicitLrc.equals(lastLrcPayload);
+        if (newEmbedded) lastLrcPayload = explicitLrc;
+        if (newEmbedded || songChanged) {
+            loadTrackLyrics(songName, artistName, newEmbedded ? explicitLrc : "", newSongKey);
         }
 
         // Active live lyric sentence (Xiaomi LAN realtime push — works instantaneously offline)
@@ -351,10 +391,28 @@ public final class LyricOrchestrator {
                     + JSONObject.quote("dlna".equals(protocol) ? "此投送未附带歌词" : "等待发送端同步歌词") + ",false);");
         }
 
-        // Priority 4: Optional one-time online fetch (ONLY if user turned the switch ON)
-        if (songChanged && autoOnlineLookup && !hasFullLrcForCurrentSong && !songName.isEmpty()) {
-            fetchOnlineLrcAsync(lookupTicket, newSongKey, songName, artistName, durationMs);
-        }
+    }
+
+    private void loadTrackLyrics(String song, String artist, String embedded, String songKey) {
+        final long revision = ++offlineTicket;
+        lyricFiles.execute(() -> {
+            List<LrcLine> lines = isEmpty(embedded) ? Collections.emptyList() : parseLrc(embedded);
+            OfflineHit hit;
+            if (!lines.isEmpty()) {
+                saveDiskLrc(song, artist, "embedded", formatLrc(lines));
+                hit = new OfflineHit(lines, "纯离线 · 投送内嵌 LRC");
+            } else {
+                hit = loadOfflineDiskLrc(song, artist);
+            }
+            main.post(() -> {
+                if (destroyed || revision != offlineTicket || !songKey.equals(currentSongKey)) return;
+                if (hit != null) {
+                    pushFullLyricsToStage(hit.lines, currentPlaybackPosition(), hit.badgeLabel);
+                } else if (autoOnlineEnabled && !hasFullLrcForCurrentSong && !song.isEmpty()) {
+                    fetchOnlineLrcAsync(lookupTicket, songKey, song, artist, currentDurationMs);
+                }
+            });
+        });
     }
 
     public boolean importLocalLrcForCurrentTrack(String rawContent) {
@@ -368,7 +426,9 @@ public final class LyricOrchestrator {
         String song = !currentSongName.isEmpty() ? currentSongName : "离线导入歌词";
         String artist = currentArtistName;
         String serialized = formatLrc(parsed);
-        saveDiskLrc(song, artist, "imported", serialized);
+        offlineTicket++;
+        invalidateOnlineLookup();
+        lyricFiles.execute(() -> saveDiskLrc(song, artist, "imported", serialized));
         lrcCache.put(currentSongKey, parsed);
         pushFullLyricsToStage(parsed, currentPlaybackPosition(), "纯离线 · 本地导入 LRC");
         return true;
@@ -376,7 +436,8 @@ public final class LyricOrchestrator {
 
     public void clearStage() {
         flushLanRecordedToDisk();
-        lookupTicket++;
+        invalidateOnlineLookup();
+        offlineTicket++;
         currentSongKey = "";
         currentSongName = "";
         currentArtistName = "";
@@ -534,6 +595,10 @@ public final class LyricOrchestrator {
     }
 
     public void destroy() {
+        invalidateOnlineLookup();
+        lyricFiles.shutdown();
+        destroyed = true;
+        webClockEpoch++;
         flushLanRecordedToDisk();
         netPool.shutdownNow();
         main.removeCallbacksAndMessages(null);
@@ -567,28 +632,28 @@ public final class LyricOrchestrator {
         List<LrcLine> cached = lrcCache.get(expectedKey);
         if (cached != null && !cached.isEmpty()) {
             main.post(() -> {
-                if (expectedKey.equals(currentSongKey)) pushFullLyricsToStage(cached, currentPlaybackPosition(), "纯离线 · 已缓存完整 LRC");
+                if (lookupIsCurrent(expectedTicket) && expectedKey.equals(currentSongKey)) pushFullLyricsToStage(cached, currentPlaybackPosition(), "纯离线 · 已缓存完整 LRC");
             });
             return;
         }
         netPool.execute(() -> {
             try {
-                if (!autoOnlineEnabled || expectedTicket != lookupTicket) return;
+                if (!lookupIsCurrent(expectedTicket)) return;
                 String cleanSong = songName.replaceAll("[（(][^）)]*[）)]", "").trim();
                 if (cleanSong.isEmpty()) cleanSong = songName.trim();
                 String cleanArtist = artistName.replaceAll("[&/、].*$", "").trim();
 
-                List<LrcLine> parsed = queryLrcLibExact(songName, cleanArtist, durationMs);
-                if (parsed.size() < 3) parsed = queryLrcLibSearch(cleanSong, cleanArtist);
-                if (parsed.size() < 3) parsed = queryKugouLrc(cleanSong, cleanArtist);
-                if (parsed.size() < 3) parsed = queryNeteaseLrc(cleanSong, cleanArtist);
-                if (parsed.size() < 3 || !autoOnlineEnabled || expectedTicket != lookupTicket) return;
+                List<LrcLine> parsed = queryLrcLibExact(expectedTicket, songName, cleanArtist, durationMs);
+                if (parsed.size() < 3 && lookupIsCurrent(expectedTicket)) parsed = queryLrcLibSearch(expectedTicket, cleanSong, cleanArtist);
+                if (parsed.size() < 3 && lookupIsCurrent(expectedTicket)) parsed = queryKugouLrc(expectedTicket, cleanSong, cleanArtist);
+                if (parsed.size() < 3 && lookupIsCurrent(expectedTicket)) parsed = queryNeteaseLrc(expectedTicket, cleanSong, cleanArtist);
+                if (parsed.size() < 3 || !lookupIsCurrent(expectedTicket)) return;
 
                 final List<LrcLine> finalLines = parsed;
                 saveDiskLrc(songName, artistName, "cached", formatLrc(finalLines));
                 lrcCache.put(expectedKey, finalLines);
                 main.post(() -> {
-                    if (autoOnlineEnabled && expectedTicket == lookupTicket && expectedKey.equals(currentSongKey) && playing) {
+                    if (lookupIsCurrent(expectedTicket) && expectedKey.equals(currentSongKey) && playing) {
                         pushFullLyricsToStage(finalLines, currentPlaybackPosition(), "联网已缓存 LRC");
                     }
                 });
@@ -596,10 +661,13 @@ public final class LyricOrchestrator {
         });
     }
 
-    private static String httpGetString(String url, String referer) {
+    private String httpGetString(long ticket, String url, String referer) {
+        if (!lookupIsCurrent(ticket)) return null;
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(url).openConnection();
+            activeLookup.set(conn);
+            if (!lookupIsCurrent(ticket)) return null;
             conn.setConnectTimeout(4000);
             conn.setReadTimeout(4000);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0 (SoundFlowReceiver/1.0)");
@@ -608,13 +676,18 @@ public final class LyricOrchestrator {
             StringBuilder sb = new StringBuilder();
             try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
                 String ln;
-                while ((ln = br.readLine()) != null) sb.append(ln).append('\n');
+                while (lookupIsCurrent(ticket) && (ln = br.readLine()) != null) {
+                    sb.append(ln).append('\n');
+                }
             }
             return sb.toString();
         } catch (Throwable ignored) {
             return null;
         } finally {
-            if (conn != null) conn.disconnect();
+            if (conn != null) {
+                activeLookup.compareAndSet(conn, null);
+                conn.disconnect();
+            }
         }
     }
 
@@ -639,21 +712,21 @@ public final class LyricOrchestrator {
         return firstGood;
     }
 
-    private List<LrcLine> queryLrcLibExact(String song, String artist, long durationMs) throws Exception {
+    private List<LrcLine> queryLrcLibExact(long ticket, String song, String artist, long durationMs) throws Exception {
         StringBuilder q = new StringBuilder("https://lrclib.net/api/get?track_name=")
                 .append(URLEncoder.encode(song, "UTF-8"));
         if (!artist.isEmpty()) q.append("&artist_name=").append(URLEncoder.encode(artist, "UTF-8"));
         if (durationMs > 10000) q.append("&duration=").append(durationMs / 1000L);
-        String body = httpGetString(q.toString(), null);
+        String body = httpGetString(ticket, q.toString(), null);
         if (body == null) return Collections.emptyList();
         JSONObject json = new JSONObject(body);
         String synced = safeTrim(json.optString("syncedLyrics", ""));
         return synced.isEmpty() ? Collections.emptyList() : parseLrc(synced);
     }
 
-    private List<LrcLine> queryLrcLibSearch(String song, String artist) throws Exception {
+    private List<LrcLine> queryLrcLibSearch(long ticket, String song, String artist) throws Exception {
         String kw = artist.isEmpty() ? song : (song + " " + artist);
-        String body = httpGetString("https://lrclib.net/api/search?q=" + URLEncoder.encode(kw, "UTF-8"), null);
+        String body = httpGetString(ticket, "https://lrclib.net/api/search?q=" + URLEncoder.encode(kw, "UTF-8"), null);
         if (body == null) return Collections.emptyList();
         JSONArray arr = new JSONArray(body);
         List<String> cands = new ArrayList<>();
@@ -664,9 +737,9 @@ public final class LyricOrchestrator {
         return pickBestCandidate(cands);
     }
 
-    private List<LrcLine> queryKugouLrc(String song, String artist) throws Exception {
+    private List<LrcLine> queryKugouLrc(long ticket, String song, String artist) throws Exception {
         String kw = artist.isEmpty() ? song : (song + " " + artist);
-        String body = httpGetString("https://lyrics.kugou.com/search?ver=1&man=yes&client=pc&keyword="
+        String body = httpGetString(ticket, "https://lyrics.kugou.com/search?ver=1&man=yes&client=pc&keyword="
                 + URLEncoder.encode(kw, "UTF-8") + "&duration=&hash=", null);
         if (body == null) return Collections.emptyList();
         JSONArray arr = new JSONObject(body).optJSONArray("candidates");
@@ -677,7 +750,7 @@ public final class LyricOrchestrator {
             String id = c.optString("id", "");
             String key = c.optString("accesskey", "");
             if (id.isEmpty() || key.isEmpty()) continue;
-            String dl = httpGetString("https://lyrics.kugou.com/download?ver=1&client=pc&id="
+            String dl = httpGetString(ticket, "https://lyrics.kugou.com/download?ver=1&client=pc&id="
                     + URLEncoder.encode(id, "UTF-8")
                     + "&accesskey=" + URLEncoder.encode(key, "UTF-8")
                     + "&fmt=lrc&charset=utf8", null);
@@ -690,9 +763,9 @@ public final class LyricOrchestrator {
         return pickBestCandidate(cands);
     }
 
-    private List<LrcLine> queryNeteaseLrc(String song, String artist) throws Exception {
+    private List<LrcLine> queryNeteaseLrc(long ticket, String song, String artist) throws Exception {
         String kw = artist.isEmpty() ? song : (song + " " + artist);
-        String body = httpGetString("https://music.163.com/api/search/get/web?s="
+        String body = httpGetString(ticket, "https://music.163.com/api/search/get/web?s="
                 + URLEncoder.encode(kw, "UTF-8") + "&type=1&limit=3", "https://music.163.com/");
         if (body == null) return Collections.emptyList();
         JSONObject res = new JSONObject(body).optJSONObject("result");
@@ -702,7 +775,7 @@ public final class LyricOrchestrator {
         for (int i = 0; i < Math.min(3, songs.length()); i++) {
             long id = songs.getJSONObject(i).optLong("id", 0);
             if (id <= 0) continue;
-            String lrcResp = httpGetString("https://music.163.com/api/song/lyric?id=" + id + "&lv=1&tv=-1",
+            String lrcResp = httpGetString(ticket, "https://music.163.com/api/song/lyric?id=" + id + "&lv=1&tv=-1",
                     "https://music.163.com/");
             if (lrcResp == null) continue;
             JSONObject lrcObj = new JSONObject(lrcResp).optJSONObject("lrc");

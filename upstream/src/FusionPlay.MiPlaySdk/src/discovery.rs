@@ -1465,6 +1465,7 @@ fn responder_loop_inner(
         match socket.recv_from(&mut buffer) {
             Ok((length, source)) => {
                 let query = &buffer[..length];
+                #[cfg(not(target_os = "android"))]
                 events(json!({
                     "event": "discovery_packet_received",
                     "protocol": "xiaomi_miplay",

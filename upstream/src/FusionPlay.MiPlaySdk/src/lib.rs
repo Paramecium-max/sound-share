@@ -8,6 +8,8 @@
 pub mod discovery;
 pub mod lyra;
 pub mod media;
+#[cfg(target_os = "android")]
+pub use media::set_audio_meter_enabled;
 pub mod onset;
 pub mod protocol;
 

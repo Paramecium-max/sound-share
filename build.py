@@ -4,7 +4,6 @@ from pathlib import Path
 import hashlib
 import json
 import os
-import secrets
 import shutil
 import struct
 import subprocess
@@ -29,7 +28,7 @@ OUT_APP.mkdir(parents=True, exist_ok=True)
 OUT_ZIP.mkdir(parents=True, exist_ok=True)
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-VERSION = "1.1.20"
+VERSION = "1.1.21"
 
 
 def run(*args, **kw):
@@ -164,34 +163,8 @@ def build_apk(so_path: Path) -> Path:
 
     key_file = PROJ / "keys/soundflow.jks"
     pass_file = PROJ / "keys/signing.json"
-    if not key_file.exists():
-        pwd = secrets.token_urlsafe(24)
-        pass_file.write_text(json.dumps({"password": pwd}), encoding="utf-8")
-        pass_file.chmod(0o600)
-        kenv = os.environ.copy()
-        kenv["SF_KEY_PASS"] = pwd
-        run(
-            JAVA_BIN / "keytool",
-            "-genkeypair",
-            "-keystore",
-            key_file,
-            "-storepass:env",
-            "SF_KEY_PASS",
-            "-keypass:env",
-            "SF_KEY_PASS",
-            "-keyalg",
-            "RSA",
-            "-keysize",
-            "3072",
-            "-validity",
-            "10000",
-            "-alias",
-            "soundflow",
-            "-dname",
-            "CN=SoundFlow Standalone Receiver",
-            env=kenv,
-        )
-        key_file.chmod(0o600)
+    if not key_file.is_file() or not pass_file.is_file():
+        raise FileNotFoundError("SoundFlow release signing key and signing.json are required")
 
     sign_env = os.environ.copy()
     sign_env["SF_KEY_PASS"] = json.loads(pass_file.read_text(encoding="utf-8"))["password"]

@@ -42,6 +42,7 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.net.Inet4Address;
 import java.nio.charset.StandardCharsets;
@@ -50,6 +51,9 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -111,8 +115,23 @@ public final class ReceiverService extends Service {
     private long engineToken;
     private HandlerThread analysisThread;
     private Handler analysis;
-    private boolean onsetBusy;
+    private HandlerThread eventThread;
+    private Handler eventWorker;
+    private volatile VisualRequest visualRequest;
+    private VisualRequest samplingRequest;
+    private final DlnaRendererServer.Spectrum spectrumScratch = new DlnaRendererServer.Spectrum();
     private long lastMeterAt;
+    private long visualGeneration;
+    private long dlnaSession;
+    private long nativeMediaGeneration;
+    private boolean screenInteractive = true;
+    private boolean motionAllowed;
+    private boolean rippleEnabled;
+    private BufferedOutputStream logOutput;
+    private long logBytes;
+    private final ThreadPoolExecutor logWriter = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(128), r -> new Thread(r, "soundflow-log"),
+            new ThreadPoolExecutor.DiscardOldestPolicy());
 
     private ConnectivityManager connectivity;
     private ConnectivityManager.NetworkCallback networkCallback;
@@ -129,11 +148,11 @@ public final class ReceiverService extends Service {
     private boolean miplayRunning = false;
     private boolean dlnaRunning = false;
     private boolean playing = false;
-    private boolean sessionActive = false;
+    private volatile boolean sessionActive = false;
     private boolean desired = false;
-    private boolean destroyed = false;
+    private volatile boolean destroyed = false;
     private boolean focusHeld = false;
-    private boolean uiVisible = true;
+    private boolean uiVisible = false;
     private float lastSentPeak = -1f;
     private int lastSentSpectrum = -1;
     private long lastSentPosMs = -1L;
@@ -141,8 +160,14 @@ public final class ReceiverService extends Service {
     private int lastVolumeIndex = -1;
     private int currentVolumePercent = 45;
     private long generation = 0;
-    private long lastNoticeTime = 0;
-    private long lastWakeRenew = 0;
+    private int foregroundType;
+    private String publishedNoticeTitle;
+    private String publishedNoticeStatus;
+    private int publishedNoticeAction = -1;
+    private boolean nativeSessionActive;
+    private boolean nativePlaying;
+    private long publishedMediaPosition;
+    private long publishedMediaAt;
 
     private String boundEndpoint = "";
     private String activeProtocol = "xiaomi";
@@ -181,19 +206,24 @@ public final class ReceiverService extends Service {
             if (msg.what == MSG_REGISTER && msg.replyTo != null) {
                 if (!clients.contains(msg.replyTo)) clients.add(msg.replyTo);
                 sendSnapshotTo(msg.replyTo);
-                startHighFreqMeterIfNeeded();
+                updateVisualRequest();
             } else if (msg.what == MSG_UNREGISTER && msg.replyTo != null) {
                 clients.remove(msg.replyTo);
+                updateVisualRequest();
             } else if (msg.what == MSG_UI_VISIBILITY) {
                 uiVisible = msg.arg1 != 0;
-                if (!uiVisible && dlnaServer != null) dlnaServer.releaseVisualizer();
-                if (uiVisible) startHighFreqMeterIfNeeded();
+                motionAllowed = (msg.arg2 & 1) != 0;
+                rippleEnabled = (msg.arg2 & 2) != 0;
+                updateVisualRequest();
             } else if (msg.what == MSG_FETCH_LOGS && msg.replyTo != null) {
-                Message reply = Message.obtain(null, MSG_LOG_TEXT);
-                Bundle b = new Bundle();
-                b.putString("logs", readLogTail());
-                reply.setData(b);
-                try { msg.replyTo.send(reply); } catch (RemoteException ignored) {}
+                final Messenger client = msg.replyTo;
+                logWriter.execute(() -> {
+                    Message reply = Message.obtain(null, MSG_LOG_TEXT);
+                    Bundle b = new Bundle();
+                    b.putString("logs", readLogTail());
+                    reply.setData(b);
+                    try { client.send(reply); } catch (RemoteException ignored) {}
+                });
             } else if (msg.what == MSG_SET_ONSET_SENSITIVITY) {
                 int sens = Math.max(0, Math.min(100, msg.arg1));
                 getSharedPreferences(PREF, MODE_PRIVATE).edit().putInt(PREF_ONSET_SENSITIVITY, sens).apply();
@@ -239,6 +269,9 @@ public final class ReceiverService extends Service {
         analysisThread = new HandlerThread("soundflow-onset");
         analysisThread.start();
         analysis = new Handler(analysisThread.getLooper());
+        eventThread = new HandlerThread("soundflow-events");
+        eventThread.start();
+        eventWorker = new Handler(eventThread.getLooper());
         audio = (AudioManager) getSystemService(AUDIO_SERVICE);
         connectivity = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
         logFile = new File(getFilesDir(), "receiver.log");
@@ -249,7 +282,7 @@ public final class ReceiverService extends Service {
         initMediaSession();
         initVolumeReceiver();
         initNetworkCallback();
-        main.post(eventPoller);
+        eventWorker.post(eventPoller);
     }
 
     private void initMediaSession() {
@@ -285,11 +318,21 @@ public final class ReceiverService extends Service {
         volumeReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context c, Intent i) {
-                main.removeCallbacks(volumeDebouncer);
-                main.postDelayed(volumeDebouncer, 90);
+                String action = i.getAction();
+                if (Intent.ACTION_SCREEN_OFF.equals(action) || Intent.ACTION_SCREEN_ON.equals(action)) {
+                    screenInteractive = Intent.ACTION_SCREEN_ON.equals(action);
+                    updateVisualRequest();
+                } else {
+                    main.removeCallbacks(volumeDebouncer);
+                    main.postDelayed(volumeDebouncer, 90);
+                }
             }
         };
         IntentFilter filter = new IntentFilter("android.media.VOLUME_CHANGED_ACTION");
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        PowerManager power = getSystemService(PowerManager.class);
+        screenInteractive = power == null || power.isInteractive();
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(volumeReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         } else {
@@ -407,11 +450,16 @@ public final class ReceiverService extends Service {
         int type = isPlaybackActive
                 ? (ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
                 : ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE;
+        if (foregroundType == type) return;
         try {
             startForeground(NOTICE_ID, buildNotification(), type);
+            foregroundType = type;
+            rememberNotification();
         } catch (Throwable ex) {
             try {
                 startForeground(NOTICE_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+                foregroundType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE;
+                rememberNotification();
             } catch (Throwable ignored) {}
             record("foreground", "promoteForeground(" + isPlaybackActive + "): " + ex.getMessage());
         }
@@ -643,7 +691,7 @@ public final class ReceiverService extends Service {
     }
 
     private final DlnaRendererServer.Listener dlnaListener = new DlnaRendererServer.Listener() {
-        @Override public void onDlnaPreparing(String title, String artist, String album) {
+        @Override public void onDlnaPreparing(long session, String title, String artist, String album) {
             main.post(() -> {
                 if (destroyed || !desired) return;
                 // SetURI is an explicit choice of transport. Its progress and
@@ -651,6 +699,9 @@ public final class ReceiverService extends Service {
                 boolean changedTrack = !mediaTitle.equals(title == null ? "" : title)
                         || !mediaArtist.equals(artist == null ? "" : artist);
                 activeProtocol = "dlna";
+                dlnaSession = session;
+                visualGeneration++;
+                playing = false;
                 sessionActive = true;
                 if (changedTrack) { mediaLyricsLrc = ""; mediaLyricLine = ""; mediaArtwork = ""; }
                 mediaTitle = title != null ? title : "";
@@ -658,22 +709,28 @@ public final class ReceiverService extends Service {
                 mediaAlbum = album != null ? album : "";
                 updateMediaSessionMetadata();
                 if (work != null) work.post(() -> NativeBridge.action("suspend", 0));
+                broadcastSnapshot();
             });
         }
 
         @Override
-        public void onDlnaState(boolean isPlaying, String transportState, String title, String artist, String album, long durationMs, long positionMs) {
+        public void onDlnaState(long session, boolean isPlaying, String transportState, String title, String artist, String album, long durationMs, long positionMs) {
             main.post(() -> {
-                if (destroyed || !desired || !"dlna".equals(activeProtocol)) return;
-                activeProtocol = "dlna";
+                if (destroyed || !desired || session != dlnaSession || !"dlna".equals(activeProtocol)) return;
+                boolean nextActive = isPlaying || "PAUSED_PLAYBACK".equals(transportState);
+                long previousPosition = currentLivePositionMs();
+                boolean changed = playing != isPlaying || sessionActive != nextActive
+                        || mediaDurationMs != durationMs || Math.abs(positionMs - previousPosition) >= 450L
+                        || !mediaTitle.equals(title) || !mediaArtist.equals(artist) || !mediaAlbum.equals(album);
                 playing = isPlaying;
-                sessionActive = isPlaying || "PAUSED_PLAYBACK".equals(transportState);
+                sessionActive = nextActive;
                 mediaTitle = title != null ? title : "";
                 mediaArtist = artist != null ? artist : "";
                 mediaAlbum = album != null ? album : "";
                 mediaDurationMs = durationMs;
                 mediaPositionMs = positionMs;
                 mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
+                if (!changed) return;
                 lastMediaSeq++;
                 formatText = "DLNA Audio · 48 kHz";
                 sourceName = "DLNA / UPnP 发送端";
@@ -736,12 +793,22 @@ public final class ReceiverService extends Service {
             }
         }
         if (wakeLock != null) wakeLock.acquire(10 * 60 * 1000L);
-        lastWakeRenew = SystemClock.elapsedRealtime();
+        main.removeCallbacks(renewPlaybackWakeLock);
+        main.postDelayed(renewPlaybackWakeLock, 5 * 60 * 1000L);
         if (mediaSession != null) mediaSession.setActive(true);
         promoteForeground(true);
     }
 
+    private final Runnable renewPlaybackWakeLock = new Runnable() {
+        @Override public void run() {
+            if (!playing || destroyed || wakeLock == null || !wakeLock.isHeld()) return;
+            wakeLock.acquire(10 * 60 * 1000L);
+            main.postDelayed(this, 5 * 60 * 1000L);
+        }
+    };
+
     private void releasePlaybackLocks() {
+        main.removeCallbacks(renewPlaybackWakeLock);
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         if (focusHeld && audio != null) {
             audio.abandonAudioFocusRequest(focusRequest);
@@ -752,114 +819,130 @@ public final class ReceiverService extends Service {
     }
 
     private final Runnable eventPoller = new Runnable() {
-        @Override
-        public void run() {
+        @Override public void run() {
             if (destroyed) return;
             try {
                 String raw = NativeBridge.poll();
                 if (raw != null && !"[]".equals(raw)) {
                     JSONArray events = new JSONArray(raw);
-                    JSONObject lastVol = null;
-                    for (int i = 0; i < events.length(); i++) {
-                        JSONObject e = events.getJSONObject(i);
-                        if ("volume".equals(e.optString("event"))) lastVol = e;
-                        else handleNativeEvent(e);
-                    }
-                    if (lastVol != null) handleNativeEvent(lastVol);
+                    main.post(() -> {
+                        if (destroyed || !desired || ENGINE_OWNER.get() != engineToken) return;
+                        JSONObject lastVolume = null;
+                        for (int i = 0; i < events.length(); i++) {
+                            JSONObject event = events.optJSONObject(i);
+                            if (event == null) continue;
+                            if ("volume".equals(event.optString("event"))) lastVolume = event;
+                            else handleNativeEvent(event);
+                        }
+                        if (lastVolume != null) handleNativeEvent(lastVolume);
+                    });
                 }
-                if (playing && wakeLock != null && wakeLock.isHeld()
-                        && SystemClock.elapsedRealtime() - lastWakeRenew > 5 * 60 * 1000L) {
-                    wakeLock.acquire(10 * 60 * 1000L);
-                    lastWakeRenew = SystemClock.elapsedRealtime();
-                }
-            } catch (Throwable ex) {
+            } catch (Exception ex) {
                 Log.e(TAG, "poll error", ex);
             }
-            main.postDelayed(this, sessionActive ? 90 : 500);
+            eventWorker.postDelayed(this, sessionActive ? 90 : 500);
         }
     };
 
-    private boolean highFreqRunning = false;
+    private static final class VisualRequest {
+        final long generation;
+        final boolean xiaomi;
+        final boolean onsets;
+        final DlnaRendererServer dlna;
 
-    private void startHighFreqMeterIfNeeded() {
-        if (highFreqRunning || destroyed) return;
-        highFreqRunning = true;
-        main.post(audioLevelTicker);
+        VisualRequest(long generation, boolean xiaomi, boolean onsets, DlnaRendererServer dlna) {
+            this.generation = generation;
+            this.xiaomi = xiaomi;
+            this.onsets = onsets;
+            this.dlna = dlna;
+        }
+    }
+
+    private void updateVisualRequest() {
+        boolean wanted = !destroyed && playing && uiVisible && screenInteractive && motionAllowed && !clients.isEmpty();
+        boolean xiaomi = "xiaomi".equals(activeProtocol);
+        DlnaRendererServer dlna = xiaomi ? null : dlnaServer;
+        VisualRequest current = visualRequest;
+        if ((!wanted && current == null) || (wanted && current != null
+                && current.generation == visualGeneration && current.xiaomi == xiaomi
+                && current.onsets == rippleEnabled && current.dlna == dlna)) return;
+        visualRequest = wanted ? new VisualRequest(visualGeneration, xiaomi, rippleEnabled, dlna) : null;
+        analysis.post(() -> {
+            analysis.removeCallbacks(audioLevelTicker);
+            audioLevelTicker.run();
+        });
     }
 
     private final Runnable audioLevelTicker = new Runnable() {
-        @Override
-        public void run() {
-            if (destroyed || clients.isEmpty()) {
-                highFreqRunning = false;
-                return;
+        @Override public void run() {
+            VisualRequest request = visualRequest;
+            if (samplingRequest != request) {
+                if (samplingRequest != null && samplingRequest.dlna != null) {
+                    samplingRequest.dlna.releaseVisualizer();
+                }
+                if (ENGINE_OWNER.get() == engineToken) {
+                    NativeBridge.setAudioMeterEnabled(request != null && request.xiaomi);
+                    NativeBridge.setOnsetCapture(false, System.nanoTime());
+                    if (request != null && request.xiaomi && request.onsets) {
+                        NativeBridge.setOnsetCapture(true, System.nanoTime());
+                    }
+                }
+                samplingRequest = request;
+                lastMeterAt = 0;
             }
-            if (playing && uiVisible) {
-                if (!onsetBusy) {
-                    onsetBusy = true;
-                    final boolean xiaomi = "xiaomi".equals(activeProtocol);
-                    final String protocol = activeProtocol;
-                    final DlnaRendererServer dlna = dlnaServer;
-                    analysis.post(() -> {
-                        String events;
-                        if (xiaomi) {
-                            events = NativeBridge.audioOnsets(true);
-                        } else {
-                            float[] dlnaSpectrum = dlna != null ? dlna.captureOnsetSpectrum() : null;
-                            int dlnaRate = dlna != null ? dlna.onsetSampleRate : 48000;
-                            events = dlnaSpectrum == null ? "[]" : NativeBridge.spectrumOnsets(dlnaSpectrum, dlnaRate);
-                        }
-                        final String payload = events;
-                        final long capturedAt = SystemClock.elapsedRealtime();
-                        main.post(() -> {
-                            onsetBusy = false;
-                            if (!destroyed && playing && uiVisible && protocol.equals(activeProtocol) && !"[]".equals(payload)) {
-                                Message event = Message.obtain(null, MSG_AUDIO_ONSETS);
-                                Bundle data = new Bundle();
-                                data.putString("events", payload);
-                                data.putLong("captured_at", capturedAt);
-                                event.setData(data);
-                                sendToAllClients(event);
-                            }
-                        });
-                    });
+            if (request == null || destroyed || ENGINE_OWNER.get() != engineToken) return;
+            try {
+                long now = SystemClock.elapsedRealtime();
+                boolean meterDue = now - lastMeterAt >= 85L;
+                String onsets = null;
+                int spectrum = 0;
+                if (request.xiaomi) {
+                    if (request.onsets) onsets = NativeBridge.audioOnsets();
+                    if (meterDue) spectrum = NativeBridge.audioSpectrum();
+                } else if (request.dlna != null
+                        && request.dlna.captureSpectrum(spectrumScratch, request.onsets, meterDue)) {
+                    if (request.onsets) onsets = NativeBridge.spectrumOnsets(
+                            spectrumScratch.bins, spectrumScratch.sampleRate, spectrumScratch.capturedNanos);
+                    if (meterDue) spectrum = spectrumScratch.packed;
                 }
-                long nowElapsed = SystemClock.elapsedRealtime();
-                if (nowElapsed - lastMeterAt < 85L) {
-                    main.postDelayed(this, 12);
-                    return;
+                if (meterDue) lastMeterAt = now;
+                if (onsets != null || meterDue) {
+                    final String payload = onsets;
+                    final int packed = spectrum;
+                    main.post(() -> publishVisualSample(request, payload, meterDue, packed));
                 }
-                lastMeterAt = nowElapsed;
-                int spec;
-                float peak;
-                if ("xiaomi".equals(activeProtocol)) {
-                    spec = NativeBridge.audioSpectrum();
-                    peak = ((spec >>> 24) & 0xff) / 255f;
-                } else {
-                    spec = dlnaServer != null ? dlnaServer.audioSpectrum() : 0;
-                    peak = ((spec >>> 24) & 0xff) / 255f;
-                }
-                long livePos = currentLivePositionMs();
-                if (Math.abs(peak - lastSentPeak) >= 0.025f || spec != lastSentSpectrum || Math.abs(livePos - lastSentPosMs) >= 240L) {
-                    lastSentPeak = peak;
-                    lastSentSpectrum = spec;
-                    lastSentPosMs = livePos;
-                    Message msg = Message.obtain(null, MSG_AUDIO_LEVEL);
-                    Bundle b = new Bundle();
-                    b.putFloat("peak", peak);
-                    b.putInt("spectrum", spec);
-                    b.putLong("position_ms", livePos);
-                    msg.setData(b);
-                    sendToAllClients(msg);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "visual analysis", e);
+            } finally {
+                if (visualRequest == request && !destroyed) {
+                    analysis.postDelayed(this, request.onsets ? 12L : 85L);
                 }
             }
-            if ((!playing || !uiVisible) && dlnaServer != null) dlnaServer.releaseVisualizer();
-            if (!playing || !uiVisible) {
-                if (!onsetBusy) analysis.post(() -> NativeBridge.audioOnsets(false));
-            }
-            main.postDelayed(this, (playing && uiVisible) ? 12 : 350);
         }
     };
+
+    private void publishVisualSample(VisualRequest request, String onsets, boolean meterDue, int packed) {
+        if (visualRequest != request || destroyed || !playing) return;
+        long pos = meterDue ? currentLivePositionMs() : 0;
+        float peak = ((packed >>> 24) & 0xff) / 255f;
+        boolean meterChanged = meterDue && (Math.abs(peak - lastSentPeak) >= 0.025f
+                || packed != lastSentSpectrum || Math.abs(pos - lastSentPosMs) >= 240L);
+        if (onsets == null && !meterChanged) return;
+        Bundle data = new Bundle();
+        if (onsets != null) data.putString("events", onsets);
+        if (meterChanged) {
+            lastSentPeak = peak;
+            lastSentSpectrum = packed;
+            lastSentPosMs = pos;
+            data.putInt("spectrum", packed);
+            data.putLong("position_ms", pos);
+        }
+        Message msg = Message.obtain(null, MSG_AUDIO_ONSETS);
+        data.putLong("visual_generation", request.generation);
+        msg.setData(data);
+        sendToAllClients(msg);
+        msg.recycle();
+    }
 
     private static String optCleanString(JSONObject obj, String key) {
         if (obj == null || obj.isNull(key)) return "";
@@ -870,8 +953,21 @@ public final class ReceiverService extends Service {
     private void activateXiaomiTransport() {
         boolean wasDlna = "dlna".equals(activeProtocol);
         activeProtocol = "xiaomi";
-        if (wasDlna && dlnaServer != null) {
-            dlnaServer.stopPlayback();
+        if (wasDlna) {
+            visualGeneration++;
+            mediaTitle = "";
+            mediaArtist = "";
+            mediaAlbum = "";
+            mediaArtwork = "";
+            mediaLyricsLrc = "";
+            mediaLyricLine = "";
+            mediaDurationMs = 0;
+            mediaPositionMs = 0;
+            mediaPositionAnchorElapsed = 0;
+            sourceName = "小米妙播发送端";
+            formatText = "";
+            updateMediaSessionMetadata();
+            if (dlnaServer != null) dlnaServer.stopPlayback();
         }
         if (focusHeld) {
             dispatchAction("output_resume", 0);
@@ -881,11 +977,35 @@ public final class ReceiverService extends Service {
     private void handleNativeEvent(JSONObject e) {
         String event = optCleanString(e, "event");
         if (!"progress".equals(event) && !"protocol_trace".equals(event) && !"discovery_packet_received".equals(event)) {
-            record("native", e.toString());
+            if (!event.startsWith("discovery_query")) logWriter.execute(() -> writeLog("native", e.toString()));
         }
+        String stage = "interconnect_stage".equals(event) ? e.optString("stage") : "";
+        switch (event) {
+            case "interconnect_stage":
+                if ("media_session_established".equals(stage)) nativeSessionActive = true;
+                break;
+            case "stream_started":
+            case "audio_output_signal_started":
+                nativeSessionActive = true;
+                nativePlaying = true;
+                break;
+            case "playback_state":
+                nativePlaying = e.optBoolean("playing");
+                nativeSessionActive = e.optBoolean("session_active", nativeSessionActive);
+                break;
+            case "media_channel_closed":
+            case "stream_stopped":
+                nativeSessionActive = false;
+                nativePlaying = false;
+                break;
+        }
+        boolean reclaimFromMetadata = false;
         if ("dlna".equals(activeProtocol)) {
-            String stage = "interconnect_stage".equals(event) ? e.optString("stage") : "";
-            boolean newNativeSession = ("transport_connected".equals(stage) && !sessionActive)
+            boolean explicitResume = "playback_state".equals(event) && e.optBoolean("playing");
+            reclaimFromMetadata = !sessionActive && nativeSessionActive && "media_info".equals(event);
+            boolean reclaimIdleDlna = (!playing && explicitResume) || reclaimFromMetadata;
+            boolean newNativeSession = reclaimIdleDlna
+                    || ("transport_connected".equals(stage) && !sessionActive)
                     || "media_session_established".equals(stage)
                     || "stream_started".equals(event)
                     || "audio_output_signal_started".equals(event);
@@ -916,12 +1036,16 @@ public final class ReceiverService extends Service {
                 return;
             }
         }
+        long incomingGeneration = e.optLong("media_generation", 0);
+        if (incomingGeneration != 0 && incomingGeneration != nativeMediaGeneration) {
+            nativeMediaGeneration = incomingGeneration;
+            visualGeneration++;
+        }
         boolean snapshotDirty = false;
         boolean mediaDirty = false;
 
         switch (event) {
             case "interconnect_stage": {
-                String stage = e.optString("stage");
                 if ("transport_connected".equals(stage) && !sessionActive) {
                     statusText = "设备已握手，正在协商";
                     snapshotDirty = true;
@@ -997,6 +1121,15 @@ public final class ReceiverService extends Service {
                 mediaDirty = true;
                 break;
             case "media_info": {
+                if (reclaimFromMetadata) {
+                    sessionActive = nativeSessionActive;
+                    playing = nativePlaying;
+                    sourceName = "小米妙播发送端";
+                    statusText = playing ? "正在播放投送音频" : "播放已暂停";
+                    if (playing) acquirePlaybackLocks();
+                }
+                if (!mediaAlbum.equals(optCleanString(e, "album"))
+                        || !mediaArtist.equals(optCleanString(e, "artist"))) visualGeneration++;
                 activeProtocol = "xiaomi";
                 mediaTitle = optCleanString(e, "title");
                 mediaArtist = optCleanString(e, "artist");
@@ -1019,13 +1152,14 @@ public final class ReceiverService extends Service {
             }
             case "progress": {
                 long nextPos = Math.max(0L, e.optLong("position_ms", 0L));
-                long expected = currentLivePositionMs();
+                long now = SystemClock.elapsedRealtime();
+                long expected = publishedMediaPosition + (playing && publishedMediaAt != 0
+                        ? Math.max(0L, now - publishedMediaAt) : 0L);
                 mediaPositionMs = nextPos;
                 mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
                 if (Math.abs(nextPos - expected) >= 450L) {
                     mediaDirty = true;
                 }
-                updateMediaSessionState();
                 break;
             }
             case "volume":
@@ -1043,10 +1177,11 @@ public final class ReceiverService extends Service {
             }
         }
 
+        updateVisualRequest();
         if (snapshotDirty || mediaDirty) updateMediaSessionState();
         if (mediaDirty) broadcastMediaEvent();
         if (snapshotDirty) broadcastSnapshot();
-        if (SystemClock.elapsedRealtime() - lastNoticeTime > 1500 || mediaDirty || snapshotDirty) {
+        if (mediaDirty || snapshotDirty) {
             updateNotification(false);
         }
     }
@@ -1062,9 +1197,11 @@ public final class ReceiverService extends Service {
 
     private void updateMediaSessionState() {
         if (mediaSession == null) return;
+        publishedMediaPosition = currentLivePositionMs();
+        publishedMediaAt = SystemClock.elapsedRealtime();
         mediaSession.setPlaybackState(new PlaybackState.Builder()
                 .setState(playing ? PlaybackState.STATE_PLAYING : (sessionActive ? PlaybackState.STATE_PAUSED : PlaybackState.STATE_STOPPED),
-                        currentLivePositionMs(), 1f)
+                        publishedMediaPosition, playing ? 1f : 0f, publishedMediaAt)
                 .setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
                         | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_SKIP_TO_NEXT
                         | PlaybackState.ACTION_STOP)
@@ -1100,7 +1237,7 @@ public final class ReceiverService extends Service {
         });
     }
 
-    private Bundle buildSnapshotBundle() {
+    private Bundle buildSnapshotBundle(boolean includeMedia) {
         SharedPreferences prefs = getSharedPreferences(PREF, MODE_PRIVATE);
         Bundle b = new Bundle();
         b.putBoolean("enabled", desired);
@@ -1123,24 +1260,28 @@ public final class ReceiverService extends Service {
         b.putString("title", mediaTitle);
         b.putString("artist", mediaArtist);
         b.putString("album", mediaAlbum);
-        b.putString("lyrics_lrc", mediaLyricsLrc);
-        b.putString("lyric_line", mediaLyricLine);
-        b.putString("artwork", mediaArtwork);
+        if (includeMedia) {
+            b.putString("lyrics_lrc", mediaLyricsLrc);
+            b.putString("lyric_line", mediaLyricLine);
+            b.putString("artwork", mediaArtwork);
+        }
         b.putLong("duration_ms", mediaDurationMs);
         b.putLong("position_ms", currentLivePositionMs());
         b.putLong("media_seq", lastMediaSeq);
+        b.putLong("visual_generation", visualGeneration);
         return b;
     }
 
     private void sendSnapshotTo(Messenger client) {
         Message msg = Message.obtain(null, MSG_SNAPSHOT);
-        msg.setData(buildSnapshotBundle());
+        msg.setData(buildSnapshotBundle(true));
         try { client.send(msg); } catch (RemoteException ignored) {}
     }
 
     private void broadcastSnapshot() {
+        updateVisualRequest();
         if (clients.isEmpty()) return;
-        Bundle b = buildSnapshotBundle();
+        Bundle b = buildSnapshotBundle(false);
         Iterator<Messenger> it = clients.iterator();
         while (it.hasNext()) {
             Messenger m = it.next();
@@ -1151,8 +1292,9 @@ public final class ReceiverService extends Service {
     }
 
     private void broadcastMediaEvent() {
+        updateVisualRequest();
         if (clients.isEmpty()) return;
-        Bundle b = buildSnapshotBundle();
+        Bundle b = buildSnapshotBundle(true);
         Iterator<Messenger> it = clients.iterator();
         while (it.hasNext()) {
             Messenger m = it.next();
@@ -1203,29 +1345,61 @@ public final class ReceiverService extends Service {
         return b.build();
     }
 
-    private void updateNotification(boolean force) {
-        long now = SystemClock.elapsedRealtime();
-        if (!force && now - lastNoticeTime < 1500) return;
-        lastNoticeTime = now;
-        NotificationManager nm = getSystemService(NotificationManager.class);
-        if (nm != null) nm.notify(NOTICE_ID, buildNotification());
+    private int notificationAction() {
+        return sessionActive ? (playing ? 2 : 1) : 0;
     }
 
-    private synchronized void record(String kind, String text) {
+    private void rememberNotification() {
+        publishedNoticeTitle = mediaTitle;
+        publishedNoticeStatus = statusText;
+        publishedNoticeAction = notificationAction();
+    }
+
+    private void updateNotification(boolean force) {
+        if (!force && mediaTitle.equals(publishedNoticeTitle) && statusText.equals(publishedNoticeStatus)
+                && notificationAction() == publishedNoticeAction) return;
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) {
+            nm.notify(NOTICE_ID, buildNotification());
+            rememberNotification();
+        }
+    }
+
+    private void record(String kind, String text) {
+        logWriter.execute(() -> writeLog(kind, text));
+    }
+
+    private void closeLog() {
+        if (logOutput == null) return;
+        try { logOutput.close(); } catch (IOException ignored) {}
+        logOutput = null;
+    }
+
+    private void writeLog(String kind, String text) {
         Log.i(TAG, kind + ": " + text);
+        byte[] line = (System.currentTimeMillis() + " [" + kind + "] " + text + "\n")
+                .getBytes(StandardCharsets.UTF_8);
         try {
-            if (logFile.length() > 512 * 1024) {
+            if (logOutput == null) {
+                logBytes = logFile.length();
+                logOutput = new BufferedOutputStream(new FileOutputStream(logFile, true));
+            }
+            if (logBytes + line.length > 512 * 1024) {
+                closeLog();
                 File prev = new File(getFilesDir(), "receiver.previous.log");
                 prev.delete();
-                logFile.renameTo(prev);
+                if (!logFile.renameTo(prev)) return;
+                logOutput = new BufferedOutputStream(new FileOutputStream(logFile, true));
+                logBytes = 0;
             }
-            try (FileOutputStream fos = new FileOutputStream(logFile, true)) {
-                fos.write((System.currentTimeMillis() + " [" + kind + "] " + text + "\n").getBytes(StandardCharsets.UTF_8));
-            }
-        } catch (IOException ignored) {}
+            logOutput.write(line);
+            logOutput.flush();
+            logBytes += line.length;
+        } catch (IOException ignored) { closeLog(); }
     }
 
-    private synchronized String readLogTail() {
+    private String readLogTail() {
+        try { if (logOutput != null) logOutput.flush(); } catch (IOException ignored) { closeLog(); }
         try (FileInputStream in = new FileInputStream(logFile)) {
             long fileLen = logFile.length();
             long skip = Math.max(0, fileLen - 48 * 1024);
@@ -1287,6 +1461,7 @@ public final class ReceiverService extends Service {
         releasePlaybackLocks();
         updateMediaSessionState();
         stopForeground(STOP_FOREGROUND_REMOVE);
+        foregroundType = 0;
         broadcastMediaEvent();
         broadcastSnapshot();
         if (work != null && !destroyed) {
@@ -1329,8 +1504,14 @@ public final class ReceiverService extends Service {
         destroyed = true;
         desired = false;
         generation++;
+        visualRequest = null;
         analysis.removeCallbacksAndMessages(null);
+        analysis.post(audioLevelTicker);
         analysisThread.quitSafely();
+        eventWorker.removeCallbacksAndMessages(null);
+        eventThread.quitSafely();
+        logWriter.execute(this::closeLog);
+        logWriter.shutdown();
         main.removeCallbacksAndMessages(null);
         try { if (networkCallback != null) connectivity.unregisterNetworkCallback(networkCallback); } catch (Throwable ignored) {}
         try { if (volumeReceiver != null) unregisterReceiver(volumeReceiver); } catch (Throwable ignored) {}
@@ -1352,6 +1533,7 @@ public final class ReceiverService extends Service {
             releaseNetworkLocks();
         });
         stopForeground(STOP_FOREGROUND_REMOVE);
+        foregroundType = 0;
         super.onDestroy();
     }
 

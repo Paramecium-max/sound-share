@@ -3,7 +3,7 @@
 //! This implementation is based on observed wire behaviour and intentionally
 //! contains no Xiaomi binaries, account client, certificate service or JNI.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, bail};
 use hkdf::Hkdf;
@@ -72,7 +72,8 @@ struct PeerSession {
     response_order: VecDeque<u32>,
     pending: HashMap<u32, PendingResponse>,
     account_hash: Vec<u8>,
-    session_key: Option<[u8; 32]>,
+    cipher: Option<Aes256Gcm>,
+    plaintext: Vec<u8>,
     client_channel_id: Option<u64>,
     server_channel_id: Option<u64>,
     last_active: Instant,
@@ -92,7 +93,8 @@ impl PeerSession {
             response_order: VecDeque::new(),
             pending: HashMap::new(),
             account_hash: Vec::new(),
-            session_key: None,
+            cipher: None,
+            plaintext: Vec::new(),
             client_channel_id: None,
             server_channel_id: None,
             last_active: now,
@@ -114,13 +116,13 @@ impl PeerSession {
     }
 }
 
-struct LogicalFrame {
+struct LogicalFrame<'a> {
     outer_scalars: Vec<(u32, u64)>,
     logical_id: u64,
     encrypted: bool,
     inner_type: u64,
-    inner: Vec<u8>,
-    message: Option<Vec<u8>>,
+    inner: &'a [u8],
+    message: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Copy)]
@@ -189,7 +191,7 @@ fn prune_stale_sessions(sessions: &mut HashMap<SocketAddr, PeerSession>, now: In
     while sessions.len() > MAX_PEER_SESSIONS {
         let victim = sessions
             .iter()
-            .min_by_key(|(_, session)| (session.session_key.is_some(), session.last_active))
+            .min_by_key(|(_, session)| (session.cipher.is_some(), session.last_active))
             .map(|(peer, _)| *peer);
         if let Some(peer) = victim {
             sessions.remove(&peer);
@@ -237,6 +239,7 @@ fn run_server(
             prune_stale_sessions(&mut sessions, now);
         }
         let packet = &buffer[..length];
+        #[cfg(not(target_os = "android"))]
         events(json!({
             "event": "lyra_packet_received",
             "protocol": "xiaomi_miplay",
@@ -366,6 +369,7 @@ fn handle_payload(
     events: &EventEmitter,
 ) -> Result<Option<Vec<u8>>> {
     let (kind, body) = transport_payload(frame)?;
+    #[cfg(not(target_os = "android"))]
     events(json!({
         "event": "lyra_transport_frame_trace",
         "protocol": "xiaomi_miplay",
@@ -409,104 +413,18 @@ fn handle_payload(
             }
         }
         0x11 => {
-            let logical = parse_logical_frame(body, session.session_key.as_ref())?;
-            events(json!({
-                "event": "lyra_logical_frame_trace",
-                "protocol": "xiaomi_miplay",
-                "peer": peer.to_string(),
-                "logical_id": format!("{:08X}", logical.logical_id),
-                "frame_type": logical.inner_type,
-                "encrypted": logical.encrypted,
-                "outer_scalars": &logical.outer_scalars,
-                "inner_hex": hex::encode(&logical.inner),
-                "message_hex": logical.message.as_deref().map(hex::encode),
-                "message_utf8": logical
-                    .message
-                    .as_deref()
-                    .and_then(|value| std::str::from_utf8(value).ok()),
-            }));
-            match logical.inner_type {
-                5 => {
-                    events(json!({
-                        "event": "lyra_logical_sync",
-                        "protocol": "xiaomi_miplay",
-                        "peer": peer.to_string(),
-                        "logical_id": format!("{:08X}", logical.logical_id),
-                    }));
-                    Ok(Some(build_logical_sync_response(&logical)?))
-                }
-                6 => {
-                    let auth = logical
-                        .message
-                        .as_deref()
-                        .context("missing Lyra auth frame")?;
-                    let (response, key_index) = build_auth_server_notify(&logical, auth, session)?;
-                    events(json!({
-                        "event": "lyra_secure_channel_established",
-                        "protocol": "xiaomi_miplay",
-                        "peer": peer.to_string(),
-                        "logical_id": format!("{:08X}", logical.logical_id),
-                        "key_index": key_index,
-                        "cipher": "P-256/HKDF-SHA256/AES-256-GCM",
-                        "external_account_required": false,
-                    }));
-                    Ok(Some(response))
-                }
-                1 if logical.encrypted => {
-                    let service = logical
-                        .message
-                        .as_deref()
-                        .and_then(|message| bytes_field(message, 2).ok().flatten())
-                        .and_then(|value| std::str::from_utf8(value).ok())
-                        .unwrap_or_default();
-                    let (response, peer_port) = build_connect_success_response(&logical, session)?;
-                    if let Some((client_channel_id, server_channel_id, _)) = peer_port {
-                        session.client_channel_id = Some(client_channel_id);
-                        session.server_channel_id = Some(server_channel_id);
-                    }
-                    events(json!({
-                        "event": "lyra_logical_connection_accepted",
-                        "protocol": "xiaomi_miplay",
-                        "peer": peer.to_string(),
-                        "logical_id": format!("{:08X}", logical.logical_id),
-                        "service": service,
-                        "client_channel_id": peer_port.map(|value| value.0),
-                        "server_channel_id": peer_port.map(|value| value.1),
-                        "server_port": peer_port.map(|value| value.2),
-                    }));
-                    Ok(Some(response))
-                }
-                3 if logical.encrypted => {
-                    events(json!({
-                        "event": "lyra_logical_connection_confirmed",
-                        "protocol": "xiaomi_miplay",
-                        "peer": peer.to_string(),
-                        "logical_id": format!("{:08X}", logical.logical_id),
-                        "playable": false,
-                    }));
-                    Ok(None)
-                }
-                4 => Ok(None),
-                _ => {
-                    events(json!({
-                        "event": "lyra_logical_frame",
-                        "protocol": "xiaomi_miplay",
-                        "peer": peer.to_string(),
-                        "logical_id": format!("{:08X}", logical.logical_id),
-                        "frame_type": logical.inner_type,
-                        "encrypted": logical.encrypted,
-                        "payload_hex": hex::encode(&logical.inner),
-                    }));
-                    Ok(None)
-                }
-            }
+            let mut scratch = std::mem::take(&mut session.plaintext);
+            let result = parse_logical_frame(body, session.cipher.as_ref(), &mut scratch)
+                .and_then(|logical| handle_logical_frame(logical, session, peer, events));
+            session.plaintext = scratch;
+            result
         }
         0x21 => {
             let (&channel_id, encrypted) = body
                 .split_first()
                 .context("missing Lyra channel identifier")?;
             let expected_channel_id = session.server_channel_id;
-            let Some(session_key) = session.session_key.as_ref() else {
+            let Some(cipher) = session.cipher.as_ref() else {
                 events(json!({
                     "event": "lyra_channel_frame_rejected",
                     "protocol": "xiaomi_miplay",
@@ -518,17 +436,20 @@ fn handle_payload(
                 return Ok(None);
             };
 
-            match decrypt_payload(encrypted, session_key) {
-                Ok(plain) => events(json!({
+            match decrypt_into(encrypted, cipher, &mut session.plaintext) {
+                Ok(()) => {
+                    #[cfg(not(target_os = "android"))]
+                    events(json!({
                     "event": "lyra_channel_frame_decrypted",
                     "protocol": "xiaomi_miplay",
                     "peer": peer.to_string(),
                     "channel_id": channel_id,
                     "expected_channel_id": expected_channel_id,
                     "client_channel_id": session.client_channel_id,
-                    "payload_hex": hex::encode(&plain),
-                    "payload_utf8": std::str::from_utf8(&plain).ok(),
-                })),
+                    "payload_hex": hex::encode(&session.plaintext),
+                    "payload_utf8": std::str::from_utf8(&session.plaintext).ok(),
+                    }));
+                }
                 Err(error) => events(json!({
                     "event": "lyra_channel_frame_decrypt_failed",
                     "protocol": "xiaomi_miplay",
@@ -574,7 +495,105 @@ fn physical_frame(body: &[u8]) -> Result<(u64, Option<&[u8]>)> {
     Ok((frame_type, message))
 }
 
-fn parse_logical_frame(body: &[u8], key: Option<&[u8; 32]>) -> Result<LogicalFrame> {
+fn handle_logical_frame(
+    logical: LogicalFrame<'_>, session: &mut PeerSession, peer: SocketAddr, events: &EventEmitter,
+) -> Result<Option<Vec<u8>>> {
+    #[cfg(not(target_os = "android"))]
+    events(json!({
+        "event": "lyra_logical_frame_trace",
+        "protocol": "xiaomi_miplay",
+        "peer": peer.to_string(),
+        "logical_id": format!("{:08X}", logical.logical_id),
+        "frame_type": logical.inner_type,
+        "encrypted": logical.encrypted,
+        "outer_scalars": &logical.outer_scalars,
+        "inner_hex": hex::encode(&logical.inner),
+        "message_hex": logical.message.as_deref().map(hex::encode),
+        "message_utf8": logical
+            .message
+            .as_deref()
+            .and_then(|value| std::str::from_utf8(value).ok()),
+    }));
+    match logical.inner_type {
+        5 => {
+            events(json!({
+                "event": "lyra_logical_sync",
+                "protocol": "xiaomi_miplay",
+                "peer": peer.to_string(),
+                "logical_id": format!("{:08X}", logical.logical_id),
+            }));
+            Ok(Some(build_logical_sync_response(&logical)?))
+        }
+        6 => {
+            let auth = logical
+                .message
+                .as_deref()
+                .context("missing Lyra auth frame")?;
+            let (response, key_index) = build_auth_server_notify(&logical, auth, session)?;
+            events(json!({
+                "event": "lyra_secure_channel_established",
+                "protocol": "xiaomi_miplay",
+                "peer": peer.to_string(),
+                "logical_id": format!("{:08X}", logical.logical_id),
+                "key_index": key_index,
+                "cipher": "P-256/HKDF-SHA256/AES-256-GCM",
+                "external_account_required": false,
+            }));
+            Ok(Some(response))
+        }
+        1 if logical.encrypted => {
+            let service = logical
+                .message
+                .as_deref()
+                .and_then(|message| bytes_field(message, 2).ok().flatten())
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .unwrap_or_default();
+            let (response, peer_port) = build_connect_success_response(&logical, session)?;
+            if let Some((client_channel_id, server_channel_id, _)) = peer_port {
+                session.client_channel_id = Some(client_channel_id);
+                session.server_channel_id = Some(server_channel_id);
+            }
+            events(json!({
+                "event": "lyra_logical_connection_accepted",
+                "protocol": "xiaomi_miplay",
+                "peer": peer.to_string(),
+                "logical_id": format!("{:08X}", logical.logical_id),
+                "service": service,
+                "client_channel_id": peer_port.map(|value| value.0),
+                "server_channel_id": peer_port.map(|value| value.1),
+                "server_port": peer_port.map(|value| value.2),
+            }));
+            Ok(Some(response))
+        }
+        3 if logical.encrypted => {
+            events(json!({
+                "event": "lyra_logical_connection_confirmed",
+                "protocol": "xiaomi_miplay",
+                "peer": peer.to_string(),
+                "logical_id": format!("{:08X}", logical.logical_id),
+                "playable": false,
+            }));
+            Ok(None)
+        }
+        4 => Ok(None),
+        _ => {
+            events(json!({
+                "event": "lyra_logical_frame",
+                "protocol": "xiaomi_miplay",
+                "peer": peer.to_string(),
+                "logical_id": format!("{:08X}", logical.logical_id),
+                "frame_type": logical.inner_type,
+                "encrypted": logical.encrypted,
+                "payload_hex": hex::encode(&logical.inner),
+            }));
+            Ok(None)
+        }
+    }
+}
+
+fn parse_logical_frame<'a>(
+    body: &'a [u8], cipher: Option<&Aes256Gcm>, scratch: &'a mut Vec<u8>,
+) -> Result<LogicalFrame<'a>> {
     let outer = nested_bytes(body, &[2, 1])?.context("missing logical frame")?;
     let mut outer_scalars = Vec::new();
     let mut logical_id = 0;
@@ -596,19 +615,17 @@ fn parse_logical_frame(body: &[u8], key: Option<&[u8; 32]>) -> Result<LogicalFra
     }
     let wire_payload = payload.context("missing logical inner frame")?;
     let inner = if encrypted {
-        decrypt_payload(
-            wire_payload,
-            key.context("encrypted logical frame before ECDH")?,
-        )?
+        decrypt_into(wire_payload, cipher.context("encrypted logical frame before ECDH")?, scratch)?;
+        scratch.as_slice()
     } else {
-        wire_payload.to_vec()
+        wire_payload
     };
     let mut inner_type = 0;
     let mut message = None;
-    for (field, value) in parse_fields(&inner)? {
+    for (field, value) in parse_fields(inner)? {
         match value {
             PbValue::Varint(value) if field == 1 => inner_type = value,
-            PbValue::Bytes(value) if field >= 2 => message = Some(value.to_vec()),
+            PbValue::Bytes(value) if field >= 2 => message = Some(value),
             _ => {}
         }
     }
@@ -660,7 +677,7 @@ fn build_keep_alive_response(request: &[u8]) -> Vec<u8> {
     wrap_transport(0x09, &pb_bytes(2, &pb_bytes(2, &physical)))
 }
 
-fn build_logical_sync_response(logical: &LogicalFrame) -> Result<Vec<u8>> {
+fn build_logical_sync_response(logical: &LogicalFrame<'_>) -> Result<Vec<u8>> {
     let sync = logical
         .message
         .as_deref()
@@ -677,7 +694,7 @@ fn build_logical_sync_response(logical: &LogicalFrame) -> Result<Vec<u8>> {
 }
 
 fn build_auth_server_notify(
-    logical: &LogicalFrame,
+    logical: &LogicalFrame<'_>,
     auth: &[u8],
     session: &mut PeerSession,
 ) -> Result<(Vec<u8>, u64)> {
@@ -710,12 +727,12 @@ fn build_auth_server_notify(
     info.extend_from_slice(&server_nonce);
     let hkdf = Hkdf::<Sha256>::new(
         Some(&SESSION_KEY_SALT),
-        shared.raw_secret_bytes().as_slice(),
+        &shared.raw_secret_bytes()[..],
     );
     let mut session_key = [0_u8; 32];
     hkdf.expand(&info, &mut session_key)
         .map_err(|_| anyhow::anyhow!("derive Lyra session key"))?;
-    session.session_key = Some(session_key);
+    session.cipher = Some(Aes256Gcm::new_from_slice(&session_key).map_err(|_| anyhow::anyhow!("initialize Lyra AES-GCM"))?);
 
     let generic_public = pb_join([pb_varint(1, 1), pb_bytes(2, server_public.as_bytes())]);
     let selected = pb_join([
@@ -740,7 +757,7 @@ fn build_auth_server_notify(
 type PeerPortNegotiation = Option<(u64, u64, u16)>;
 
 fn build_connect_success_response(
-    logical: &LogicalFrame,
+    logical: &LogicalFrame<'_>,
     session: &PeerSession,
 ) -> Result<(Vec<u8>, PeerPortNegotiation)> {
     let (connect_response, peer_port) = match logical.message.as_deref() {
@@ -751,7 +768,7 @@ fn build_connect_success_response(
     let encrypted = encrypt_payload(
         &plain,
         session
-            .session_key
+            .cipher
             .as_ref()
             .context("missing Lyra session key")?,
     )?;
@@ -817,7 +834,7 @@ fn build_logical_connect_response(request: &[u8]) -> Result<(Vec<u8>, PeerPortNe
     ))
 }
 
-fn wrap_logical(logical: &LogicalFrame, payload: &[u8]) -> Vec<u8> {
+fn wrap_logical(logical: &LogicalFrame<'_>, payload: &[u8]) -> Vec<u8> {
     let mut outer = Vec::new();
     for (field, value) in &logical.outer_scalars {
         pb_varint_into(&mut outer, *field, *value);
@@ -826,28 +843,42 @@ fn wrap_logical(logical: &LogicalFrame, payload: &[u8]) -> Vec<u8> {
     wrap_transport(0x11, &pb_bytes(2, &pb_bytes(1, &outer)))
 }
 
-fn encrypt_payload(payload: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("initialize Lyra AES-GCM"))?;
-    let mut nonce_bytes = [0_u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let encrypted = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), payload)
-        .map_err(|_| anyhow::anyhow!("encrypt Lyra logical payload"))?;
-    let mut output = nonce_bytes.to_vec();
-    output.extend_from_slice(&encrypted);
+fn encrypt_payload(payload: &[u8], cipher: &Aes256Gcm) -> Result<Vec<u8>> {
+    let mut nonce = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let mut output = Vec::with_capacity(nonce.len() + payload.len() + 16);
+    output.extend_from_slice(&nonce);
+    output.extend_from_slice(payload);
+    let tag = cipher.encrypt_in_place_detached(
+        &Nonce::from(nonce), &[], &mut output[nonce.len()..],
+    ).map_err(|_| anyhow::anyhow!("encrypt Lyra logical payload"))?;
+    output.extend_from_slice(&tag);
     Ok(output)
 }
 
-fn decrypt_payload(payload: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
-    if payload.len() < 28 {
+#[cfg(test)]
+fn decrypt_payload(payload: &[u8], cipher: &Aes256Gcm) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    decrypt_into(payload, cipher, &mut output)?;
+    Ok(output)
+}
+
+fn decrypt_into(payload: &[u8], cipher: &Aes256Gcm, output: &mut Vec<u8>) -> Result<()> {
+    const NONCE_LEN: usize = 12;
+    const TAG_LEN: usize = 16;
+    if payload.len() < NONCE_LEN + TAG_LEN {
         bail!("encrypted Lyra payload is too short");
     }
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("initialize Lyra AES-GCM"))?;
-    cipher
-        .decrypt(Nonce::from_slice(&payload[..12]), &payload[12..])
-        .map_err(|_| anyhow::anyhow!("decrypt Lyra logical payload"))
+    let nonce: [u8; NONCE_LEN] = payload[..NONCE_LEN].try_into().expect("validated nonce");
+    let tag_start = payload.len() - TAG_LEN;
+    let tag: [u8; TAG_LEN] = payload[tag_start..].try_into().expect("validated tag");
+    output.clear();
+    output.extend_from_slice(&payload[NONCE_LEN..tag_start]);
+    if cipher.decrypt_in_place_detached(&nonce.into(), &[], output, &tag.into()).is_err() {
+        output.clear();
+        bail!("decrypt Lyra logical payload");
+    }
+    Ok(())
 }
 
 fn extract_phone_account(body: &[u8]) -> Result<Vec<u8>> {
@@ -1025,9 +1056,10 @@ mod tests {
     #[test]
     fn aes_gcm_round_trip_uses_xiaomi_layout() {
         let key = [7_u8; 32];
-        let encrypted = encrypt_payload(b"lyra", &key).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let encrypted = encrypt_payload(b"lyra", &cipher).unwrap();
         assert_eq!(encrypted.len(), 12 + 4 + 16);
-        assert_eq!(decrypt_payload(&encrypted, &key).unwrap(), b"lyra");
+        assert_eq!(decrypt_payload(&encrypted, &cipher).unwrap(), b"lyra");
     }
 
     #[test]
@@ -1052,17 +1084,18 @@ mod tests {
             logical_id: 0x1234,
             encrypted: true,
             inner_type: 1,
-            inner: Vec::new(),
-            message: Some(connect_request),
+            inner: &[],
+            message: Some(&connect_request),
         };
         let session = PeerSession {
-            session_key: Some([3_u8; 32]),
+            cipher: Some(Aes256Gcm::new_from_slice(&[3_u8; 32]).unwrap()),
             ..PeerSession::default()
         };
         let (response, peer_port) = build_connect_success_response(&logical, &session).unwrap();
         assert_eq!(peer_port, Some((32, 1, CONTROL_PORT)));
         let (_, body) = transport_payload(&response).unwrap();
-        let parsed = parse_logical_frame(body, session.session_key.as_ref()).unwrap();
+        let mut scratch = Vec::new();
+        let parsed = parse_logical_frame(body, session.cipher.as_ref(), &mut scratch).unwrap();
         assert_eq!(parsed.inner_type, 2);
         let connect_response = parsed.message.expect("logical connection response");
         assert_eq!(varint_field(&connect_response, 1).unwrap(), Some(0));
