@@ -2626,6 +2626,7 @@ struct AndroidMiPlayAudioCallback {
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     commands: mpsc::Sender<AndroidMiPlayAudioCommand>,
     output_sample_rate: Arc<AtomicU32>,
+    actual_buffer_frames: Arc<AtomicU32>,
     callback_started: bool,
     signal_started: bool,
     synchronization_started: bool,
@@ -2845,8 +2846,22 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             })));
         }
         LIVE_OUTPUT_PEAK_BITS.store(callback_peak.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-        crate::onset::tap_output(output, output_sample_rate, endpoint_latency_millis);
         let active_slice = &output[leading_silence_frames..];
+        if !active_slice.is_empty() {
+            let tap_latency_millis = if latency_measured {
+                endpoint_latency_millis
+            } else {
+                let buf_frames = self.actual_buffer_frames.load(Ordering::Relaxed);
+                let buf_ms = if buf_frames > 0 {
+                    f64::from(buf_frames) * 1_000.0 / f64::from(output_sample_rate)
+                } else {
+                    f64::from(ANDROID_OUTPUT_BUFFER_MS)
+                };
+                buf_ms.max(endpoint_latency_millis) + 24.0
+            };
+            let silence_ms = leading_silence_frames as f64 * 1_000.0 / f64::from(output_sample_rate);
+            crate::onset::tap_output(active_slice, output_sample_rate, tap_latency_millis + silence_ms);
+        }
         let sr = output_sample_rate as f32;
         let alpha_low = 1.0 - (-std::f32::consts::TAU * 250.0 / sr).exp();
         let alpha_mid = 1.0 - (-std::f32::consts::TAU * 2000.0 / sr).exp();
@@ -2917,6 +2932,7 @@ fn open_native_audio_output(
 ) -> Result<(Arc<Mutex<PcmQueue>>, NativeAudioStream)> {
     let queue = Arc::new(Mutex::new(PcmQueue::new()));
     let output_sample_rate = Arc::new(AtomicU32::new(MIPLAY_SAMPLE_RATE_HZ));
+    let actual_buffer_frames = Arc::new(AtomicU32::new(0));
     let measured_latency_us = Arc::new(AtomicU64::new(ANDROID_UNKNOWN_LATENCY_US));
     let (commands, command_receiver) = mpsc::channel();
     let initial_stream = open_android_miplay_stream(
@@ -2927,6 +2943,7 @@ fn open_native_audio_output(
         Arc::clone(&events),
         commands.clone(),
         Arc::clone(&output_sample_rate),
+        Arc::clone(&actual_buffer_frames),
         Arc::clone(&measured_latency_us),
     )?;
     let route_queue = Arc::clone(&queue);
@@ -2936,6 +2953,7 @@ fn open_native_audio_output(
     let route_events = Arc::clone(&events);
     let route_commands = commands.clone();
     let route_sample_rate = Arc::clone(&output_sample_rate);
+    let route_buffer_frames = Arc::clone(&actual_buffer_frames);
     thread::Builder::new()
         .name("miplay-audio-route".to_owned())
         .spawn(move || {
@@ -2949,6 +2967,7 @@ fn open_native_audio_output(
                 route_telemetry,
                 route_events,
                 route_sample_rate,
+                route_buffer_frames,
                 measured_latency_us,
             );
         })
@@ -2976,6 +2995,7 @@ fn open_android_miplay_stream(
     events: EventEmitter,
     commands: mpsc::Sender<AndroidMiPlayAudioCommand>,
     output_sample_rate: Arc<AtomicU32>,
+    actual_buffer_frames: Arc<AtomicU32>,
     measured_latency_us: Arc<AtomicU64>,
 ) -> Result<AndroidMiPlayOboeStream> {
     let callback = AndroidMiPlayAudioCallback {
@@ -2985,6 +3005,7 @@ fn open_android_miplay_stream(
         latency_telemetry,
         commands,
         output_sample_rate: Arc::clone(&output_sample_rate),
+        actual_buffer_frames: Arc::clone(&actual_buffer_frames),
         callback_started: false,
         signal_started: false,
         synchronization_started: false,
@@ -3021,6 +3042,9 @@ fn open_android_miplay_stream(
     let requested_frames = ((u64::from(actual_sample_rate) * u64::from(ANDROID_OUTPUT_BUFFER_MS) + 500) / 1_000) as i32;
     let buffer_result = stream.set_buffer_size_in_frames(requested_frames);
     let actual_frames = stream.get_buffer_size_in_frames();
+    if let Ok(frames) = u32::try_from(actual_frames) {
+        actual_buffer_frames.store(frames, Ordering::Release);
+    }
     events(json!({
         "event": "audio_output_buffer_configured",
         "protocol": "xiaomi_miplay",
@@ -3045,6 +3069,7 @@ fn manage_android_miplay_output(
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
     output_sample_rate: Arc<AtomicU32>,
+    actual_buffer_frames: Arc<AtomicU32>,
     measured_latency_us: Arc<AtomicU64>,
 ) {
     let mut stream = Some(initial_stream);
@@ -3098,6 +3123,7 @@ fn manage_android_miplay_output(
                         Arc::clone(&events),
                         commands.clone(),
                         Arc::clone(&output_sample_rate),
+                        Arc::clone(&actual_buffer_frames),
                         Arc::clone(&measured_latency_us),
                     ) {
                         Ok(replacement) => {

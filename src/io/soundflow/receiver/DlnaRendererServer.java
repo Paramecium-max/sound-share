@@ -105,7 +105,7 @@ public final class DlnaRendererServer {
         if (visualizer == null && !visualizerUnavailable) {
             visualizer = new Visualizer(player.getAudioSessionId());
             visualizer.setCaptureSize(fft.length);
-            visualizer.setScalingMode(Visualizer.SCALING_MODE_NORMALIZED);
+            visualizer.setScalingMode(Visualizer.SCALING_MODE_AS_PLAYED);
             visualizer.setEnabled(true);
             listener.onDlnaLog("DLNA 实频谱已启用，音频会话 " + player.getAudioSessionId());
         }
@@ -117,6 +117,7 @@ public final class DlnaRendererServer {
             try {
                 Visualizer v = ensureVisualizerLocked();
                 if (v == null || v.getFft(fft) != Visualizer.SUCCESS) return null;
+                onsetBins[0] = Math.abs(fft[0]) / 128f;
                 for (int k = 1; k < fft.length / 2; k++) {
                     onsetBins[k] = (float) Math.hypot(fft[2 * k], fft[2 * k + 1]) / 128f;
                 }
@@ -498,7 +499,10 @@ public final class DlnaRendererServer {
             long targetMs = parseDlnaTimeMs(xmlTag(body, "Target"));
             mainHandler.post(() -> {
                 if (player != null && mediaPrepared) {
-                    try { player.seekTo((int) targetMs); } catch (IllegalStateException ignored) {}
+                    try {
+                        player.seekTo((int) targetMs);
+                        emitState(playing ? "PLAYING" : "PAUSED_PLAYBACK");
+                    } catch (IllegalStateException ignored) {}
                 }
             });
             return soapResp("AVTransport", "Seek", "");

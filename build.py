@@ -11,7 +11,7 @@ import subprocess
 import zipfile
 
 PROJ = Path(__file__).resolve().parent
-ROOT = PROJ.parent.parent
+ROOT = next((p for p in (PROJ.parent, PROJ.parent.parent) if (p / "拆包内容/tools").is_dir()), PROJ.parent)
 TOOLS = Path(os.environ.get("SOUNDFLOW_TOOLS_DIR", str(ROOT / "拆包内容/tools")))
 JAVA_BIN = TOOLS / "jdk17/usr/lib/jvm/java-17-openjdk-amd64/bin"
 AAPT2 = TOOLS / "aapt2/aapt2"
@@ -29,7 +29,7 @@ OUT_APP.mkdir(parents=True, exist_ok=True)
 OUT_ZIP.mkdir(parents=True, exist_ok=True)
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-VERSION = "1.1.19"
+VERSION = "1.1.20"
 
 
 def run(*args, **kw):
@@ -225,6 +225,7 @@ def build_apk(so_path: Path) -> Path:
             "assets/ui/index.html",
             "assets/ui/app.bundle.js",
             "assets/ui/app.css",
+            "assets/ui/redesign.css",
             "assets/ui/tokens.css",
             "assets/ui/amll-style.css",
             "assets/ui/refraction.js",

@@ -167,17 +167,26 @@ public final class LyricOrchestrator {
 
     public void updateAudioOnsets(String events, long capturedAt) {
         if (!playing || !uiVisible || !pageReady || webView == null) return;
-        long elapsed = Math.max(0, SystemClock.uptimeMillis() - capturedAt);
-        eval("window.SoundFlowStage && window.SoundFlowStage.onAudioOnsets("
-                + events + "," + elapsed + ")");
+        main.post(() -> {
+            if (!playing || !uiVisible || webView == null) return;
+            long elapsed = Math.max(0L, SystemClock.elapsedRealtime() - capturedAt) + 3L;
+            webView.evaluateJavascript("window.SoundFlowStage && window.SoundFlowStage.onAudioOnsets("
+                    + events + "," + elapsed + ")", null);
+        });
     }
 
     public void updateAudioEnergy(float peak, long positionMs, int spectrumPacked) {
         if (!playing || !uiVisible || !pageReady || webView == null) return;
-        long posArg = (hasFullLrcForCurrentSong && positionMs > 0) ? positionMs : -1L;
+        long posArg = -1L;
+        if (hasFullLrcForCurrentSong && positionMs > 0
+                && Math.abs(positionMs - currentPlaybackPosition()) >= 320L) {
+            playbackPositionMs = positionMs;
+            positionAnchorElapsedMs = SystemClock.elapsedRealtime();
+            posArg = positionMs;
+        }
         if (Math.abs(peak - lastTickPeak) < 0.025f
                 && spectrumPacked == lastTickSpectrum
-                && (posArg < 0 || Math.abs(posArg - lastTickPosMs) < 180L)) {
+                && posArg < 0) {
             return;
         }
         lastTickPeak = peak;

@@ -131,20 +131,20 @@
             <div class="tuner-row">
               <span class="tuner-label">时间同步</span>
               <button type="button" class="nudge-pill" id="nudge-minus">-0.5s</button>
-              <input type="range" min="-5000" max="5000" step="100" value="-600" class="lg-slider" id="stage-sync-slider" aria-label="歌词同步偏移" style="margin:6px 0;" />
+              <input type="range" min="-5000" max="5000" step="100" value="-600" class="lg-slider" id="stage-sync-slider" aria-label="歌词同步偏移" />
               <button type="button" class="nudge-pill" id="nudge-zero">归零</button>
               <button type="button" class="nudge-pill" id="nudge-plus">+0.5s</button>
               <span class="tuner-val tnum" id="stage-sync-val">-0.6s</span>
             </div>
             <div class="tuner-row">
               <span class="tuner-label">动画速度</span>
-              <input type="range" min="0.25" max="2.50" step="0.01" value="1.00" class="lg-slider" id="stage-speed-slider" aria-label="歌词动画速度" style="margin:6px 0;" />
+              <input type="range" min="0.25" max="2.50" step="0.01" value="1.00" class="lg-slider" id="stage-speed-slider" aria-label="歌词动画速度" />
               <span class="tuner-val tnum" id="stage-speed-val">1.00x</span>
             </div>
-            <div class="tuner-row ripple-trigger-row"><span class="tuner-label">水波触发</span><div class="ripple-trigger-choices" role="group" aria-label="水波触发方式"><button type="button" class="nudge-pill" data-ripple-trigger="classic" aria-pressed="true">原有节奏</button><button type="button" class="nudge-pill" data-ripple-trigger="bass" aria-pressed="false">低频</button><button type="button" class="nudge-pill" data-ripple-trigger="mid" aria-pressed="false">中频</button><button type="button" class="nudge-pill" data-ripple-trigger="high" aria-pressed="false">高频</button><button type="button" class="nudge-pill" data-ripple-trigger="percussion" aria-pressed="false">鼓点</button></div></div>
+            <div class="tuner-row ripple-trigger-row"><span class="tuner-label">水波触发</span><div class="ripple-trigger-choices" role="group" aria-label="水波触发方式"><button type="button" class="nudge-pill" data-ripple-trigger="percussion" aria-pressed="true">鼓点</button><button type="button" class="nudge-pill" data-ripple-trigger="classic" aria-pressed="false">融合节奏</button><button type="button" class="nudge-pill" data-ripple-trigger="bass" aria-pressed="false">低频</button><button type="button" class="nudge-pill" data-ripple-trigger="mid" aria-pressed="false">中频</button><button type="button" class="nudge-pill" data-ripple-trigger="high" aria-pressed="false">高频</button></div></div>
             <div class="tuner-row">
               <span class="tuner-label">识别灵敏度</span>
-              <input type="range" min="0" max="100" step="1" value="55" class="lg-slider" id="stage-ripple-sens-slider" aria-label="鼓点与频段识别灵敏度" style="margin:6px 0;" />
+              <input type="range" min="0" max="100" step="1" value="55" class="lg-slider" id="stage-ripple-sens-slider" aria-label="鼓点与频段识别灵敏度" />
               <span class="tuner-val tnum" id="stage-ripple-sens-val">55%</span>
             </div>
             <div class="tuner-row" style="flex-wrap:wrap;">
@@ -209,179 +209,187 @@
       </div>
     </section>
 
-    <!-- Tab 2: Preferences (Lyric Styles + Sync + Speed + Broadcast Identity) -->
-    <section class="tab-pane" id="pane-settings" role="tabpanel" aria-labelledby="tab-settings"><div class="page-heading"><h1>偏好设置</h1><p>让歌词与音乐，合拍。</p></div>
-      <div class="section-header">歌词与播放</div>
-      <div class="list-group">
-        <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:10px;">
-          <div>
-            <div class="row-title">歌词舞台视觉样式</div>
-            <div class="row-desc">四种风格，随时切换。水波可单独开关。</div>
-          </div>
-          <div class="segmented" id="pref-style-seg" role="tablist">
-            <button type="button" data-val="amll" aria-selected="true">AMLL 流体</button>
-            <button type="button" data-val="qq-vinyl" aria-selected="false">QQ 黑胶水波</button>
-            <button type="button" data-val="qq-water" aria-selected="false">QQ 极光水波</button>
-            <button type="button" data-val="qq-karaoke" aria-selected="false">QQ 逐字动感</button>
+    <!-- Tab 2: Preferences (Organized into 歌词 / 接收 / 外观 per DESIGN.md) -->
+    <section class="tab-pane" id="pane-settings" role="tabpanel" aria-labelledby="tab-settings">
+      <div class="page-heading"><h1>偏好设置</h1><p>让歌词与音乐，合拍。</p></div>
+      <div class="settings-columns">
+        <div>
+          <div class="section-header">歌词</div>
+          <div class="list-group">
+            <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:10px;">
+              <div>
+                <div class="row-title">歌词舞台视觉样式</div>
+                <div class="row-desc">四种风格，随时切换。水波可单独开关。</div>
+              </div>
+              <div class="segmented" id="pref-style-seg" role="tablist">
+                <button type="button" data-val="amll" aria-selected="true">AMLL 流体</button>
+                <button type="button" data-val="qq-vinyl" aria-selected="false">QQ 黑胶水波</button>
+                <button type="button" data-val="qq-water" aria-selected="false">QQ 极光水波</button>
+                <button type="button" data-val="qq-karaoke" aria-selected="false">QQ 逐字动感</button>
+              </div>
+            </div>
+
+            <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:6px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <div>
+                  <div class="row-title">歌词同步时间微调</div>
+                  <div class="row-desc">歌词太慢就提前，太快就延后。</div>
+                </div>
+                <span class="volume-val tnum" id="pref-sync-val">-0.6s</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <button type="button" class="row-btn" id="pref-nudge-minus">-0.5s</button>
+                <input type="range" min="-5000" max="5000" step="100" value="-600" class="lg-slider" id="pref-sync-slider" aria-label="歌词同步偏移" />
+                <button type="button" class="row-btn" id="pref-nudge-zero">0s</button>
+                <button type="button" class="row-btn" id="pref-nudge-plus">+0.5s</button>
+              </div>
+            </div>
+
+            <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:6px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <div>
+                  <div class="row-title">歌词动画速度无级调节</div>
+                  <div class="row-desc">从舒缓到轻快，不改变歌词时间。</div>
+                </div>
+                <span class="volume-val tnum" id="pref-speed-val">1.00x</span>
+              </div>
+              <input type="range" min="0.25" max="2.50" step="0.01" value="1.00" class="lg-slider" id="pref-speed-slider" aria-label="歌词动画速度" />
+            </div>
+
+            <div class="list-row">
+              <div class="row-leading">
+                <div class="row-icon" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><circle cx="12" cy="12" r="7" stroke-opacity="0.6"></circle><circle cx="12" cy="12" r="10" stroke-opacity="0.3"></circle></svg>
+                </div>
+                <div class="row-copy">
+                  <div class="row-title">中心扩散水波涟漪</div>
+                  <div class="row-desc">随鼓点或频段瞬态从封面边缘同步向外扩散，每圈完整出屏；可独立开关</div>
+                </div>
+              </div>
+              <button type="button" class="ios-switch" id="sw-ripple" role="switch" aria-checked="true" aria-label="中心扩散水波涟漪"></button>
+            </div>
+
+            <div class="list-row no-icon ripple-trigger-row">
+              <div class="row-leading"><div class="row-copy">
+                <div class="row-title">水波触发方式</div>
+                <div class="row-desc">默认鼓点模式精准锁定低音底鼓、808、军鼓与打击乐瞬态；融合节奏兼顾鼓点与无鼓段落低中频律动；频段模式独立跟随低/中/高频起伏。</div>
+                <div class="ripple-trigger-choices" role="group" aria-label="水波触发方式"><button type="button" class="nudge-pill" data-ripple-trigger="percussion" aria-pressed="true">鼓点</button><button type="button" class="nudge-pill" data-ripple-trigger="classic" aria-pressed="false">融合节奏</button><button type="button" class="nudge-pill" data-ripple-trigger="bass" aria-pressed="false">低频</button><button type="button" class="nudge-pill" data-ripple-trigger="mid" aria-pressed="false">中频</button><button type="button" class="nudge-pill" data-ripple-trigger="high" aria-pressed="false">高频</button></div>
+                <div class="glass-preference" style="padding-top:10px;">
+                  <div class="preference-label"><span>鼓点 / 频段识别灵敏度</span><span id="pref-ripple-sens-val" class="tnum">55%</span></div>
+                  <input id="pref-ripple-sens-slider" class="lg-slider" type="range" min="0" max="100" step="1" value="55" aria-label="鼓点与频段识别灵敏度" />
+                  <div class="preference-endpoints"><span>严格（仅强主鼓）</span><span>灵敏（捕捉轻鼓与弱拍）</span></div>
+                </div>
+              </div></div>
+            </div>
+
+            <div class="list-row">
+              <div class="row-leading">
+                <div class="row-icon" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
+                </div>
+                <div class="row-copy">
+                  <div class="row-title">联网匹配完整同步歌词</div>
+                  <div class="row-desc">默认离线。开启后，缺失的歌词会联网查找并保存到本地。</div>
+                </div>
+              </div>
+              <button type="button" class="ios-switch" id="sw-lrc" role="switch" aria-checked="false" aria-label="联网匹配完整歌词"></button>
+            </div>
+
+            <div class="list-row clickable" id="row-import-lrc">
+              <div class="row-leading">
+                <div class="row-icon green" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+                </div>
+                <div class="row-copy">
+                  <div class="row-title">导入本地 .lrc 歌词文件</div>
+                  <div class="row-desc">零联网直接加载本地歌词文件，绑定到当前歌曲，按实际播放进度同步</div>
+                </div>
+              </div>
+              <div class="row-trailing"><button type="button" class="row-btn">导入</button></div>
+            </div>
+
+            <div class="list-row">
+              <div class="row-leading">
+                <div class="row-icon" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+                </div>
+                <div class="row-copy">
+                  <div class="row-title">本地离线歌词缓存库</div>
+                  <div class="row-desc tnum" id="offline-cache-desc">已离线保存 0 首完整歌词 · 实时片段不作为完整歌词载入</div>
+                </div>
+              </div>
+              <div class="row-trailing"><button type="button" class="row-btn destructive" id="btn-clear-cache">清空</button></div>
+            </div>
           </div>
         </div>
 
-        <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:6px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;">
-            <div>
-              <div class="row-title">歌词同步时间微调</div>
-              <div class="row-desc">歌词太慢就提前，太快就延后。</div>
+        <div>
+          <div class="section-header">接收</div>
+          <div class="list-group">
+            <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:8px;">
+              <div class="row-title">投屏显示名称</div>
+              <div class="field-stack">
+                <input type="text" class="ios-input" id="name-input" maxlength="32" value="SoundFlow-Pad" placeholder="1–32 个字符" />
+                <button type="button" class="row-btn" id="apply-config-btn">应用并生效</button>
+              </div>
+              <div class="row-error" id="name-error">请输入 1–32 个有效字符</div>
             </div>
-            <span class="volume-val tnum" id="pref-sync-val">-0.6s</span>
-          </div>
-          <div style="display:flex;align-items:center;gap:8px;">
-            <button type="button" class="row-btn" id="pref-nudge-minus" style="min-height:34px;padding:0 12px;">-0.5s</button>
-            <input type="range" min="-5000" max="5000" step="100" value="-600" class="lg-slider" id="pref-sync-slider" aria-label="歌词同步偏移" style="margin:10px 0;" />
-            <button type="button" class="row-btn" id="pref-nudge-zero" style="min-height:34px;padding:0 12px;">0s</button>
-            <button type="button" class="row-btn" id="pref-nudge-plus" style="min-height:34px;padding:0 12px;">+0.5s</button>
-          </div>
-        </div>
 
-        <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:6px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;">
-            <div>
-              <div class="row-title">歌词动画速度无级调节</div>
-              <div class="row-desc">从舒缓到轻快，不改变歌词时间。</div>
+            <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:10px;">
+              <div>
+                <div class="row-title">小米妙播广播设备类型</div>
+                <div class="row-desc">不同设备类型会展示对应投屏图标与音频焦点行为</div>
+              </div>
+              <div class="segmented" id="devtype-seg" role="tablist">
+                <button type="button" data-val="4" aria-selected="true">智能音箱</button>
+                <button type="button" data-val="16" aria-selected="false">有屏音箱</button>
+                <button type="button" data-val="2" aria-selected="false">智能电视</button>
+                <button type="button" data-val="18" aria-selected="false">小米平板</button>
+              </div>
             </div>
-            <span class="volume-val tnum" id="pref-speed-val">1.00x</span>
-          </div>
-          <input type="range" min="0.25" max="2.50" step="0.01" value="1.00" class="lg-slider" id="pref-speed-slider" aria-label="歌词动画速度" style="margin:10px 0;" />
-        </div>
 
-        <div class="list-row">
-          <div class="row-leading">
-            <div class="row-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><circle cx="12" cy="12" r="7" stroke-opacity="0.6"></circle><circle cx="12" cy="12" r="10" stroke-opacity="0.3"></circle></svg>
+            <div class="list-row">
+              <div class="row-leading">
+                <div class="row-icon" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"></circle><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path></svg>
+                </div>
+                <div class="row-copy">
+                  <div class="row-title">开放 DLNA / UPnP 接收</div>
+                  <div class="row-desc">支持跨品牌安卓手机、电脑与主流音乐 App 直接投送音频</div>
+                </div>
+              </div>
+              <button type="button" class="ios-switch" id="sw-dlna" role="switch" aria-checked="true" aria-label="开放 DLNA 接收"></button>
             </div>
-            <div class="row-copy">
-              <div class="row-title">中心扩散水波涟漪</div>
-              <div class="row-desc">随音乐节奏从屏幕中心向外扩散，每圈完整出屏；可独立开关</div>
-            </div>
-          </div>
-          <button type="button" class="ios-switch" id="sw-ripple" role="switch" aria-checked="true" aria-label="中心扩散水波涟漪"></button>
-        </div>
-        <div class="list-row no-icon ripple-trigger-row">
-          <div class="row-leading"><div class="row-copy">
-            <div class="row-title">水波触发方式</div>
-            <div class="row-desc">原有节奏延续当前效果。频段模式跟随对应声音的起伏；鼓点模式优先底鼓与军鼓，拖动下方灵敏度滑块可自由调节识别范围（左严格、右灵敏）。</div>
-            <div class="ripple-trigger-choices" role="group" aria-label="水波触发方式"><button type="button" class="nudge-pill" data-ripple-trigger="classic" aria-pressed="true">原有节奏</button><button type="button" class="nudge-pill" data-ripple-trigger="bass" aria-pressed="false">低频</button><button type="button" class="nudge-pill" data-ripple-trigger="mid" aria-pressed="false">中频</button><button type="button" class="nudge-pill" data-ripple-trigger="high" aria-pressed="false">高频</button><button type="button" class="nudge-pill" data-ripple-trigger="percussion" aria-pressed="false">鼓点</button></div>
-            <div class="glass-preference" style="padding-top:10px;">
-              <div class="preference-label"><span>鼓点 / 频段识别灵敏度</span><span id="pref-ripple-sens-val" class="tnum">55%</span></div>
-              <input id="pref-ripple-sens-slider" class="lg-slider" type="range" min="0" max="100" step="1" value="55" aria-label="鼓点与频段识别灵敏度" />
-              <div class="preference-endpoints"><span>严格（仅强主鼓）</span><span>灵敏（捕捉轻鼓与弱拍）</span></div>
-            </div>
-          </div></div>
-        </div>
-        <div class="list-row no-icon">
-          <div class="row-leading"><div>
-            <div class="row-title">DLNA 节奏分析授权</div>
-            <div class="row-desc">可选：Android 要求录音权限来分析本应用的播放音频。不会打开麦克风；小米投送无需此权限。</div>
-          </div></div>
-          <button type="button" class="row-btn" id="dlna-visualizer-permission">授权</button>
-        </div>
 
-      </div>
-
-      <div class="section-header">广播名称与设备身份</div>
-      <div class="list-group">
-        <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:8px;">
-          <div class="row-title">投屏显示名称</div>
-          <div class="field-stack">
-            <input type="text" class="ios-input" id="name-input" maxlength="32" value="SoundFlow-Pad" placeholder="1–32 个字符" />
-            <button type="button" class="row-btn" id="apply-config-btn">应用并生效</button>
-          </div>
-          <div class="row-error" id="name-error">请输入 1–32 个有效字符</div>
-        </div>
-        <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:10px;">
-          <div>
-            <div class="row-title">小米妙播广播设备类型</div>
-            <div class="row-desc">不同设备类型会展示对应投屏图标与音频焦点行为</div>
-          </div>
-          <div class="segmented" id="devtype-seg" role="tablist">
-            <button type="button" data-val="4" aria-selected="true">智能音箱</button>
-            <button type="button" data-val="16" aria-selected="false">有屏音箱</button>
-            <button type="button" data-val="2" aria-selected="false">智能电视</button>
-            <button type="button" data-val="18" aria-selected="false">小米平板</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="section-header">协议与视觉主题</div>
-      <div class="list-group">
-        <div class="list-row">
-          <div class="row-leading">
-            <div class="row-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"></circle><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path></svg>
+            <div class="list-row no-icon">
+              <div class="row-leading"><div>
+                <div class="row-title">DLNA 节奏分析授权</div>
+                <div class="row-desc">可选：Android 要求录音权限来分析本应用的播放音频。不会打开麦克风；小米投送无需此权限。</div>
+              </div></div>
+              <button type="button" class="row-btn" id="dlna-visualizer-permission">授权</button>
             </div>
-            <div class="row-copy">
-              <div class="row-title">开放 DLNA / UPnP 接收</div>
-              <div class="row-desc">支持跨品牌安卓手机、电脑与主流音乐 App 直接投送音频</div>
-            </div>
-          </div>
-          <button type="button" class="ios-switch" id="sw-dlna" role="switch" aria-checked="true" aria-label="开放 DLNA 接收"></button>
-        </div>
-
-        <div class="list-row">
-          <div class="row-leading">
-            <div class="row-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
-            </div>
-            <div class="row-copy">
-              <div class="row-title">联网匹配完整同步歌词</div>
-              <div class="row-desc">默认离线。开启后，缺失的歌词会联网查找并保存到本地。</div>
-            </div>
-          </div>
-          <button type="button" class="ios-switch" id="sw-lrc" role="switch" aria-checked="false" aria-label="联网匹配完整歌词"></button>
-        </div>
-
-        <div class="list-row clickable" id="row-import-lrc">
-          <div class="row-leading">
-            <div class="row-icon green" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
-            </div>
-            <div class="row-copy">
-              <div class="row-title">导入本地 .lrc 歌词文件</div>
-              <div class="row-desc">零联网直接加载本地歌词文件，绑定到当前歌曲，按实际播放进度同步</div>
-            </div>
-          </div>
-          <div class="row-trailing"><button type="button" class="row-btn">导入</button></div>
-        </div>
-
-        <div class="list-row">
-          <div class="row-leading">
-            <div class="row-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
-            </div>
-            <div class="row-copy">
-              <div class="row-title">本地离线歌词缓存库</div>
-              <div class="row-desc tnum" id="offline-cache-desc">已离线保存 0 首完整歌词 · 实时片段不作为完整歌词载入</div>
-            </div>
-          </div>
-          <div class="row-trailing"><button type="button" class="row-btn destructive" id="btn-clear-cache">清空</button></div>
-        </div>
-
-        <div class="list-row" style="flex-direction:column;align-items:stretch;gap:10px;">
-          <div class="row-leading">
-            <div class="row-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line></svg>
-            </div>
-            <div class="row-copy"><div class="row-title">外观</div></div>
-          </div>
-          <div class="segmented" id="theme-seg" role="tablist">
-            <button type="button" data-val="auto" aria-selected="true">跟随系统</button>
-            <button type="button" data-val="light" aria-selected="false">浅色</button>
-            <button type="button" data-val="dark" aria-selected="false">深色</button>
-          </div>
-          <div class="glass-preference"><div class="preference-label"><span>玻璃通透度</span><span id="glass-tint-val">35%</span></div>
-            <input id="glass-tint-slider" class="lg-slider" type="range" min="0" max="100" value="35" aria-label="玻璃着色程度" />
-            <div class="preference-endpoints"><span>通透</span><span>柔和着色</span></div>
           </div>
 
+          <div class="section-header">外观</div>
+          <div class="list-group">
+            <div class="list-row" style="flex-direction:column;align-items:stretch;gap:10px;">
+              <div class="row-leading">
+                <div class="row-icon" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line></svg>
+                </div>
+                <div class="row-copy"><div class="row-title">外观</div></div>
+              </div>
+              <div class="segmented" id="theme-seg" role="tablist">
+                <button type="button" data-val="auto" aria-selected="true">跟随系统</button>
+                <button type="button" data-val="light" aria-selected="false">浅色</button>
+                <button type="button" data-val="dark" aria-selected="false">深色</button>
+              </div>
+              <div class="glass-preference"><div class="preference-label"><span>玻璃通透度</span><span id="glass-tint-val">35%</span></div>
+                <input id="glass-tint-slider" class="lg-slider" type="range" min="0" max="100" value="35" aria-label="玻璃着色程度" />
+                <div class="preference-endpoints"><span>通透</span><span>柔和着色</span></div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -505,7 +513,7 @@
             </div>
             <div class="row-copy">
               <div class="row-title">开源协议与架构说明</div>
-              <div class="row-desc">版本 1.1.19 · 开源许可与组件说明</div>
+              <div class="row-desc">版本 1.1.20 · 开源许可与组件说明</div>
             </div>
           </div>
           <div class="row-trailing"><button type="button" class="row-btn">详情</button></div>

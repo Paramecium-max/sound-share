@@ -52,3 +52,16 @@ Android 接收服务将手动偏移传入妙播的时间戳排程和缓冲排程
 - **前端、Magisk 与构建**：
   - 修复完整 LRC 匹配实时句时重复叠加负同步偏移回跳上一句的问题，`setArtworkBase64` 兼容 JPEG/PNG/WebP；`ripple-water.mjs` 复用缓冲并支持 `webglcontextlost` 降级与恢复。
   - 去除 Magisk 全局 `service.d` 重复部署并在 `service.sh` 中等待 FBE 解锁；统一版本号至 `1.1.19` / `129`，支持 `build.py` 环境变量覆盖与跨分区移动。
+
+## v1.1.20 水波鼓点声画对齐与全栈整改（2026-11-26）
+
+- **原生音频延迟校准与因果鼓点识别（Rust）**：
+  - `upstream/src/FusionPlay.MiPlaySdk/src/onset.rs`：步长加密至 `HOP = 256`（`5.33 ms`），预计算 2048 点 Hann 窗与位反转表；修复 `PendingBandPeak` 强度饱和导致重拍滞后的问题；重构因果多通道 `PercussionDetector`（底鼓/808 下扫频 + 锤头瞬态、军鼓/木鱼宽频冲击、高频打击乐，确认窗口收敛至 `≤ 16 ms`，抑制持续低音与纯音阶跃假阳性），校准 `-16 ms` 汉宁窗重心偏移，端到端扬声器出声时刻误差收敛至 `±12 ms`。
+  - `upstream/src/FusionPlay.MiPlaySdk/src/media.rs`：记录 Oboe 实际输出缓冲帧数用于未收敛阶段的回退延迟估算，跳过回调前导静音帧并叠加对应延迟后再送入 `onset::tap_output`。
+  - `native/src/lib.rs`：在 `emit()` 入口拦截高频诊断 trace 事件，防止高吞吐下冲掉 `media_info`/`playback_state`/`progress` 等关键控制事件。
+- **Android 双进程服务、歌词时钟与 DLNA 频谱**：
+  - `DlnaRendererServer.java`：将 `Visualizer` 缩放模式从 `SCALING_MODE_NORMALIZED`（逐帧自动增益抹平鼓点动态）修正为 `SCALING_MODE_AS_PLAYED`，补齐 `Seek` 即时状态广播。
+  - `ReceiverService.java` & `LyricOrchestrator.java`：将 `dlnaServer.captureOnsetSpectrum()` 移入后台 `analysis` 线程并以 `12 ms` 节拍轮询；新增 `case "progress":` 实时锚定播放进度，消除 `MSG_AUDIO_LEVEL` 每 85 ms 用陈旧进度覆盖 90fps 歌词时钟导致的锯齿抖动；修复 DLNA 活跃期切回小米妙播的协议抢占与远端音量量化回声环路；统一使用 `SystemClock.elapsedRealtime()`。
+- **前端水波零遮挡渲染与 `DESIGN.md` 合规**：
+  - `web/src/{ripple-onsets.mjs,ripple-water.mjs,stage-app.js}`：默认启用 `percussion`（鼓点）模式并将 `classic`（融合节奏）接入原生起音队列，删除伪周期 `quietCadenceMs` 定时器；`rippleCoverRadius` 对齐 `#platter-disc` 真实外缘，WebGL 波包相位外移 `0.42 * width` 并缩短淡入至 `16 ms`，配合 `10 ms` 扫描提前量实现鼓点出声瞬间亮峰即刻跃出封面边缘；打通系统 `setReducedMotion` 与 WebGL 暂停联动。
+  - `assets/ui/{index.html,tokens.css,redesign.css}`：按 `DESIGN.md` 将偏好设置重构为「歌词」「接收」「外观」三组双栏结构，补齐所有 `.lg-slider` 滑块的 `44 CSS px` 触控热区高度、浅色 `--label-2` 色值与 Android 系统优先字体栈；版本升至 `1.1.20`（`versionCode = 130`）。

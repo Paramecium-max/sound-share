@@ -121,7 +121,22 @@ fn sanitize(v: &mut Value) {
     sanitize_with_key(v, None);
 }
 
+fn is_high_freq_trace_event(v: &Value) -> bool {
+    matches!(
+        v["event"].as_str(),
+        Some(
+            "protocol_trace"
+                | "discovery_packet_received"
+                | "lyra_packet_received"
+                | "lyra_transport_frame_trace"
+        )
+    )
+}
+
 fn emit(receiver_epoch: u64, mut value: Value) {
+    if is_high_freq_trace_event(&value) {
+        return;
+    }
     sanitize(&mut value);
     if let Ok(mut pending) = EVENTS.lock() {
         pending.push(receiver_epoch, value);
@@ -371,13 +386,21 @@ mod tests {
         assert_eq!(pending.queue.len(), 1);
         assert_eq!(pending.queue[0]["event"], "stream_started");
     }
+
+    #[test]
+    fn high_frequency_trace_events_do_not_evict_control_events() {
+        assert!(is_high_freq_trace_event(&json!({"event": "protocol_trace"})));
+        assert!(is_high_freq_trace_event(&json!({"event": "lyra_packet_received"})));
+        assert!(!is_high_freq_trace_event(&json!({"event": "progress", "position_ms": 1200})));
+        assert!(!is_high_freq_trace_event(&json!({"event": "media_info"})));
+    }
 }
 
 fn onset_json(events: Vec<fusionplay_miplay_sdk::onset::OnsetEvent>) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(1);
     let now = fusionplay_miplay_sdk::onset::now_ms();
-    let values: Vec<_> = events.into_iter().filter(|e| now - e.time_ms < 350.0).map(|e| serde_json::json!({
+    let values: Vec<_> = events.into_iter().filter(|e| now - e.time_ms < 260.0).map(|e| serde_json::json!({
         "id": SEQUENCE.fetch_add(1, Ordering::Relaxed),
         "band": (["bass", "mid", "high", "drum"][e.band]),
         "strength": e.strength, "percussion": e.percussion,

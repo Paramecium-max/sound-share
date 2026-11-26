@@ -92,8 +92,6 @@ public final class MainActivity extends Activity {
     private int safeBottomCss = 16;
     private int safeLeftCss = 0;
 
-    private final Runnable pendingHideRunnable = this::hideLyricStageDelayed;
-
     private final class IncomingUiHandler extends Handler {
         IncomingUiHandler() {
             super(Looper.getMainLooper());
@@ -594,8 +592,8 @@ public final class MainActivity extends Activity {
 
     private void handleLyricVisibility(boolean playing, boolean session, Bundle b) {
         currentPlaying = playing;
-        main.removeCallbacks(pendingHideRunnable);
         if (session) {
+            eval("window.SoundFlowStage && window.SoundFlowStage.setVisibility(true)");
             lyricOrchestrator.setPlayingState(playing);
             lyricOrchestrator.onMediaUpdate(
                     b.getLong("media_seq", 0),
@@ -615,10 +613,6 @@ public final class MainActivity extends Activity {
             lyricOrchestrator.clearStage();
             eval("window.SoundFlowStage && window.SoundFlowStage.setVisibility(false)");
         }
-    }
-
-    private void hideLyricStageDelayed() {
-        eval("window.SoundFlowStage && window.SoundFlowStage.setVisibility(false)");
     }
 
     private void refreshRootAndAntiKillStatus() {

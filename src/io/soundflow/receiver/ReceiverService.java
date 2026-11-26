@@ -161,7 +161,15 @@ public final class ReceiverService extends Service {
     private String mediaArtwork = "";
     private long mediaDurationMs = 0;
     private long mediaPositionMs = 0;
+    private long mediaPositionAnchorElapsed = 0;
+    private long suppressVolumeEchoUntil = 0;
     private long lastMediaSeq = 0;
+
+    private long currentLivePositionMs() {
+        if (!playing || mediaPositionAnchorElapsed <= 0) return mediaPositionMs;
+        long pos = mediaPositionMs + Math.max(0L, SystemClock.elapsedRealtime() - mediaPositionAnchorElapsed);
+        return mediaDurationMs > 0 ? Math.min(mediaDurationMs, pos) : pos;
+    }
 
     private final class IncomingHandler extends Handler {
         IncomingHandler() {
@@ -437,21 +445,29 @@ public final class ReceiverService extends Service {
         currentVolumePercent = percent;
         getSharedPreferences(PREF, MODE_PRIVATE).edit().putInt("volume", percent).apply();
         if (dlnaServer != null) dlnaServer.setVolumeFromSystem(percent);
-        if (publishToRemote && changed && miplayRunning) {
+        boolean allowPublish = publishToRemote && SystemClock.elapsedRealtime() >= suppressVolumeEchoUntil;
+        if (allowPublish && changed && miplayRunning) {
             dispatchAction("volume", percent);
         }
         broadcastSnapshot();
     }
 
     private void applySystemVolume(int percent) {
+        applySystemVolume(percent, true);
+    }
+
+    private void applySystemVolume(int percent, boolean publishToRemote) {
         if (audio == null) return;
         int clamped = Math.max(0, Math.min(100, percent));
         int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
         int targetIndex = Math.round(clamped * max / 100f);
+        if (!publishToRemote) {
+            suppressVolumeEchoUntil = SystemClock.elapsedRealtime() + 350L;
+        }
         if (audio.getStreamVolume(AudioManager.STREAM_MUSIC) != targetIndex) {
             audio.setStreamVolume(AudioManager.STREAM_MUSIC, targetIndex, 0);
         }
-        updateSystemVolume(true);
+        updateSystemVolume(publishToRemote);
     }
 
     private String[] findLanInterface() {
@@ -657,6 +673,7 @@ public final class ReceiverService extends Service {
                 mediaAlbum = album != null ? album : "";
                 mediaDurationMs = durationMs;
                 mediaPositionMs = positionMs;
+                mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
                 lastMediaSeq++;
                 formatText = "DLNA Audio · 48 kHz";
                 sourceName = "DLNA / UPnP 发送端";
@@ -671,7 +688,7 @@ public final class ReceiverService extends Service {
             });
         }
 
-        @Override public void onDlnaVolume(int percent) { main.post(() -> applySystemVolume(percent)); }
+        @Override public void onDlnaVolume(int percent) { main.post(() -> applySystemVolume(percent, false)); }
         @Override public void onDlnaError(String msg) { main.post(() -> { lastError = msg; broadcastSnapshot(); }); }
         @Override public void onDlnaLog(String msg) { record("dlna", msg); }
     };
@@ -780,15 +797,20 @@ public final class ReceiverService extends Service {
             if (playing && uiVisible) {
                 if (!onsetBusy) {
                     onsetBusy = true;
-                    boolean xiaomi = "xiaomi".equals(activeProtocol);
-                    String protocol = activeProtocol;
-                    float[] dlnaSpectrum = !xiaomi && dlnaServer != null ? dlnaServer.captureOnsetSpectrum() : null;
-                    int dlnaRate = dlnaServer != null ? dlnaServer.onsetSampleRate : 48000;
+                    final boolean xiaomi = "xiaomi".equals(activeProtocol);
+                    final String protocol = activeProtocol;
+                    final DlnaRendererServer dlna = dlnaServer;
                     analysis.post(() -> {
-                        String events = NativeBridge.audioOnsets(xiaomi);
-                        if (!xiaomi) events = dlnaSpectrum == null ? "[]" : NativeBridge.spectrumOnsets(dlnaSpectrum, dlnaRate);
-                        String payload = events;
-                        long capturedAt = SystemClock.uptimeMillis();
+                        String events;
+                        if (xiaomi) {
+                            events = NativeBridge.audioOnsets(true);
+                        } else {
+                            float[] dlnaSpectrum = dlna != null ? dlna.captureOnsetSpectrum() : null;
+                            int dlnaRate = dlna != null ? dlna.onsetSampleRate : 48000;
+                            events = dlnaSpectrum == null ? "[]" : NativeBridge.spectrumOnsets(dlnaSpectrum, dlnaRate);
+                        }
+                        final String payload = events;
+                        final long capturedAt = SystemClock.elapsedRealtime();
                         main.post(() -> {
                             onsetBusy = false;
                             if (!destroyed && playing && uiVisible && protocol.equals(activeProtocol) && !"[]".equals(payload)) {
@@ -802,11 +824,12 @@ public final class ReceiverService extends Service {
                         });
                     });
                 }
-                if (SystemClock.uptimeMillis() - lastMeterAt < 85) {
-                    main.postDelayed(this, 20);
+                long nowElapsed = SystemClock.elapsedRealtime();
+                if (nowElapsed - lastMeterAt < 85L) {
+                    main.postDelayed(this, 12);
                     return;
                 }
-                lastMeterAt = SystemClock.uptimeMillis();
+                lastMeterAt = nowElapsed;
                 int spec;
                 float peak;
                 if ("xiaomi".equals(activeProtocol)) {
@@ -816,15 +839,16 @@ public final class ReceiverService extends Service {
                     spec = dlnaServer != null ? dlnaServer.audioSpectrum() : 0;
                     peak = ((spec >>> 24) & 0xff) / 255f;
                 }
-                if (Math.abs(peak - lastSentPeak) >= 0.025f || spec != lastSentSpectrum || Math.abs(mediaPositionMs - lastSentPosMs) >= 180L) {
+                long livePos = currentLivePositionMs();
+                if (Math.abs(peak - lastSentPeak) >= 0.025f || spec != lastSentSpectrum || Math.abs(livePos - lastSentPosMs) >= 240L) {
                     lastSentPeak = peak;
                     lastSentSpectrum = spec;
-                    lastSentPosMs = mediaPositionMs;
+                    lastSentPosMs = livePos;
                     Message msg = Message.obtain(null, MSG_AUDIO_LEVEL);
                     Bundle b = new Bundle();
                     b.putFloat("peak", peak);
                     b.putInt("spectrum", spec);
-                    b.putLong("position_ms", mediaPositionMs);
+                    b.putLong("position_ms", livePos);
                     msg.setData(b);
                     sendToAllClients(msg);
                 }
@@ -833,7 +857,7 @@ public final class ReceiverService extends Service {
             if (!playing || !uiVisible) {
                 if (!onsetBusy) analysis.post(() -> NativeBridge.audioOnsets(false));
             }
-            main.postDelayed(this, (playing && uiVisible) ? 20 : 350);
+            main.postDelayed(this, (playing && uiVisible) ? 12 : 350);
         }
     };
 
@@ -860,9 +884,12 @@ public final class ReceiverService extends Service {
             record("native", e.toString());
         }
         if ("dlna".equals(activeProtocol)) {
-            boolean newNativeConnection = "interconnect_stage".equals(event)
-                    && "transport_connected".equals(e.optString("stage")) && !sessionActive;
-            if (newNativeConnection) {
+            String stage = "interconnect_stage".equals(event) ? e.optString("stage") : "";
+            boolean newNativeSession = ("transport_connected".equals(stage) && !sessionActive)
+                    || "media_session_established".equals(stage)
+                    || "stream_started".equals(event)
+                    || "audio_output_signal_started".equals(event);
+            if (newNativeSession) {
                 activateXiaomiTransport();
             } else {
                 // A matching MiPlay side channel can supply a live lyric sentence,
@@ -918,6 +945,7 @@ public final class ReceiverService extends Service {
                 activateXiaomiTransport();
                 sessionActive = true;
                 playing = true;
+                mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
                 statusText = "正在接收投送音频";
                 acquirePlaybackLocks();
                 snapshotDirty = true;
@@ -926,6 +954,7 @@ public final class ReceiverService extends Service {
                 activateXiaomiTransport();
                 playing = true;
                 sessionActive = true;
+                mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
                 statusText = "正在播放投送音频";
                 acquirePlaybackLocks();
                 snapshotDirty = true;
@@ -935,6 +964,8 @@ public final class ReceiverService extends Service {
                 boolean p = e.optBoolean("playing", false);
                 sessionActive = e.optBoolean("session_active", sessionActive);
                 if (playing != p) {
+                    mediaPositionMs = currentLivePositionMs();
+                    mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
                     playing = p;
                     snapshotDirty = true;
                     mediaDirty = true;
@@ -959,6 +990,7 @@ public final class ReceiverService extends Service {
                 mediaArtwork = "";
                 mediaDurationMs = 0;
                 mediaPositionMs = 0;
+                mediaPositionAnchorElapsed = 0;
                 statusText = idleStatus();
                 releasePlaybackLocks();
                 snapshotDirty = true;
@@ -975,15 +1007,29 @@ public final class ReceiverService extends Service {
                 if (art.length() <= 196608) mediaArtwork = art;
                 else mediaArtwork = "";
                 mediaDurationMs = e.optLong("duration_ms", 0);
-                if (!e.isNull("position_ms")) mediaPositionMs = e.optLong("position_ms", 0);
+                if (!e.isNull("position_ms")) {
+                    mediaPositionMs = e.optLong("position_ms", 0);
+                    mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
+                }
                 lastMediaSeq++;
                 updateMediaSessionMetadata();
                 mediaDirty = true;
                 snapshotDirty = true;
                 break;
             }
+            case "progress": {
+                long nextPos = Math.max(0L, e.optLong("position_ms", 0L));
+                long expected = currentLivePositionMs();
+                mediaPositionMs = nextPos;
+                mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
+                if (Math.abs(nextPos - expected) >= 450L) {
+                    mediaDirty = true;
+                }
+                updateMediaSessionState();
+                break;
+            }
             case "volume":
-                applySystemVolume(e.optInt("percent", currentVolumePercent));
+                applySystemVolume(e.optInt("percent", currentVolumePercent), false);
                 break;
             case "audio_format":
                 formatText = optCleanString(e, "codec") + " · " + e.optInt("sample_rate") + " Hz · " + e.optInt("channels") + "ch";
@@ -1018,7 +1064,7 @@ public final class ReceiverService extends Service {
         if (mediaSession == null) return;
         mediaSession.setPlaybackState(new PlaybackState.Builder()
                 .setState(playing ? PlaybackState.STATE_PLAYING : (sessionActive ? PlaybackState.STATE_PAUSED : PlaybackState.STATE_STOPPED),
-                        mediaPositionMs, 1f)
+                        currentLivePositionMs(), 1f)
                 .setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
                         | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_SKIP_TO_NEXT
                         | PlaybackState.ACTION_STOP)
@@ -1081,7 +1127,7 @@ public final class ReceiverService extends Service {
         b.putString("lyric_line", mediaLyricLine);
         b.putString("artwork", mediaArtwork);
         b.putLong("duration_ms", mediaDurationMs);
-        b.putLong("position_ms", mediaPositionMs);
+        b.putLong("position_ms", currentLivePositionMs());
         b.putLong("media_seq", lastMediaSeq);
         return b;
     }
@@ -1232,6 +1278,7 @@ public final class ReceiverService extends Service {
         mediaArtwork = "";
         mediaDurationMs = 0;
         mediaPositionMs = 0;
+        mediaPositionAnchorElapsed = 0;
         lastError = "";
         getSharedPreferences(PREF, MODE_PRIVATE).edit().putBoolean("enabled", false).apply();
         main.removeCallbacks(reconnectTask);

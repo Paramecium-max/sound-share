@@ -76,8 +76,10 @@ let lastSentFlowSpeed = -1;
 const rippleField = new RippleField();
 const rippleOnsets = new RippleOnsetQueue();
 const rippleRenderer = new WaterRippleRenderer(rippleCanvas);
-let rippleTriggerMode = localStorage.getItem("sf_ripple_trigger") || "classic";
-if (!RIPPLE_TRIGGER_MODES.includes(rippleTriggerMode)) rippleTriggerMode = "classic";
+let rippleTriggerMode = localStorage.getItem("sf_ripple_trigger") || "percussion";
+if (!RIPPLE_TRIGGER_MODES.includes(rippleTriggerMode)) rippleTriggerMode = "percussion";
+let rippleSensitivity = Math.max(0, Math.min(100, Number(localStorage.getItem("sf_ripple_sens") ?? 55) || 55));
+let lastNativeOnsetFeedTs = -Infinity;
 let rippleWidth = 0;
 let rippleHeight = 0;
 let rippleOriginX = 0.5;
@@ -105,6 +107,7 @@ let lastMatchedLrcIdx = -1;
 
 // Persisted user preferences
 const reduceMotionQuery = matchMedia("(prefers-reduced-motion: reduce)");
+let systemReduceMotion = false;
 let reduceMotion = reduceMotionQuery.matches;
 let lyricStyle = localStorage.getItem("sf_lyric_style") || "amll";
 let centerRippleEnabled = localStorage.getItem("sf_center_ripple") !== "0";
@@ -344,17 +347,21 @@ function stepCoverThump(dt) {
 
 function spawnCenterRipple(kind, strength) {
   if (!centerRippleEnabled || !isPlaying || reduceMotion) return;
-  if (rippleField.spawn(ripplePalette(kind), rippleTriggerMode === "classic" ? null : strength, 0, false, rippleCoverRadius)) {
+  measureRippleOrigin();
+  if (rippleField.spawn(ripplePalette(kind), strength, 0, kind === "drum", rippleCoverRadius)) {
     triggerCoverThump(strength ?? 0.65);
   }
 }
 
 function processSpectrumOnset(peak, bass, mid, high) {
   if (!centerRippleEnabled || !isPlaying || reduceMotion) return;
-  const now = performance.now();
   if (rippleTriggerMode !== "classic") return;
+  const now = performance.now();
+  // Whenever native PCM or DLNA Visualizer onset feed is active, beat-locked
+  // RippleOnsetQueue drives "classic" directly with exact latency alignment.
+  if (now - lastNativeOnsetFeedTs < 1500) return;
 
-  // Fallback when a sender only pushes scalar level (no PCM 3-band yet)
+  // Fallback only when an unpermissioned DLNA stream provides coarse meter ticks
   const rawMax = Math.max(bass, mid, high);
   let b = bass;
   let m = mid;
@@ -365,7 +372,6 @@ function processSpectrumOnset(peak, bass, mid, high) {
     h = peak * 0.36;
   }
 
-  // Adaptive auto-gain reference so soft verses and hot drops modulate ripple density cleanly
   const instantMax = Math.max(peak, b, m, h);
   envPeakRef = Math.max(0.055, instantMax, envPeakRef * 0.992);
 
@@ -380,44 +386,28 @@ function processSpectrumOnset(peak, bass, mid, high) {
   prevMid = m;
   prevHigh = h;
 
+  const sensNorm = rippleSensitivity / 100;
+  const strict = 1.32 - 0.64 * sensNorm;
   const normB = Math.min(1.0, Math.pow(Math.max(0, b / envPeakRef), 0.78));
   const normM = Math.min(1.0, Math.pow(Math.max(0, m / envPeakRef), 0.82));
   const normH = Math.min(1.0, Math.pow(Math.max(0, h / envPeakRef), 0.85));
 
-  // Song intensity modulates wave density (spacing between successive ripples) while keeping waves spacious & fast enough for 90fps
-  const minBassGap = Math.round(350 - normB * 120);
-  const minMidGap = Math.round(330 - normM * 100);
-  const minHighGap = Math.round(310 - normH * 90);
-
-  let spawned = false;
-  if (b > 0.018 && (b > avgBass * 1.10 + 0.014 || fluxBass > envPeakRef * 0.13) && now - lastBassSpawnTs >= minBassGap && now - lastAnySpawnTs >= 210) {
+  const minGap = Math.round(230 - sensNorm * 80);
+  if (b > 0.022 * strict && (b > avgBass * (1.14 * strict) + 0.016 * strict || fluxBass > envPeakRef * 0.15 * strict) && now - lastBassSpawnTs >= minGap && now - lastAnySpawnTs >= 150) {
     lastBassSpawnTs = now;
     lastAnySpawnTs = now;
-    const hitStrength = Math.min(1.0, normB * 0.68 + (fluxBass / envPeakRef) * 0.72 + (b > avgBass * 1.45 ? 0.22 : 0));
-    spawnCenterRipple("bass", Math.max(0.24, hitStrength));
-    spawned = true;
-  }
-  if (m > 0.016 && (m > avgMid * 1.12 + 0.012 || fluxMid > envPeakRef * 0.14) && now - lastMidSpawnTs >= minMidGap && now - lastAnySpawnTs >= 210 && !spawned) {
+    const hitStrength = Math.min(1.0, normB * 0.68 + (fluxBass / envPeakRef) * 0.72);
+    spawnCenterRipple("bass", Math.max(0.28, hitStrength));
+  } else if (m > 0.020 * strict && (m > avgMid * (1.16 * strict) + 0.014 * strict || fluxMid > envPeakRef * 0.16 * strict) && now - lastMidSpawnTs >= minGap && now - lastAnySpawnTs >= 150) {
     lastMidSpawnTs = now;
     lastAnySpawnTs = now;
     const hitStrength = Math.min(1.0, normM * 0.64 + (fluxMid / envPeakRef) * 0.65);
-    spawnCenterRipple("mid", Math.max(0.20, hitStrength));
-    spawned = true;
-  }
-  if (h > 0.014 && (h > avgHigh * 1.15 + 0.010 || fluxHigh > envPeakRef * 0.15) && now - lastHighSpawnTs >= minHighGap && now - lastAnySpawnTs >= 210 && !spawned) {
+    spawnCenterRipple("mid", Math.max(0.24, hitStrength));
+  } else if (h > 0.018 * strict && (h > avgHigh * (1.18 * strict) + 0.012 * strict || fluxHigh > envPeakRef * 0.17 * strict) && now - lastHighSpawnTs >= minGap && now - lastAnySpawnTs >= 150) {
     lastHighSpawnTs = now;
     lastAnySpawnTs = now;
     const hitStrength = Math.min(0.84, normH * 0.56 + (fluxHigh / envPeakRef) * 0.52);
-    spawnCenterRipple("high", Math.max(0.16, hitStrength));
-    spawned = true;
-  }
-  // Calm sustained passages keep sparse gentle ripples drifting out to the edges
-  const quietCadenceMs = Math.round(780 - Math.max(normB, normM) * 320);
-  if (!spawned && instantMax > 0.02 && now - lastAnySpawnTs >= quietCadenceMs) {
-    lastAnySpawnTs = now;
-    const dominantKind = normB >= normM ? "bass" : "mid";
-    const softStrength = Math.max(0.18, Math.min(0.62, Math.max(normB, normM) * 0.58));
-    spawnCenterRipple(dominantKind, softStrength);
+    spawnCenterRipple("high", Math.max(0.20, hitStrength));
   }
 }
 
@@ -438,7 +428,7 @@ function measureRippleOrigin() {
         Math.hypot(cx, cardRect.height - cy),
         Math.hypot(cardRect.width - cx, cardRect.height - cy),
       );
-      rippleCoverRadius = Math.max(0.04, Math.min(0.24, (Math.min(r.width, r.height) * 0.44) / Math.max(1, maxDist)));
+      rippleCoverRadius = Math.max(0.04, Math.min(0.28, (Math.max(r.width, r.height) * 0.50) / Math.max(1, maxDist)));
       return;
     }
   }
@@ -468,17 +458,19 @@ function stepAndDrawCenterRipples(rawDeltaSec) {
   if (!rippleField.waves.length && !canvasNeedsClear && !rippleOnsets.pending.length) return;
   if (!rippleWidth || !rippleHeight) resizeRippleCanvas();
   const now = performance.now();
-  const event = rippleOnsets.takeDue(now);
-  if (event && isPlaying && centerRippleEnabled && !reduceMotion && rippleTriggerMode !== "classic") {
-    measureRippleOrigin();
-    if (rippleField.spawn(
-      ripplePalette(event.band),
-      event.strength,
-      Math.max(0, now - event.at) / 1000,
-      rippleTriggerMode === "percussion",
-      rippleCoverRadius,
-    )) {
-      triggerCoverThump(event.strength);
+  let event;
+  while ((event = rippleOnsets.takeDue(now)) !== null) {
+    if (isPlaying && centerRippleEnabled && !reduceMotion) {
+      measureRippleOrigin();
+      if (rippleField.spawn(
+        ripplePalette(event.band),
+        event.strength,
+        Math.max(0, now - event.at) / 1000,
+        event.band === "drum" || rippleTriggerMode === "percussion",
+        rippleCoverRadius,
+      )) {
+        triggerCoverThump(event.strength);
+      }
     }
   }
   rippleField.step(rawDeltaSec);
@@ -603,8 +595,8 @@ function syncVisualActivity() {
 }
 
 reduceMotionQuery.addEventListener("change", (event) => {
-  reduceMotion = event.matches;
-  if (reduceMotion) { rippleField.clear(); canvasNeedsClear = true; stepAndDrawCenterRipples(0); }
+  reduceMotion = systemReduceMotion || event.matches;
+  if (reduceMotion) { rippleOnsets.reset(); rippleField.clear(); canvasNeedsClear = true; stepAndDrawCenterRipples(0); }
   applySpeedPhysics();
   syncVisualActivity();
 });
@@ -713,8 +705,9 @@ function commitStreamLineNow(clean) {
 
 window.SoundFlowStage = {
   onAudioOnsets(events, bridgeElapsed = 0) {
-    if (!isPlaying || !centerRippleEnabled || reduceMotion || rippleTriggerMode === "classic" || !Array.isArray(events)) return;
-    rippleOnsets.accept(events, rippleTriggerMode, performance.now(), bridgeElapsed);
+    if (!isPlaying || !centerRippleEnabled || reduceMotion || !Array.isArray(events)) return;
+    lastNativeOnsetFeedTs = performance.now();
+    rippleOnsets.accept(events, rippleTriggerMode, lastNativeOnsetFeedTs, bridgeElapsed);
     ensureRaf();
   },
   setPlaying(playing) {
@@ -1299,7 +1292,17 @@ document.getElementById("row-license").onclick = () => {
 
 window.SoundFlowApp = {
   setReducedMotion(reduce) {
-    document.documentElement.toggleAttribute("data-reduce-motion", reduce);
+    systemReduceMotion = !!reduce;
+    reduceMotion = systemReduceMotion || reduceMotionQuery.matches;
+    document.documentElement.toggleAttribute("data-reduce-motion", reduceMotion);
+    if (reduceMotion) {
+      rippleOnsets.reset();
+      rippleField.clear();
+      canvasNeedsClear = true;
+      stepAndDrawCenterRipples(0);
+    }
+    applySpeedPhysics();
+    syncVisualActivity();
   },
 
   setSafeInsets(top, right, bottom, left, isSysDark) {
@@ -1449,6 +1452,7 @@ applyGlassTint(localStorage.getItem("sf_glass_tint") ?? 35);
 
 function applyRippleSensitivity(value) {
   const sens = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+  rippleSensitivity = sens;
   localStorage.setItem("sf_ripple_sens", String(sens));
   for (const id of ["stage-ripple-sens-slider", "pref-ripple-sens-slider"]) {
     const el = document.getElementById(id);
@@ -1467,31 +1471,6 @@ for (const id of ["stage-ripple-sens-slider", "pref-ripple-sens-slider"]) {
   document.getElementById(id)?.addEventListener("input", (e) => applyRippleSensitivity(e.target.value));
 }
 applyRippleSensitivity(localStorage.getItem("sf_ripple_sens") ?? 55);
-
-// Split by purpose, not by arbitrary row counts. All feature IDs and native
-// bridge actions remain intact; tablets gain two readable columns.
-const settingsPane = document.getElementById("pane-settings");
-const settingsGroups = settingsPane.querySelectorAll(":scope > .list-group");
-const settingsHeadings = settingsPane.querySelectorAll(":scope > .section-header");
-const columns = document.createElement("div");
-columns.className = "settings-columns";
-const leftColumn = document.createElement("div");
-const rightColumn = document.createElement("div");
-const lyricsGroup = document.createElement("div");
-lyricsGroup.className = "list-group";
-for (const id of ["sw-lrc", "row-import-lrc", "btn-clear-cache"]) {
-  lyricsGroup.appendChild(document.getElementById(id).closest(".list-row"));
-}
-function sectionHeading(text) {
-  const el = document.createElement("div");
-  el.className = "section-header";
-  el.textContent = text;
-  return el;
-}
-leftColumn.append(settingsHeadings[0], settingsGroups[0], sectionHeading("离线歌词"), lyricsGroup);
-rightColumn.append(settingsHeadings[1], settingsGroups[1], settingsHeadings[2], settingsGroups[2]);
-columns.append(leftColumn, rightColumn);
-settingsPane.appendChild(columns);
 
 paintGenerativeCover("SoundFlow");
 applyLyricStyle(lyricStyle);

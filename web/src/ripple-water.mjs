@@ -44,7 +44,9 @@ void main() {
     float A = w.y;
     float width = max(w.z, 0.012);
     float age = w.w;
-    float s = (d - R) / width;
+    // Place the bright primary water crest right outside the cover rim (d >= R)
+    // at age = 0 so zero milliseconds are wasted hidden behind the platter disc.
+    float s = (d - R - width * 0.42) / width;
     if (s < -4.2 || s > 2.2) continue;
 
     // Clean single primary water crest + soft concave trough behind it (avoids
@@ -56,7 +58,7 @@ void main() {
     float sn = sin(phase);
     float dWave = env * (-2.05 * sn - 2.0 * k * s * c);
 
-    float fadeIn = smoothstep(0.0, 0.065, age);
+    float fadeIn = smoothstep(0.0, 0.016, age);
     float radialAtten = 1.0 / pow(1.0 + d * 2.4, 0.65);
     float edgeFade = 1.0 - smoothstep(0.94, 1.20, d);
     float amp = A * fadeIn * radialAtten * edgeFade;
@@ -296,8 +298,8 @@ export class WaterRippleRenderer {
     if (!ctx) return;
     ctx.clearRect(0, 0, width, height);
     for (const wave of waves) {
-      const radius = wave.radius * maxDist;
-      ctx.globalAlpha = Math.min(1, wave.age * 9) * wave.opacity;
+      const radius = (wave.radius + 0.024) * maxDist;
+      ctx.globalAlpha = Math.min(1, wave.age * 35) * wave.opacity;
       ctx.drawImage(this.fallbackSprite(wave.rgb, wave.thickness), cx - radius, cy - radius, radius * 2, radius * 2);
     }
     ctx.globalAlpha = 1;
