@@ -13,7 +13,44 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, LazyLock, Mutex};
 
 static RECEIVER: Mutex<Option<MiPlayReceiver>> = Mutex::new(None);
-static EVENTS: LazyLock<Mutex<VecDeque<Value>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
+static EVENTS: LazyLock<Mutex<PendingEvents>> = LazyLock::new(|| Mutex::new(PendingEvents::default()));
+
+#[derive(Default)]
+struct PendingEvents {
+    receiver_epoch: u64,
+    media_generation: u64,
+    queue: VecDeque<Value>,
+}
+
+impl PendingEvents {
+    fn reset(&mut self) -> u64 {
+        self.receiver_epoch = self.receiver_epoch.wrapping_add(1);
+        self.media_generation = 0;
+        self.queue.clear();
+        self.receiver_epoch
+    }
+
+    fn push(&mut self, receiver_epoch: u64, value: Value) {
+        if receiver_epoch != self.receiver_epoch {
+            return;
+        }
+        if let Some(generation) = value["media_generation"].as_u64() {
+            if generation < self.media_generation {
+                return;
+            }
+            if generation > self.media_generation {
+                self.media_generation = generation;
+                self.queue.retain(|event| {
+                    event["media_generation"].as_u64().is_none_or(|old| old >= generation)
+                });
+            }
+        }
+        if self.queue.len() >= 192 {
+            self.queue.pop_front();
+        }
+        self.queue.push_back(value);
+    }
+}
 
 fn sanitize(v: &mut Value) {
     match v {
@@ -39,13 +76,10 @@ fn sanitize(v: &mut Value) {
     }
 }
 
-fn emit(mut value: Value) {
+fn emit(receiver_epoch: u64, mut value: Value) {
     sanitize(&mut value);
-    if let Ok(mut queue) = EVENTS.lock() {
-        if queue.len() >= 192 {
-            queue.pop_front();
-        }
-        queue.push_back(value);
+    if let Ok(mut pending) = EVENTS.lock() {
+        pending.push(receiver_epoch, value);
     }
 }
 
@@ -80,11 +114,11 @@ fn run_start(config: &str) -> Result<(), String> {
         return Err("接收内核已在运行".into());
     }
     reset_live_output_peak();
-    EVENTS
+    let receiver_epoch = EVENTS
         .lock()
         .map_err(|_| "event queue poisoned")?
-        .clear();
-    let receiver = MiPlayReceiver::start(cfg, Arc::new(emit))
+        .reset();
+    let receiver = MiPlayReceiver::start(cfg, Arc::new(move |event| emit(receiver_epoch, event)))
         .map_err(|e| friendly_bind_error(format!("{e:#}")))?;
     *guard = Some(receiver);
     Ok(())
@@ -136,6 +170,9 @@ pub extern "system" fn Java_io_soundflow_receiver_NativeBridge_stop(_: JNIEnv, _
     let _ = catch_unwind(|| {
         reset_live_output_peak();
         if let Ok(mut guard) = RECEIVER.lock() {
+            if let Ok(mut pending) = EVENTS.lock() {
+                pending.reset();
+            }
             *guard = None;
         }
     });
@@ -148,7 +185,7 @@ pub extern "system" fn Java_io_soundflow_receiver_NativeBridge_poll(
 ) -> jstring {
     let events = EVENTS
         .lock()
-        .map(|mut q| q.drain(..).collect::<Vec<_>>())
+        .map(|mut pending| pending.queue.drain(..).collect::<Vec<_>>())
         .unwrap_or_default();
     java_str(
         &mut env,
@@ -243,6 +280,26 @@ mod tests {
     fn run_start_rejects_loopback() {
         let err = run_start(r#"{"ip":"127.0.0.1","interface":"lo","name":"Pad","uuid":"u","lyra":"12345678","media":"12345678"}"#).unwrap_err();
         assert!(err.contains("IPv4"));
+    }
+
+    #[test]
+    fn pending_events_discard_delayed_closes_from_replaced_media_and_receivers() {
+        let mut pending = PendingEvents::default();
+        let first = pending.reset();
+        let close = json!({"event": "media_channel_closed", "media_generation": 1});
+        pending.push(first, close.clone());
+        pending.push(first, json!({"event": "clock_synchronized"}));
+        pending.push(first, json!({"event": "stream_started", "media_generation": 2}));
+        pending.push(first, close.clone());
+        assert_eq!(pending.queue.len(), 2);
+        assert_eq!(pending.queue[0]["event"], "clock_synchronized");
+        assert_eq!(pending.queue[1]["event"], "stream_started");
+
+        let second = pending.reset();
+        pending.push(second, json!({"event": "stream_started", "media_generation": 1}));
+        pending.push(first, close);
+        assert_eq!(pending.queue.len(), 1);
+        assert_eq!(pending.queue[0]["event"], "stream_started");
     }
 }
 

@@ -1525,17 +1525,6 @@ fn run_session(
                     tx.clone(),
                     Arc::clone(&next_notification_sequence),
                 );
-                spawn_rtsp_receiver(
-                    host,
-                    port,
-                    keys,
-                    output_device.clone(),
-                    media_paused,
-                    Arc::clone(&hub.volume_percent),
-                    media_generation,
-                    Arc::clone(&hub.media_generation),
-                    Arc::clone(&events),
-                );
                 events(json!({
                     "event": "status",
                     "state": "media_opening",
@@ -1551,6 +1540,17 @@ fn run_session(
                     "route_acceptance": "source_open_command",
                     "vendor_attestation_verified": false,
                 }));
+                spawn_rtsp_receiver(
+                    host,
+                    port,
+                    keys,
+                    output_device.clone(),
+                    media_paused,
+                    Arc::clone(&hub.volume_percent),
+                    media_generation,
+                    Arc::clone(&hub.media_generation),
+                    Arc::clone(&events),
+                );
             }
             PAUSE => {
                 tx.send(Outgoing::encrypted(PAUSE_ACK, frame.sequence, Vec::new()))?;
