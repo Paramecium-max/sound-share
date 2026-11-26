@@ -131,6 +131,184 @@ std::optional<std::string> decode_tlv_string(const std::vector<uint8_t>& buf, st
     return std::string(reinterpret_cast<const char*>(buf.data() + off), vlen);
 }
 
+namespace {
+
+uint64_t read_be_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+    return v;
+}
+
+uint64_t read_le_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= (static_cast<uint64_t>(p[i]) << (8 * i));
+    return v;
+}
+
+uint32_t read_be_u32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+std::string ascii_lower_str(std::string s) {
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+}
+
+void parse_notify_tlv_stream(const uint8_t* data, size_t len, std::vector<RemoteControlEvent>& out) {
+    size_t off = 0;
+    while (off + 2 <= len) {
+        const uint8_t klen = data[off++];
+        if (klen == 0 || off + klen + 1 > len) break;
+        std::string key(reinterpret_cast<const char*>(data + off), klen);
+        off += klen;
+        const uint8_t vtype = data[off++];
+
+        uint64_t int_val = 0;
+        bool has_int = false;
+        std::string str_val;
+
+        if (vtype == 0x00 || vtype == 0x01 || vtype == 0x02 || vtype == 0x03) {
+            if (off + 1 > len) break;
+            int_val = data[off++];
+            has_int = true;
+        } else if (vtype == 0x04 || vtype == 0x05 || vtype == 0x06 || vtype == 0x07) {
+            if (off + 4 <= len) {
+                int_val = read_be_u32(data + off);
+                off += 4;
+                has_int = true;
+            } else if (off + 2 <= len) {
+                int_val = (static_cast<uint64_t>(data[off]) << 8) | data[off + 1];
+                off += 2;
+                has_int = true;
+            } else {
+                break;
+            }
+        } else if (vtype == 0x08 || vtype == 0x09) {
+            if (off + 8 > len) break;
+            int_val = read_be_u64(data + off);
+            off += 8;
+            has_int = true;
+        } else if (vtype == 0x14 || vtype == 0x1E) {
+            if (off + 4 > len) break;
+            const uint32_t vlen = read_be_u32(data + off);
+            off += 4;
+            if (off + vlen > len) break;
+            str_val.assign(reinterpret_cast<const char*>(data + off), vlen);
+            off += vlen;
+        } else if (vtype == 0x16) {
+            if (off + 4 > len) break;
+            const uint32_t vlen = read_be_u32(data + off);
+            off += 4;
+            if (off + vlen > len) break;
+            parse_notify_tlv_stream(data + off, vlen, out);
+            off += vlen;
+            continue;
+        } else {
+            break;
+        }
+
+        const std::string k = ascii_lower_str(key);
+        RemoteControlEvent ev;
+        ev.raw_key = key;
+        if (k == "key-pause" || k == "pause") {
+            ev.action = RemoteControlAction::Pause;
+            out.push_back(std::move(ev));
+        } else if (k == "key-resume" || k == "key-play" || k == "resume" || k == "play") {
+            ev.action = RemoteControlAction::Resume;
+            out.push_back(std::move(ev));
+        } else if (k == "key-next" || k == "next") {
+            ev.action = RemoteControlAction::Next;
+            out.push_back(std::move(ev));
+        } else if (k == "key-prev" || k == "key-previous" || k == "prev" || k == "previous") {
+            ev.action = RemoteControlAction::Previous;
+            out.push_back(std::move(ev));
+        } else if (k == "key-seek" || k == "seek") {
+            ev.action = RemoteControlAction::Seek;
+            if (has_int) {
+                ev.position_ms = int_val;
+            } else if (!str_val.empty()) {
+                try { ev.position_ms = std::stoull(str_val); } catch (...) {}
+            }
+            out.push_back(std::move(ev));
+        } else if (k == "volume") {
+            int32_t vol = -1;
+            if (has_int && int_val <= 100) {
+                vol = static_cast<int32_t>(int_val);
+            } else if (!str_val.empty()) {
+                try {
+                    int v = std::stoi(str_val);
+                    if (v >= 0 && v <= 100) vol = v;
+                } catch (...) {}
+            }
+            if (vol >= 0) {
+                ev.action = RemoteControlAction::SetVolume;
+                ev.volume = vol;
+                out.push_back(std::move(ev));
+            }
+        }
+    }
+}
+
+} // namespace
+
+std::vector<RemoteControlEvent> decode_remote_control_events(uint16_t cmd_type,
+                                                             const std::vector<uint8_t>& payload) {
+    std::vector<RemoteControlEvent> out;
+    if (cmd_type == static_cast<uint16_t>(CmdType::Notify)) {
+        parse_notify_tlv_stream(payload.data(), payload.size(), out);
+        return out;
+    }
+    if (cmd_type == static_cast<uint16_t>(CmdType::Pause)) {
+        out.push_back(RemoteControlEvent{RemoteControlAction::Pause, 0, -1, "cmd-pause"});
+        return out;
+    }
+    if (cmd_type == static_cast<uint16_t>(CmdType::Resume)) {
+        out.push_back(RemoteControlEvent{RemoteControlAction::Resume, 0, -1, "cmd-resume"});
+        return out;
+    }
+    if (cmd_type == static_cast<uint16_t>(CmdType::SetPosition) && payload.size() >= 8) {
+        uint64_t le = read_le_u64(payload.data());
+        uint64_t be = read_be_u64(payload.data());
+        // 合理毫秒上限（24 小时 = 86,400,000 ms），兼容小端/大端实现
+        constexpr uint64_t kMaxReasonableMs = 86400000ULL;
+        uint64_t pos_ms = (le <= kMaxReasonableMs) ? le : ((be <= kMaxReasonableMs) ? be : le);
+        out.push_back(RemoteControlEvent{RemoteControlAction::Seek, pos_ms, -1, "cmd-setposition"});
+        return out;
+    }
+    return out;
+}
+
+std::vector<uint8_t> encode_notify_control_key(const std::string& key) {
+    // 实机实证格式：[key_len:u8][key_ascii][0x00][0x01]
+    std::vector<uint8_t> out;
+    if (key.empty() || key.size() > 255) return out;
+    out.reserve(key.size() + 3);
+    out.push_back(static_cast<uint8_t>(key.size()));
+    out.insert(out.end(), key.begin(), key.end());
+    out.push_back(0x00);
+    out.push_back(0x01);
+    return out;
+}
+
+std::vector<uint8_t> encode_notify_seek_ms(uint64_t position_ms) {
+    // 实机实证格式：[0x08]["key-seek"][0x09][position_ms:u64be]
+    static constexpr char kKey[] = "key-seek";
+    std::vector<uint8_t> out;
+    out.reserve(18);
+    out.push_back(8);
+    out.insert(out.end(), kKey, kKey + 8);
+    out.push_back(0x09);
+    for (int i = 7; i >= 0; --i) {
+        out.push_back(static_cast<uint8_t>((position_ms >> (i * 8)) & 0xFF));
+    }
+    return out;
+}
+
 void SafetyCipher::init(const uint8_t key16[16], const uint8_t iv16[16]) {
     std::memcpy(key_.data(), key16, 16);
     std::memcpy(iv_.data(), iv16, 16);

@@ -10,5 +10,12 @@ contextBridge.exposeInMainWorld('miplayBridge', {
     return () => ipcRenderer.removeListener('sidecar:status', listener);
   },
   openWavFile: () => ipcRenderer.invoke('dialog:openWav'),
+  openLrcFile: () => ipcRenderer.invoke('dialog:openLrc'),
+  dispatchMediaControl: (action, positionMs) => ipcRenderer.invoke('media:dispatchControl', action, positionMs),
+  onSystemTrack: (cb) => {
+    const listener = (_ev, track) => cb(track);
+    ipcRenderer.on('media:systemTrack', listener);
+    return () => ipcRenderer.removeListener('media:systemTrack', listener);
+  },
   platform: process.platform,
 });

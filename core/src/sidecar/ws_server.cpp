@@ -197,6 +197,7 @@ void LocalWsServer::handle_client(SocketHandle fd) {
                 for (int i = 0; i < 8; ++i) plen = (plen << 8) | acc[2 + i];
                 off = 10;
             }
+            if (plen > 1024 * 1024) return;
             if (acc.size() < off + (masked ? 4 : 0) + plen) break;
 
             uint8_t mask[4]{};

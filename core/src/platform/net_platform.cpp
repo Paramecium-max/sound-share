@@ -1,5 +1,9 @@
 #include "platform/net_platform.h"
+#include "platform/deadline_write.h"
 
+#include <algorithm>
+#include <chrono>
+#include <climits>
 #include <cstring>
 #include <mutex>
 
@@ -149,7 +153,8 @@ std::vector<NetworkInterface> list_ipv4_interfaces() {
     if (getifaddrs(&ifaddr) != 0 || !ifaddr) return result;
     for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-        if (!(ifa->ifa_flags & IFF_UP)) continue;
+        if (!(ifa->ifa_flags & IFF_UP) ||
+            !(ifa->ifa_flags & (IFF_RUNNING | IFF_LOOPBACK))) continue;
         char ip[INET_ADDRSTRLEN]{};
         auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
         inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
@@ -162,10 +167,16 @@ std::vector<NetworkInterface> list_ipv4_interfaces() {
     freeifaddrs(ifaddr);
 #else
     ULONG out_len = 16384;
-    std::vector<uint8_t> buf(out_len);
-    auto* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
-    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
-                             nullptr, addrs, &out_len) == NO_ERROR) {
+    std::vector<uint8_t> buf;
+    IP_ADAPTER_ADDRESSES* addrs = nullptr;
+    ULONG status = ERROR_BUFFER_OVERFLOW;
+    for (int attempts = 0; attempts < 4 && status == ERROR_BUFFER_OVERFLOW; ++attempts) {
+        buf.resize(out_len);
+        addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        status = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                                      nullptr, addrs, &out_len);
+    }
+    if (status == NO_ERROR) {
         for (auto* a = addrs; a != nullptr; a = a->Next) {
             if (a->OperStatus != IfOperStatusUp) continue;
             for (auto* u = a->FirstUnicastAddress; u != nullptr; u = u->Next) {
@@ -202,6 +213,26 @@ std::string pick_default_lan_ipv4() {
     return "127.0.0.1";
 }
 
+bool is_local_ipv4(const std::string& ip) {
+    const auto interfaces = list_ipv4_interfaces();
+    return std::any_of(interfaces.begin(), interfaces.end(), [&](const auto& iface) { return iface.ipv4 == ip; });
+}
+
+std::string local_ipv4_for_peer(const std::string& peer_ip, uint16_t port) {
+    sockaddr_in peer{};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(port);
+    if (inet_pton(AF_INET, peer_ip.c_str(), &peer.sin_addr) != 1) return {};
+    const auto fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == kInvalidSocket) return {};
+    sockaddr_in local{};
+    socklen_t size = sizeof(local);
+    const bool ok = connect(fd, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == 0 &&
+                    getsockname(fd, reinterpret_cast<sockaddr*>(&local), &size) == 0;
+    close_socket(fd);
+    return ok ? u32_host_order_to_ipv4(ntohl(local.sin_addr.s_addr)) : "";
+}
+
 bool send_all(SocketHandle fd, const uint8_t* data, size_t len) {
     size_t sent = 0;
     while (sent < len) {
@@ -222,36 +253,67 @@ bool send_all(SocketHandle fd, const uint8_t* data, size_t len) {
     return true;
 }
 
-SendAllStatus send_all_checked(SocketHandle fd, const uint8_t* data, size_t len) {
-    size_t sent = 0;
-    int partial_retries = 0;
-    while (sent < len) {
-#ifdef _WIN32
-        int n = send(fd, reinterpret_cast<const char*>(data + sent),
-                     static_cast<int>(len - sent), 0);
-        if (n <= 0) {
-            if (last_socket_error_is_timeout()) {
-                if (sent == 0) return SendAllStatus::TimeoutClean;
-                if (++partial_retries <= 3) continue;
-            }
-            return SendAllStatus::Failed;
-        }
-#else
-        ssize_t n = ::send(fd, data + sent, len - sent, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (last_socket_error_is_timeout()) {
-                if (sent == 0) return SendAllStatus::TimeoutClean;
-                if (++partial_retries <= 3) continue;
-            }
-            return SendAllStatus::Failed;
-        }
-        if (n == 0) return SendAllStatus::Failed;
-#endif
-        partial_retries = 0;
-        sent += static_cast<size_t>(n);
+ConnectionWriter::ConnectionWriter(SocketHandle fd, bool owns_socket, SendOperation send_override)
+    : fd_(fd), owns_socket_(owns_socket), usable_(set_nonblocking(fd, true)),
+      send_override_(std::move(send_override)) {}
+
+ConnectionWriter::~ConnectionWriter() {
+    if (owns_socket_) close_socket(fd_);
+}
+
+void ConnectionWriter::abort_locked() {
+    usable_ = false;
+    if (fd_ != kInvalidSocket) shutdown_socket(fd_);
+}
+
+void ConnectionWriter::abort() {
+    std::lock_guard lock(mutex_);
+    abort_locked();
+}
+
+SendAllStatus ConnectionWriter::write(const uint8_t* data, size_t len, int timeout_ms,
+                                      const std::atomic<bool>* cancel) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+    if (cancel && cancel->load()) return SendAllStatus::Cancelled;
+    std::unique_lock lock(mutex_, std::defer_lock);
+    if (!lock.try_lock_until(deadline)) {
+        usable_.store(false);
+        if (fd_ != kInvalidSocket) shutdown_socket(fd_);
+        return SendAllStatus::Failed;
     }
-    return SendAllStatus::Ok;
+    if (!usable_.load()) return SendAllStatus::Failed;
+    auto send_bytes = [&](const uint8_t* buffer, size_t remaining) -> WriteAttempt {
+        using State = WriteAttempt::State;
+        if (!usable_.load()) return {State::Failed};
+        if (send_override_) return send_override_(buffer, remaining);
+        const int chunk = static_cast<int>(std::min<size_t>(remaining, INT_MAX));
+#ifdef _WIN32
+        const auto n = send(fd_, reinterpret_cast<const char*>(buffer), chunk, 0);
+#else
+        const auto n = ::send(fd_, buffer, chunk, MSG_NOSIGNAL);
+#endif
+        if (n > 0) return {State::Progress, static_cast<size_t>(n)};
+        if (n == 0) return {State::Failed};
+        const int err = last_socket_error_code();
+#ifdef _WIN32
+        if (err == WSAEINTR) return {State::Interrupted};
+        if (err == WSAEWOULDBLOCK) return {State::WouldBlock};
+        // WSAETIMEDOUT and other terminal errors invalidate the connection.
+#else
+        if (err == EINTR) return {State::Interrupted};
+        if (err == EAGAIN || err == EWOULDBLOCK) return {State::WouldBlock};
+#endif
+        return {State::Failed};
+    };
+    auto wait = [&](Clock::time_point until) {
+        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(until - Clock::now());
+        if (remaining > 0ms) wait_connect_result(fd_, static_cast<int>(std::min(remaining, 10ms).count()));
+    };
+    const auto status = write_until(data, len, deadline, cancel, Clock::now, send_bytes, wait);
+    if (status == SendAllStatus::Partial || status == SendAllStatus::Failed) abort_locked();
+    return status;
 }
 
 } // namespace miplay::net

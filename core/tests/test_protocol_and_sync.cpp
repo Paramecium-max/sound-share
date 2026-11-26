@@ -1,18 +1,22 @@
 #include "cmd/cmd_codec.h"
 #include "crypto/mini_crypto.h"
 #include "discovery/mdns_discovery.h"
+#include "discovery/probe_burst.h"
 #include "engine/multiroom_engine.h"
 #include "media/aac_encoder.h"
+#include "media/aac_timeline.h"
 #include "media/audio_pipeline.h"
 #include "media/rtp_sender.h"
 #include "media/ts_packetizer.h"
 #include "platform/net_platform.h"
+#include "platform/deadline_write.h"
 #include "rtsp/wfd_rtsp_server.h"
 #include "sidecar/ws_server.h"
 #include "sync/master_clock.h"
 #include "sync/timer_service.h"
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -20,7 +24,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +66,31 @@ std::pair<SocketHandle, SocketHandle> make_socket_pair() {
     CHECK(sfd != kInvalidSocket);
     net::close_socket(lfd);
     return {sfd, cfd};
+}
+
+void receive_exact(SocketHandle fd, uint8_t* buffer, size_t len) {
+    while (len) {
+        auto n = recv(fd, reinterpret_cast<char*>(buffer), static_cast<int>(len), 0);
+        CHECK(n > 0);
+        buffer += n;
+        len -= static_cast<size_t>(n);
+    }
+}
+
+void read_access_unit(SocketHandle fd, std::vector<uint8_t>& wire) {
+    bool marker = false;
+    while (!marker) {
+        uint8_t header[4]{};
+        receive_exact(fd, header, 4);
+        CHECK(header[0] == '$' && header[1] == 0);
+        const size_t size = (header[2] << 8) | header[3];
+        CHECK(size >= 12 && size <= 12 + 7 * 188);
+        wire.insert(wire.end(), header, header + 4);
+        size_t old_size = wire.size();
+        wire.resize(old_size + size);
+        receive_exact(fd, wire.data() + old_size, size);
+        marker = (wire[old_size + 1] & 0x80) != 0;
+    }
 }
 
 void write_u16_le(std::vector<uint8_t>& v, uint16_t x) {
@@ -233,9 +265,9 @@ static void test_timer_service_multi_clients() {
         CHECK(resp.server_recv_us > 0 && resp.server_send_us >= resp.server_recv_us);
         net::close_socket(cli);
     }
+    srv.stop();
     auto tele = srv.snapshot_telemetry();
     CHECK(tele.count("127.0.0.1") == 1 && tele["127.0.0.1"].packet_count == 2);
-    srv.stop();
     std::cout << "[PASS] test_timer_service_multi_clients\n";
 }
 
@@ -807,17 +839,36 @@ static void test_rtsp_multiport_dual_tcp_negotiation() {
     // 3. 完整双 TCP（含 image_port 辅助连接、重复 PLAY、控制保活、独立音频写通道）
     {
         std::atomic<int> ready_count{0};
-        std::atomic<SocketHandle> ready_sock{kInvalidSocket};
+        std::atomic<bool> fail_media{false};
         std::mutex status_mu;
         std::string last_m7_status;
+        media::MultiAudioSender sender;
+        auto [other_tx, other_rx] = make_socket_pair();
+        CHECK(net::set_socket_timeout(other_rx, SO_RCVTIMEO, 1000));
+        sender.add_or_update_target("other", "127.0.0.1", other_tx, 0, true, 2);
+        std::promise<void> closed;
+        auto closed_future = closed.get_future();
         rtsp::WfdRtspServer srv;
         rtsp::RtspServerCallbacks cbs;
-        cbs.on_stream_ready = [&](const std::string&, const std::string&, SocketHandle data_sock) {
-            ready_sock.store(data_sock);
+        cbs.on_stream_connection = [&](const std::string& id, const std::string& ip,
+                                       std::shared_ptr<net::ConnectionWriter> writer, std::function<void()> failure) {
+            auto injected = std::make_shared<net::ConnectionWriter>(writer->socket(), false,
+                [writer, &fail_media](const uint8_t* data, size_t size) -> net::WriteAttempt {
+                    using State = net::WriteAttempt::State;
+                    if (fail_media.load()) return {State::Failed};
+                    const auto result = writer->write(data, size, 100);
+                    return result == net::SendAllStatus::Ok ? net::WriteAttempt{State::Progress, size}
+                                                           : net::WriteAttempt{State::Failed};
+                });
+            const auto fd = writer->socket();
+            sender.add_or_update_target(id, ip, fd, 0, false, 3, std::move(injected), std::move(failure));
             ready_count.fetch_add(1);
             const char marker[] = "$AUDIO_MULTIPORT_OK";
-            net::send_all(data_sock, reinterpret_cast<const uint8_t*>(marker), sizeof(marker) - 1);
+            CHECK(writer->write(reinterpret_cast<const uint8_t*>(marker), sizeof(marker) - 1, 100) ==
+                  net::SendAllStatus::Ok);
         };
+        cbs.on_stop_media = [&](const auto& id) { sender.remove_target(id, 3); };
+        cbs.on_session_closed = [&](const auto&) { closed.set_value(); };
         cbs.on_status = [&](const std::string&, const std::string& st) {
             if (st.find("RTSP M7") != std::string::npos) {
                 std::lock_guard<std::mutex> lk(status_mu);
@@ -879,6 +930,17 @@ static void test_rtsp_multiport_dual_tcp_negotiation() {
             CHECK(last_m7_status.find(std::to_string(ctrl_port)) != std::string::npos);
             CHECK(last_m7_status.find(std::to_string(audio_port)) != std::string::npos);
         }
+
+        // The control connection has just answered a keepalive. Kill only its media writer.
+        fail_media.store(true);
+        std::vector<uint8_t> audio_payload(128, 0x19);
+        sender.broadcast_audio_frame(audio_payload.data(), audio_payload.size(), 90'000, 90'000);
+        CHECK(closed_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+        CHECK(!srv.is_running() && sender.active_target_count() == 1);
+        std::vector<uint8_t> other_wire;
+        read_access_unit(other_rx, other_wire);
+        CHECK(!other_wire.empty());
+        net::close_socket(other_rx);
 
         srv.stop();
         net::close_socket(audio);
@@ -1088,26 +1150,19 @@ static void test_smooth_audio_anti_jitter_pipeline() {
         auto payload = media::TsPacketizer::wrap_wfd_lpcm(pcm10ms.data(), 480, 48000);
 
         // 先在 +100ms 偏置下发 3 帧，随后突然把偏置下调到 0ms（前几帧将落在重叠区间被干净跳过），再继续发 15 帧
+        std::vector<uint8_t> stream;
         for (int i = 0; i < 3; ++i) {
             uint64_t pts = 90000ULL + static_cast<uint64_t>(i) * 900ULL;
             sender.broadcast_audio_frame(payload.data(), payload.size(), pts, static_cast<uint32_t>(pts));
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            read_access_unit(s_rx, stream);
         }
         sender.set_target_delay_bias("room_smooth", 0);
         for (int i = 3; i < 20; ++i) {
             uint64_t pts = 90000ULL + static_cast<uint64_t>(i) * 900ULL;
             sender.broadcast_audio_frame(payload.data(), payload.size(), pts, static_cast<uint32_t>(pts));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        for (int i = 13; i < 20; ++i) read_access_unit(s_rx, stream);
         sender.clear_all();
-
-        std::vector<uint8_t> stream;
-        uint8_t rbuf[4096];
-        for (;;) {
-            auto n = recv(s_rx, reinterpret_cast<char*>(rbuf), sizeof(rbuf), 0);
-            if (n <= 0) break;
-            stream.insert(stream.end(), rbuf, rbuf + n);
-        }
         net::close_socket(s_rx);
 
         // 逐个解析 RTP-over-TCP 包及内层 188B MPEG-TS 包，验证 0 帧错位、RTP Seq 连续、Audio CC 连续、PTS 严格递增
@@ -1179,16 +1234,9 @@ static void test_smooth_audio_anti_jitter_pipeline() {
         auto adts800 = media::AacEncoder::wrap_adts(big_raw.data(), big_raw.size(), 48000, 2);
         CHECK(adts800.size() == 800);
         sender.broadcast_audio_frame(adts800.data(), adts800.size(), 90000ULL, 90000U);
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
-        sender.clear_all();
-
         std::vector<uint8_t> wire;
-        uint8_t rbuf[4096];
-        for (;;) {
-            auto n = recv(s_rx, reinterpret_cast<char*>(rbuf), sizeof(rbuf), 0);
-            if (n <= 0) break;
-            wire.insert(wire.end(), rbuf, rbuf + n);
-        }
+        read_access_unit(s_rx, wire);
+        sender.clear_all();
         net::close_socket(s_rx);
 
         // 应正好拆成 2 个 RTP 包：
@@ -1410,8 +1458,767 @@ static void test_mdns_qu_unicast_and_multi_service_discovery() {
     std::cout << "[PASS] test_mdns_qu_unicast_and_multi_service_discovery\n";
 }
 
-int main() {
+static void test_transport_boundaries(bool dump = false) {
+    uint64_t mask33 = (1ULL << 33) - 1;
+    std::ifstream cases(MIPLAY_TEST_FIXTURES "/transport_cases.tsv");
+    CHECK(cases);
+    std::string line;
+    while (std::getline(cases, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream values(line);
+        std::string codec, fragments;
+        size_t payload_size;
+        unsigned previous, seq;
+        uint64_t pts;
+        CHECK(values >> codec >> payload_size >> previous >> seq >> pts >> fragments);
+        const bool lpcm = codec == "LPCM";
+        auto ts_type = lpcm ? media::TsAudioStreamType::WfdLpcm : media::TsAudioStreamType::AdtsAac;
+        std::vector<uint8_t> payload(payload_size);
+        for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<uint8_t>(i * 37 + 11);
+        media::TsPacketizer packer(ts_type);
+        for (unsigned i = 0; i < previous; ++i) {
+            packer.packetize_audio_frame(payload.data(), payload.size(), 1920ULL * i);
+        }
+        const bool force = previous == 2;
+        auto ts = packer.packetize_audio_frame(payload.data(), payload.size(), pts, force);
+        std::vector<uint8_t> interleaved;
+        auto seq16 = static_cast<uint16_t>(seq);
+        media::MultiAudioSender::append_rtp_batch(interleaved, ts, seq16, static_cast<uint32_t>(pts));
+
+        std::istringstream fragments_stream(fragments);
+        std::string count;
+        std::vector<uint8_t> pes;
+        unsigned audioCount = (previous * ((16 + payload_size + 183) / 184)) & 15;
+        unsigned psiCount = ((previous + 3) / 4) & 15;
+        bool first_audio = true;
+        std::vector<uint16_t> psi;
+        size_t pos = 0;
+        while (std::getline(fragments_stream, count, ',')) {
+            CHECK(pos + 16 <= interleaved.size());
+            const auto* pkt = interleaved.data() + pos;
+            CHECK(pkt[0] == '$' && pkt[1] == 0 && pkt[4] == 0x80);
+            const size_t rtp_len = (pkt[2] << 8) | pkt[3];
+            CHECK(rtp_len == 12 + std::stoul(count) * 188);
+            CHECK(rtp_len <= 12 + 7 * 188 && pos + 4 + rtp_len <= interleaved.size());
+            CHECK(pkt[5] == (pos + 4 + rtp_len == interleaved.size() ? 0xa1 : 0x21));
+            CHECK(((pkt[6] << 8) | pkt[7]) == (seq++ & 0xffff));
+            uint32_t rtp_ts = 0;
+            for (int i = 8; i < 12; ++i) rtp_ts = (rtp_ts << 8) | pkt[i];
+            CHECK(rtp_ts == static_cast<uint32_t>(pts));
+            for (size_t offset = 16; offset < rtp_len + 4; offset += 188) {
+                const auto* part = pkt + offset;
+                CHECK(part[0] == 0x47);
+                const uint16_t pid = ((part[1] & 31) << 8) | part[2];
+                if (pid == 0x1100) {
+                    CHECK(((part[1] & 0x40) != 0) == first_audio);
+                    CHECK((part[3] & 15) == (audioCount++ & 15));
+                    CHECK((part[3] & 16) != 0);
+                    size_t data = part[3] & 32 ? 5 + part[4] : 4;
+                    CHECK(data < 188);
+                    pes.insert(pes.end(), part + data, part + 188);
+                    first_audio = false;
+                } else {
+                    CHECK(first_audio);
+                    psi.push_back(pid);
+                    if (pid == 0x1000) {
+                        CHECK(part[3] == 0x20 && part[4] == 183 && part[5] == 0x10);
+                        uint64_t pcr = 0;
+                        for (int i = 6; i < 10; ++i) pcr = (pcr << 8) | part[i];
+                        CHECK(((pcr << 1) | (part[10] >> 7)) == (pts & mask33));
+                    } else {
+                        CHECK((part[3] & 15) == psiCount);
+                        CHECK((part[1] & 0x40) != 0);
+                        if (pid == 0x0100) CHECK(part[17] == static_cast<uint8_t>(ts_type));
+                    }
+                }
+            }
+            pos += 4 + rtp_len;
+        }
+        CHECK(pos == interleaved.size());
+        CHECK((force || previous % 4 == 0) ? (psi == std::vector<uint16_t>{0, 0x100, 0x1000}) : psi.empty());
+        CHECK(pes.size() == payload.size() + 16);
+        CHECK(pes[0] == 0 && pes[1] == 0 && pes[2] == 1 && pes[3] == (lpcm ? 0xbd : 0xc0));
+        CHECK(((pes[4] << 8) | pes[5]) == 10 + payload.size());
+        uint64_t pes_pts = (uint64_t((pes[9] >> 1) & 7) << 30) | (uint64_t(pes[10]) << 22) |
+                           (uint64_t(pes[11] >> 1) << 15) | (uint64_t(pes[12]) << 7) | (pes[13] >> 1);
+        CHECK(pes_pts == (pts & mask33));
+        CHECK(std::equal(payload.begin(), payload.end(), pes.begin() + 16));
+        if (dump) {
+            for (auto byte : interleaved) std::cout << std::hex << std::setfill('0') << std::setw(2) << unsigned(byte);
+            std::cout << "\n";
+        }
+    }
+    if (!dump) std::cout << "[PASS] test_transport_boundaries\n";
+}
+
+static void test_capture_conversion_and_fifo_limit() {
+    for (uint32_t mask : {0x3fu, 0x63fu}) {
+        const size_t channels = mask == 0x3f ? 6 : 8;
+        media::StereoDownmixer mixer(media::CaptureSampleFormat::Pcm16, channels, mask, channels * 2);
+        for (size_t ch = 0; ch < channels; ++ch) {
+            std::vector<uint8_t> input(channels * 2);
+            input[2 * ch] = 0xff;
+            input[2 * ch + 1] = 0x7f;
+            int16_t stereo[2]{};
+            mixer.convert(input.data(), 1, stereo);
+            if (ch == 2 || ch == 3) CHECK(stereo[0] > 3000 && stereo[0] == stereo[1]);
+            else if (ch % 2 == 0) CHECK(stereo[0] > 3000 && stereo[1] == 0);
+            else CHECK(stereo[1] > 3000 && stereo[0] == 0);
+        }
+        std::vector<uint8_t> input(channels * 2);
+        for (size_t i = 1; i < input.size(); i += 2) input[i] = 0x80;
+        int16_t stereo[2]{};
+        mixer.convert(input.data(), 1, stereo);
+        CHECK(stereo[0] == INT16_MIN && stereo[1] == INT16_MIN);
+    }
+
+    const uint8_t packed[] = {0xff, 0xff, 0x7f, 0, 0, 0x80};
+    const uint8_t aligned[] = {0, 0xff, 0xff, 0x7f, 0, 0, 0, 0x80};
+    const uint8_t floats[] = {0, 0, 0xc0, 0x7f, 0, 0, 0x80, 0xff};
+    int16_t converted[2]{};
+    media::StereoDownmixer(media::CaptureSampleFormat::Pcm24, 2, 3, 6).convert(packed, 1, converted);
+    CHECK(converted[0] == INT16_MAX && converted[1] == INT16_MIN);
+    media::StereoDownmixer(media::CaptureSampleFormat::Pcm32, 2, 3, 8).convert(aligned, 1, converted);
+    CHECK(converted[0] == INT16_MAX && converted[1] == INT16_MIN);
+    media::StereoDownmixer(media::CaptureSampleFormat::Float32, 2, 3, 8).convert(floats, 1, converted);
+    CHECK(converted[0] == 0 && converted[1] == 0);
+    media::StereoDownmixer(media::CaptureSampleFormat::Pcm24, 1, 4, 3).convert(packed, 1, converted);
+    CHECK(converted[0] == INT16_MAX && converted[1] == INT16_MAX);
+
+    media::SmoothLoopbackFifo fifo;
+    fifo.reset(48000, 480);
+    std::vector<int16_t> warm(3000 * 2, 10000), out(480 * 2);
+    fifo.push_interleaved_stereo(warm.data(), warm.size() / 2);
+    fifo.pop_smooth_frame(out.data(), 480);
+    CHECK(out.back() == 10000);
+    std::vector<int16_t> flood(50000 * 2, -10000);
+    for (int i = 0; i < 10; ++i) {
+        fifo.push_interleaved_stereo(flood.data(), flood.size() / 2);
+        CHECK(fifo.available_frames() <= 12000);
+    }
+    fifo.pop_smooth_frame(out.data(), 480);
+    CHECK(out.front() > 9600 && out.back() == -10000);
+    std::cout << "[PASS] test_capture_conversion_and_fifo_limit\n";
+}
+
+static void test_resampling_partitions_and_alias_rejection() {
+    const std::array<unsigned, 5> chunks{1, 13, 113, 1, 941};
+    for (const uint32_t rate : {44100u, 96000u, 192000u}) {
+        media::StreamLinearResampler res;
+        std::vector<int16_t> input(rate * 2), bulk, part, partitioned;
+        for (size_t i = 0; i < input.size() / 2; ++i) {
+            input[2 * i] = static_cast<int16_t>((i * 1273) % 65536 - 32768);
+            input[2 * i + 1] = static_cast<int16_t>((i * 7919) % 65536 - 32768);
+        }
+        res.reset(rate, 48000);
+        res.process_interleaved_stereo(input.data(), input.size() / 2, bulk);
+        CHECK(bulk.size() / 2 == ((uint64_t(rate) - 1) * 48000) / rate + 1);
+        for (bool single : {true, false}) {
+            res.reset(rate, 48000);
+            partitioned.clear();
+            size_t index = 0;
+            for (size_t i = 0; i < rate;) {
+                const size_t count = std::min<size_t>(rate - i, single ? 1 : chunks[index++ % chunks.size()]);
+                res.process_interleaved_stereo(input.data() + 2 * i, count, part);
+                partitioned.insert(partitioned.end(), part.begin(), part.end());
+                i += count;
+            }
+            CHECK(partitioned == bulk);
+        }
+        res.reset(rate, 48000);
+        const std::array<int16_t, 2> full{INT16_MIN, INT16_MAX};
+        res.process_interleaved_stereo(full.data(), 1, part);
+        CHECK(part.size() == 2 && part[0] == INT16_MIN && part[1] == INT16_MAX);
+    }
+
+    for (const unsigned frequency : {1000, 30000}) {
+        media::StreamLinearResampler res;
+        res.reset(96000, 48000);
+        std::vector<int16_t> input(9600 * 2), out;
+        for (size_t i = 0; i < input.size() / 2; ++i) {
+            input[2 * i] = static_cast<int16_t>(std::lround(20000 * std::sin(6.283185307179586 * frequency * i / 96000)));
+        }
+        res.process_interleaved_stereo(input.data(), input.size() / 2, out);
+        int peak = 0;
+        for (size_t i = 400; i < out.size() / 2; ++i) peak = std::max(peak, std::abs(int(out[2 * i])));
+        if (frequency == 1000) CHECK(peak > 19800 && peak < 20100);
+        else CHECK(peak < 100);
+    }
+
+    std::cout << "[PASS] test_resampling_partitions_and_alias_rejection\n";
+}
+
+static void test_mdns_fixtures_and_expiry() {
+    std::ifstream fixtures(MIPLAY_TEST_FIXTURES "/mdns_cases.tsv");
+    CHECK(fixtures);
+    std::string line;
+    while (std::getline(fixtures, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream fields(line);
+        std::string label, source, hex, expected;
+        std::getline(fields, label, '\t');
+        std::getline(fields, source, '\t');
+        std::getline(fields, hex, '\t');
+        std::getline(fields, expected);
+        std::vector<uint8_t> packet;
+        for (size_t i = 0; i < hex.size(); i += 2) packet.push_back(std::stoi(hex.substr(i, 2), nullptr, 16));
+        std::set<std::string> results;
+        for (const auto& entry : discovery::MdnsDiscovery::parse_announcements(packet.data(), packet.size(), source)) {
+            const auto& d = entry.device;
+            if (!entry.ttl_seconds) results.insert("Bye");
+            else results.insert("Live:" + d.name + ":" + d.ip + ":" + std::to_string(d.cmd_port) + ":" +
+                                 std::to_string(d.name_priority) + ":" + std::to_string(d.has_explicit_port()));
+        }
+        std::set<std::string> wanted;
+        if (expected != "-") {
+            std::istringstream values(expected);
+            std::string value;
+            while (std::getline(values, value, ',')) wanted.insert(value);
+        }
+        if (results != wanted) std::cerr << "mDNS fixture " << label << "\n";
+        CHECK(results == wanted);
+    }
+
+    discovery::DiscoveryCache cache;
+    discovery::DiscoveredDevice device;
+    device.name = "Room";
+    device.name_priority = 2;
+    device.ip = device.id = "192.168.10.5";
+    device.cmd_port = 9988;
+    device.port_source = discovery::PortSource::Txt;
+    auto updates = cache.update({{"first", device.ip, 2, device}}, 100);
+    CHECK(updates.size() == 1 && updates[0].online && updates[0].cmd_port == 9988);
+    const std::string stable = updates[0].id;
+    const auto first_revision = updates[0].revision;
+
+    device.mac = "AA:BB:CC:DD:EE:FF";
+    device.id = device.mac;
+    device.port_source = discovery::PortSource::Default;
+    device.cmd_port = 8899;
+    updates = cache.update({{"first", device.ip, 3, device}}, 700'000);
+    CHECK(updates.size() == 1 && updates[0].id == stable && updates[0].cmd_port == 9988);
+    CHECK(updates[0].revision > first_revision && updates[0].mac == device.mac);
+    CHECK(cache.update({}, 2'000'100).empty());
+
+    device.ip = "192.168.10.6";
+    device.port_source = discovery::PortSource::Txt;
+    updates = cache.update({{"first", device.ip, 2, device}, {"second", device.ip, 1, device}}, 2'100'000);
+    CHECK(updates.size() == 1 && updates[0].id == stable && updates[0].ip == device.ip);
+    CHECK(updates[0].cmd_port == 8899 && cache.list_devices().size() == 1);
+    updates = cache.update({{"second", device.ip, 0, {}}}, 2'100'100);
+    CHECK(updates.size() == 1 && updates[0].online);
+    updates = cache.update({}, 4'100'000);
+    CHECK(updates.size() == 1 && !updates[0].online && cache.list_devices().empty());
+    updates = cache.update({{"second", device.ip, 10, device}}, 4'200'000);
+    CHECK(updates.size() == 1 && updates[0].online && updates[0].id == stable);
+    std::cout << "[PASS] test_mdns_fixtures_and_expiry\n";
+}
+
+static void test_discovery_burst_deadlines() {
+    using namespace std::chrono_literals;
+    const auto start = discovery::ProbeBurst::Time{};
+    discovery::ProbeBurst burst;
+    CHECK(burst.begin(start));
+    CHECK(burst.take_due(start) == 0);
+    CHECK(!burst.begin(start + 5ms));
+    CHECK(!burst.take_due(start + 219ms));
+    CHECK(burst.take_due(start + 220ms) == 1);
+    CHECK(!burst.begin(start + 300ms));
+    CHECK(!burst.take_due(start + 649ms));
+    CHECK(burst.take_due(start + 650ms) == 2);
+    CHECK(!burst.active() && !burst.take_due(start + 900ms));
+    CHECK(burst.begin(start + 1500ms));
+    CHECK(burst.take_due(start + 1500ms) == 0);
+    std::cout << "[PASS] test_discovery_burst_deadlines\n";
+}
+
+static void test_discovery_concurrent_lifecycle_and_manual_identity() {
+    MultiRoomEngine engine("127.0.0.1");
+    std::barrier start(4);
+    std::vector<std::thread> threads;
+    threads.emplace_back([&] { start.arrive_and_wait(); for (int i = 0; i < 8; ++i) CHECK(engine.start_discovery()); });
+    threads.emplace_back([&] { start.arrive_and_wait(); for (int i = 0; i < 8; ++i) engine.stop_discovery(); });
+    threads.emplace_back([&] { start.arrive_and_wait(); for (int i = 0; i < 8; ++i) engine.refresh_discovery(i % 2); });
+    threads.emplace_back([&] { start.arrive_and_wait(); for (int i = 0; i < 8; ++i) engine.set_bind_ip(i % 2 ? "127.0.0.1" : ""); });
+    for (auto& t : threads) t.join();
+    engine.stop_discovery();
+    CHECK(!engine.snapshot_state().discovery_running);
+    MultiRoomEngine manual_engine("127.0.0.1");
+    const auto id = manual_engine.add_manual_device("Speaker", "127.0.0.3", 8899);
+    CHECK(manual_engine.add_device_to_group(id));
+    CHECK(manual_engine.add_manual_device("Updated", "127.0.0.3", 8899) == id);
+    CHECK(manual_engine.add_manual_device("Other port", "127.0.0.3", 9988) != id);
+    const auto snap = manual_engine.snapshot_state();
+    CHECK(snap.devices.size() == 2);
+    for (const auto& d : snap.devices) {
+        if (d.info.id == id) CHECK(d.info.name == "Updated" && d.in_group && d.info.is_manual);
+    }
+    std::cout << "[PASS] test_discovery_concurrent_lifecycle_and_manual_identity\n";
+}
+
+static void test_manual_and_discovered_identity_revisions() {
+    MultiRoomEngine engine("127.0.0.1");
+    const auto manual = engine.add_manual_device("Living Room", "127.0.0.3", 9988);
+    CHECK(engine.add_device_to_group(manual));
+    discovery::DiscoveredDevice first;
+    first.id = "aa:bb:cc:dd:ee:ff";
+    first.mac = first.id;
+    first.name = "Announced room";
+    first.ip = "127.0.0.3";
+    first.cmd_port = 9988;
+    first.port_source = discovery::PortSource::Srv;
+    first.revision = 10;
+    engine.publish_discovery_snapshot_for_test(first);
+    CHECK(engine.snapshot_state().devices.size() == 1);
+    auto moved = first;
+    moved.ip = "127.0.0.4";
+    moved.cmd_port = 8899;
+    moved.revision = 12;
+
+    std::promise<void> newer_delivered;
+    auto newer = newer_delivered.get_future();
+    std::thread delayed_old_callback([&] {
+        newer.wait();
+        first.revision = 11;
+        engine.publish_discovery_snapshot_for_test(first);
+    });
+    engine.publish_discovery_snapshot_for_test(moved);
+    newer_delivered.set_value();
+    delayed_old_callback.join();
+
+    auto devices = engine.snapshot_state().devices;
+    CHECK(devices.size() == 1 && devices[0].info.id == manual && devices[0].in_group);
+    CHECK(devices[0].info.ip == moved.ip && devices[0].info.cmd_port == 8899);
+    CHECK(devices[0].info.name == "Living Room" && devices[0].info.is_manual);
+    moved.online = false;
+    moved.revision = 13;
+    engine.publish_discovery_snapshot_for_test(moved);
+    CHECK(engine.snapshot_state().devices[0].info.online);
+
+    discovery::DiscoveredDevice automatic;
+    automatic.id = automatic.ip = "127.0.0.9";
+    automatic.name = "Automatic";
+    automatic.revision = 14;
+    engine.publish_discovery_snapshot_for_test(automatic);
+    CHECK(engine.add_manual_device("Named by user", automatic.ip, 8899) == automatic.id);
+    CHECK(engine.snapshot_state().devices.size() == 2);
+    std::cout << "[PASS] test_manual_and_discovered_identity_revisions\n";
+}
+
+static void test_write_deadline_and_serialization() {
+    using Status = net::SendAllStatus;
+    using State = net::WriteAttempt::State;
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{};
+    auto get_now = [&] { return now; };
+    auto wait = [&](auto) { now += 20ms; };
+    const std::array<uint8_t, 30> data{};
+    std::atomic<bool> cancel{false};
+    auto clean = [](auto, auto) -> net::WriteAttempt { return {State::WouldBlock}; };
+    CHECK(net::write_until(data.data(), data.size(), now + 120ms, &cancel, get_now, clean, wait) == Status::TimeoutClean);
+    CHECK(now.time_since_epoch() == 120ms);
+
+    auto fatal = [](auto, auto) -> net::WriteAttempt { return {State::Failed}; };
+    CHECK(net::write_until(data.data(), data.size(), now + 120ms, &cancel, get_now, fatal, wait) == Status::Failed);
+
+    auto interrupted = [&](auto, auto) -> net::WriteAttempt {
+        now += 10ms;
+        return {State::Interrupted};
+    };
+    CHECK(net::write_until(data.data(), data.size(), now + 120ms, &cancel, get_now, interrupted, wait) == Status::Failed);
+
+    unsigned progress = 0;
+    auto short_writes = [&](auto, auto) -> net::WriteAttempt {
+        ++progress;
+        now += 10ms;
+        return {State::Progress, 1};
+    };
+    CHECK(net::write_until(data.data(), data.size(), now + 120ms, &cancel, get_now, short_writes, wait) == Status::Partial);
+    CHECK(progress == 12);
+    auto cancel_partial = [&](auto, auto) -> net::WriteAttempt {
+        cancel.store(true);
+        return {State::Progress, 1};
+    };
+    CHECK(net::write_until(data.data(), data.size(), now + 120ms, &cancel, get_now, cancel_partial, wait) == Status::Partial);
+    CHECK(net::write_until(data.data(), data.size(), now + 120ms, &cancel, get_now, fatal, wait) == Status::Cancelled);
+
+    net::ConnectionWriter setup_failure(kInvalidSocket);
+    CHECK(setup_failure.write(data.data(), data.size(), 10) == Status::Failed);
+
+    auto [tx, rx] = make_socket_pair();
+    CHECK(net::set_socket_timeout(rx, SO_RCVTIMEO, 750));
+    std::barrier after_short_write(2);
+    std::barrier sending_control(2);
+    bool first = true;
+    net::ConnectionWriter writer(tx, true, [&](const uint8_t* bytes, size_t length) -> net::WriteAttempt {
+        auto send_length = first ? 1 : length;
+        auto n = send(tx, reinterpret_cast<const char*>(bytes), static_cast<int>(send_length), 0);
+        CHECK(n > 0);
+        if (std::exchange(first, false)) {
+            after_short_write.arrive_and_wait();
+            sending_control.arrive_and_wait();
+        }
+        return {State::Progress, static_cast<size_t>(n)};
+    });
+    const std::array<uint8_t, 8> interleaved{'$', 0, 0, 4, 1, 2, 3, 4};
+    const std::string response = "RTSP/1.0 200 OK\r\nCSeq: 7\r\n\r\n";
+    const std::string teardown = "RTSP/1.0 200 OK\r\nCSeq: 8\r\n\r\n";
+    std::thread media([&] { CHECK(writer.write(interleaved.data(), interleaved.size(), 2000) == Status::Ok); });
+    std::thread control([&] {
+        after_short_write.arrive_and_wait();
+        sending_control.arrive_and_wait();
+        for (auto& message : {response, teardown}) {
+            CHECK(writer.write(reinterpret_cast<const uint8_t*>(message.data()), message.size(), 2000) == Status::Ok);
+        }
+    });
+    std::vector<uint8_t> wire(interleaved.size() + response.size() + teardown.size());
+    receive_exact(rx, wire.data(), wire.size());
+    media.join();
+    control.join();
+    CHECK(std::equal(interleaved.begin(), interleaved.end(), wire.begin()));
+    CHECK(std::string(wire.begin() + interleaved.size(), wire.end()) == response + teardown);
+    net::close_socket(rx);
+
+    auto [partial_tx, partial_rx] = make_socket_pair();
+    unsigned attempts = 0;
+    net::ConnectionWriter broken(partial_tx, true, [&](const uint8_t*, size_t) -> net::WriteAttempt {
+        if (++attempts == 1) return {State::Progress, 1};
+        return {State::Failed};
+    });
+    CHECK(broken.write(data.data(), data.size(), 100) == Status::Partial);
+    CHECK(broken.write(data.data(), data.size(), 100) == Status::Failed && attempts == 2);
+    net::close_socket(partial_rx);
+    std::cout << "[PASS] test_write_deadline_and_serialization\n";
+}
+
+static void test_aac_backpressure_timeline_and_truncated_adts() {
+    media::AacTimeline aac;
+    using Result = media::AacInputResult;
+    auto silent = [] { return true; };
+    auto accepted = [] { return Result::Accepted; };
+    CHECK(aac.submit(0, accepted, silent));
+    CHECK(aac.submit(1920, accepted, silent));
+
+    std::vector<uint64_t> output;
+    unsigned attempts = 0;
+    auto deliver = [&] {
+        while (auto pts = aac.take_output()) output.push_back(*pts);
+        return true;
+    };
+    CHECK(aac.submit(21600, [&] { return ++attempts == 1 ? Result::Backpressure : Result::Accepted; }, deliver));
+    CHECK(attempts == 2 && (output == std::vector<uint64_t>{0, 1920, 21600}));
+
+    attempts = 0;
+    CHECK(!aac.submit(23520, [&] { ++attempts; return Result::Backpressure; }, silent));
+    CHECK(attempts == 3 && !aac.take_output());
+    CHECK(!aac.submit(25440, [] { return Result::Failed; }, silent) && !aac.take_output());
+    for (uint64_t i = 0; i < 64; ++i) CHECK(aac.submit(i * 1920, accepted, silent));
+    CHECK(!aac.submit(64 * 1920, accepted, silent));
+    aac.clear();
+    CHECK(!aac.take_output());
+
+    const uint8_t raw[] = {1, 2, 3, 4};
+    auto adts = media::AacEncoder::wrap_adts(raw, 4, 48000, 2);
+    const size_t length = adts.size();
+    std::vector<uint8_t> prefix(adts.begin(), adts.begin() + 5);
+    adts.insert(adts.end(), prefix.begin(), prefix.end());
+    size_t frames = 0;
+    media::AacEncoder::emit_adts_frames(adts.data(), adts.size(), 48000, 2,
+                                      [&](auto, auto) { ++frames; });
+    CHECK(frames == 0);
+    media::AacEncoder::emit_adts_frames(adts.data(), length - 1, 48000, 2,
+                                      [&](auto, auto) { ++frames; });
+    CHECK(frames == 0);
+    std::cout << "[PASS] test_aac_backpressure_timeline_and_truncated_adts\n";
+}
+
+static void test_fixed_capture_sample_clock() {
+    sync::MasterMediaClock clock;
+    clock.reset(48000, 350);
+    const auto origin = clock.session_origin_us();
+    const auto first = clock.next_frame_timestamps(480, false);
+    CHECK(first.linear_pts_90khz == 0);
+    for (uint64_t elapsed : {40000, 55000, 60000, 80000, 240000}) {
+        clock.reset(48000, 350);
+        clock.next_frame_timestamps(480);
+        const auto skipped = media::AudioPipeline::skipped_capture_samples(480, 48000, 480, elapsed);
+        clock.skip_samples(skipped);
+        const auto recovered = clock.next_frame_timestamps(480);
+        const auto nominal = (elapsed / 10000) * 10000;
+        CHECK(recovered.play_target_us == clock.session_origin_us() + 350000 + nominal);
+        CHECK(recovered.play_target_us >= origin);
+        CHECK(clock.next_frame_timestamps(480).linear_pts_90khz - recovered.linear_pts_90khz == 900);
+    }
+    std::cout << "[PASS] test_fixed_capture_sample_clock\n";
+}
+
+#if defined(__linux__)
+static int run_continuous_loopback_source() {
+    const std::array<uint8_t, 4> sample{0x34, 0x12, 0x34, 0x12};
+    std::array<uint8_t, 8193> bytes{};
+    size_t position = 0;
+    while (true) {
+        for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = sample[(position + i) % 4];
+        const auto written = ::write(STDOUT_FILENO, bytes.data(), bytes.size());
+        if (written <= 0) return 0;
+        position += static_cast<size_t>(written);
+    }
+}
+
+static void test_linux_continuous_loopback_and_source_switch() {
+    media::AudioPipeline pipeline;
+    pipeline.set_loopback_command_override_for_test({"/proc/self/exe", "--continuous-loopback-source"});
+    CHECK(pipeline.set_source_mode(media::AudioSourceMode::SystemLoopback));
+    std::mutex mu;
+    std::condition_variable notices;
+    size_t matching = 0, switched = 0, mixed_old = 0;
+    std::atomic<bool> expect_other{false};
+    CHECK(pipeline.start(48000, 480, [&](const int16_t* pcm, size_t frames) {
+        std::lock_guard lock(mu);
+        if (std::all_of(pcm, pcm + frames * 2, [](auto sample) { return sample == 0x1234; })) ++matching;
+        if (expect_other.load()) {
+            ++switched;
+            if (std::find(pcm, pcm + frames * 2, 0x1234) != pcm + frames * 2) ++mixed_old;
+        }
+        notices.notify_one();
+    }));
+    {
+        std::unique_lock lock(mu);
+        CHECK(notices.wait_for(lock, std::chrono::seconds(3), [&] { return matching >= 5; }));
+    }
+    CHECK(pipeline.set_source_mode(media::AudioSourceMode::ExternalPcm));
+    expect_other.store(true);
+    {
+        std::unique_lock lock(mu);
+        CHECK(notices.wait_for(lock, std::chrono::seconds(1), [&] { return switched >= 3; }));
+        CHECK(mixed_old == 0);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    pipeline.stop();
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(600));
+    std::cout << "[PASS] test_linux_continuous_loopback_and_source_switch\n";
+}
+#endif
+
+static void test_remote_control_and_lrc_sync() {
+    // 1. 0x0022 Notify 反向播控键 + key-seek (0x09 u64be) + volume (0x03 u8)
+    {
+        std::vector<uint8_t> combined;
+        auto append = [&](const std::vector<uint8_t>& v) {
+            combined.insert(combined.end(), v.begin(), v.end());
+        };
+        append(cmd::encode_notify_control_key("key-pause"));
+        append(cmd::encode_notify_control_key("key-resume"));
+        append(cmd::encode_notify_control_key("key-next"));
+        append(cmd::encode_notify_control_key("key-prev"));
+        append(cmd::encode_notify_seek_ms(98765ULL));
+        const uint8_t vol_tlv[] = {6, 'v', 'o', 'l', 'u', 'm', 'e', 0x03, 42};
+        combined.insert(combined.end(), std::begin(vol_tlv), std::end(vol_tlv));
+
+        auto evs = cmd::decode_remote_control_events(static_cast<uint16_t>(cmd::CmdType::Notify), combined);
+        CHECK(evs.size() == 6);
+        CHECK(evs[0].action == cmd::RemoteControlAction::Pause);
+        CHECK(evs[1].action == cmd::RemoteControlAction::Resume);
+        CHECK(evs[2].action == cmd::RemoteControlAction::Next);
+        CHECK(evs[3].action == cmd::RemoteControlAction::Previous);
+        CHECK(evs[4].action == cmd::RemoteControlAction::Seek && evs[4].position_ms == 98765ULL);
+        CHECK(evs[5].action == cmd::RemoteControlAction::SetVolume && evs[5].volume == 42);
+    }
+
+    // 2. 直发 Pause / Resume / SetPosition 兜底解析
+    {
+        auto p = cmd::decode_remote_control_events(static_cast<uint16_t>(cmd::CmdType::Pause), {});
+        CHECK(p.size() == 1 && p[0].action == cmd::RemoteControlAction::Pause);
+        auto r = cmd::decode_remote_control_events(static_cast<uint16_t>(cmd::CmdType::Resume), {});
+        CHECK(r.size() == 1 && r[0].action == cmd::RemoteControlAction::Resume);
+        std::vector<uint8_t> pos_le(8, 0);
+        uint64_t pos_val = 45200ULL;
+        for (int i = 0; i < 8; ++i) pos_le[i] = static_cast<uint8_t>((pos_val >> (8 * i)) & 0xFF);
+        auto s = cmd::decode_remote_control_events(static_cast<uint16_t>(cmd::CmdType::SetPosition), pos_le);
+        CHECK(s.size() == 1 && s[0].action == cmd::RemoteControlAction::Seek && s[0].position_ms == 45200ULL);
+    }
+
+    // 3. LRC 解析（UTF-8 BOM + 多时间标签 + [offset] + 毫秒二分查找）
+    {
+        const std::string sample =
+            "\xEF\xBB\xBF[ti:探窗]\r\n[offset:500]\r\n[00:01.50]第一句歌词\r\n"
+            "[00:05.00][00:12.25]副歌重复行\n[00:09.00]间奏\n";
+        auto doc = media::LrcDocument::parse(sample);
+        CHECK(doc.size() == 4);
+        CHECK(doc.line_at(500).empty());
+        CHECK(doc.line_at(1000) == "第一句歌词");
+        CHECK(doc.line_at(4500) == "副歌重复行");
+        CHECK(doc.line_at(8500) == "间奏");
+        CHECK(doc.line_at(12000) == "副歌重复行");
+    }
+
+    // 4. 端到端 8899 加密会话：发送含换行/引号歌词的 SetMediaInfo，并接收反向 Notify 播控事件
+    {
+        SocketHandle srv = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(srv != kInvalidSocket);
+        net::set_reuse_addr(srv);
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(0);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        CHECK(bind(srv, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+        CHECK(listen(srv, 2) == 0);
+        socklen_t alen = sizeof(addr);
+        CHECK(getsockname(srv, reinterpret_cast<struct sockaddr*>(&addr), &alen) == 0);
+        const uint16_t port = ntohs(addr.sin_port);
+
+        std::string captured_media_json;
+        std::atomic<bool> server_done{false};
+        std::thread fake_receiver([&]() {
+            struct sockaddr_in peer{};
+            socklen_t plen = sizeof(peer);
+            SocketHandle cli = accept(srv, reinterpret_cast<struct sockaddr*>(&peer), &plen);
+            if (cli == kInvalidSocket) return;
+            net::set_socket_timeout(cli, SO_RCVTIMEO, 2000);
+            const uint16_t client_port = ntohs(peer.sin_port);
+
+            // 发送明文 Challenge
+            const std::string ch = "13139245183899";
+            auto ch_frame = cmd::encode_frame({static_cast<uint16_t>(cmd::CmdType::Challenge), 1,
+                                               std::vector<uint8_t>(ch.begin(), ch.end())});
+            send(cli, reinterpret_cast<const char*>(ch_frame.data()), ch_frame.size(), 0);
+
+            std::string key_str = cmd::derive_type1_auth_key("127.0.0.1", port, "127.0.0.1", client_port);
+            const uint8_t* k16 = reinterpret_cast<const uint8_t*>(key_str.data());
+            cmd::SafetyCipher rx_dec, tx_enc;
+            rx_dec.init(k16, k16);
+            tx_enc.init(k16, k16);
+            bool safety_on = false;
+
+            std::vector<uint8_t> acc;
+            uint8_t tmp[4096];
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (std::chrono::steady_clock::now() < deadline && captured_media_json.empty()) {
+                auto n = recv(cli, reinterpret_cast<char*>(tmp), sizeof(tmp), 0);
+                if (n <= 0) break;
+                acc.insert(acc.end(), tmp, tmp + n);
+                std::vector<cmd::CmdFrame> frames;
+                size_t used = cmd::decode_frames(acc.data(), acc.size(), frames);
+                if (used) acc.erase(acc.begin(), acc.begin() + static_cast<ptrdiff_t>(used));
+                for (const auto& f : frames) {
+                    if (f.cmd_type == static_cast<uint16_t>(cmd::CmdType::GetVersion)) {
+                        const std::string ver = "2.1.5112421";
+                        auto vf = cmd::encode_frame({static_cast<uint16_t>(cmd::CmdType::GetVersionAck), f.seq,
+                                                     std::vector<uint8_t>(ver.begin(), ver.end())});
+                        send(cli, reinterpret_cast<const char*>(vf.data()), vf.size(), 0);
+                    } else if (f.cmd_type == static_cast<uint16_t>(cmd::CmdType::SafetyInfo)) {
+                        auto env = cmd::encode_tlv_string("ack", "{\"result\":\"0\"}");
+                        auto af = cmd::encode_frame({static_cast<uint16_t>(cmd::CmdType::SafetyInfoAck), f.seq, env});
+                        send(cli, reinterpret_cast<const char*>(af.data()), af.size(), 0);
+                    } else if (f.cmd_type == static_cast<uint16_t>(cmd::CmdType::SafetyAuth)) {
+                        auto plain = rx_dec.decrypt_blob(f.payload);
+                        if (plain) {
+                            auto ack_env = cmd::encode_tlv_string("ack", "{\"result\":\"0\"}");
+                            auto ack_blob = tx_enc.encrypt_blob(ack_env);
+                            auto af = cmd::encode_frame({static_cast<uint16_t>(cmd::CmdType::SafetyAuthAck), f.seq, ack_blob});
+                            send(cli, reinterpret_cast<const char*>(af.data()), af.size(), 0);
+
+                            auto req_env = cmd::encode_tlv_string("cmd", "{\"authMsg\":\"peer_nonce\"}");
+                            auto req_blob = tx_enc.encrypt_blob(req_env);
+                            auto rf = cmd::encode_frame({static_cast<uint16_t>(cmd::CmdType::SafetyAuth), 9, req_blob});
+                            send(cli, reinterpret_cast<const char*>(rf.data()), rf.size(), 0);
+                        }
+                    } else if (f.cmd_type == static_cast<uint16_t>(cmd::CmdType::SafetyAuthAck)) {
+                        (void)rx_dec.decrypt_blob(f.payload);
+                        safety_on = true;
+                    } else if (f.cmd_type == static_cast<uint16_t>(cmd::CmdType::SetMediaInfo)) {
+                        auto plain = safety_on ? rx_dec.decrypt_blob(f.payload) : std::optional<std::vector<uint8_t>>(f.payload);
+                        if (plain) {
+                            captured_media_json.assign(plain->begin(), plain->end());
+                            // 收到歌词后，反向发送加密的 key-next 和 key-seek 通知
+                            auto n1 = tx_enc.encrypt_blob(cmd::encode_notify_control_key("key-next"));
+                            auto f1 = cmd::encode_frame({static_cast<uint16_t>(cmd::CmdType::Notify), 100, n1});
+                            send(cli, reinterpret_cast<const char*>(f1.data()), f1.size(), 0);
+
+                            auto n2 = tx_enc.encrypt_blob(cmd::encode_notify_seek_ms(12345ULL));
+                            auto f2 = cmd::encode_frame({static_cast<uint16_t>(cmd::CmdType::Notify), 101, n2});
+                            send(cli, reinterpret_cast<const char*>(f2.data()), f2.size(), 0);
+                        }
+                    } else if (safety_on && f.payload.size() >= 25) {
+                        (void)rx_dec.decrypt_blob(f.payload);
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            net::close_socket(cli);
+            server_done.store(true);
+        });
+
+        cmd::CmdSession sess("127.0.0.1", port, "127.0.0.1");
+        std::mutex ev_mu;
+        std::condition_variable ev_cv;
+        std::vector<cmd::RemoteControlEvent> received_evs;
+        cmd::CmdSessionCallbacks cbs;
+        cbs.on_remote_control = [&](const cmd::RemoteControlEvent& ev) {
+            std::lock_guard<std::mutex> lk(ev_mu);
+            received_evs.push_back(ev);
+            ev_cv.notify_all();
+        };
+        CHECK(sess.connect(std::move(cbs)));
+        CHECK(sess.is_safety_enabled());
+
+        cmd::MediaInfoPayload info;
+        info.title = "测试\"曲目\"";
+        info.artist = "歌手A";
+        info.album = "专辑B";
+        info.duration_ms = 180000;
+        info.position_ms = 12000;
+        info.lyrics = "[00:01.00]第一行\n[00:10.00]第二行\"带引号\"";
+        info.lyric_line = "第二行\"带引号\"";
+        CHECK(sess.send_set_media_info(info));
+
+        {
+            std::unique_lock<std::mutex> lk(ev_mu);
+            CHECK(ev_cv.wait_for(lk, std::chrono::seconds(2), [&] { return received_evs.size() >= 2; }));
+        }
+        sess.disconnect();
+        fake_receiver.join();
+        net::close_socket(srv);
+
+        // 验证接收端收到的 JSON 合法且包含完整转义后的歌词与当前行
+        const auto parsed = json::parse(captured_media_json);
+        const auto* obj = std::get_if<json::Value::Object>(&parsed.data);
+        CHECK(obj != nullptr);
+        CHECK(std::get<std::string>(obj->at("mTitle").data) == info.title);
+        CHECK(std::get<std::string>(obj->at("mLrc").data) == info.lyrics);
+        CHECK(std::get<std::string>(obj->at("lyric_line").data) == info.lyric_line);
+
+        CHECK(received_evs.size() == 2);
+        CHECK(received_evs[0].action == cmd::RemoteControlAction::Next);
+        CHECK(received_evs[1].action == cmd::RemoteControlAction::Seek && received_evs[1].position_ms == 12345ULL);
+    }
+
+    std::cout << "[PASS] test_remote_control_and_lrc_sync\n";
+}
+
+int main(int argc, char** argv) {
+#if defined(__linux__)
+    if (argc == 2 && std::string_view(argv[1]) == "--continuous-loopback-source") {
+        return run_continuous_loopback_source();
+    }
+#endif
+    net::init_network();
+    if (argc == 2 && std::string_view(argv[1]) == "--dump-transport-fixtures") {
+        test_transport_boundaries(true);
+        return 0;
+    }
+    test_transport_boundaries();
+    test_write_deadline_and_serialization();
+    test_fixed_capture_sample_clock();
+    test_aac_backpressure_timeline_and_truncated_adts();
+    test_capture_conversion_and_fifo_limit();
+    test_resampling_partitions_and_alias_rejection();
+    test_mdns_fixtures_and_expiry();
+    test_discovery_concurrent_lifecycle_and_manual_identity();
+    test_discovery_burst_deadlines();
+    test_manual_and_discovered_identity_revisions();
     test_cmd8899_codec_and_safety();
+    test_remote_control_and_lrc_sync();
     test_master_clock_and_trendline();
     test_timer_service_multi_clients();
     test_wav_parser_bounds_and_formats();
@@ -1420,6 +2227,7 @@ int main() {
     test_lifecycle_cancellation_and_concurrent_start_stop();
 #if defined(__linux__)
     test_linux_stalled_loopback_cancellation();
+    test_linux_continuous_loopback_and_source_switch();
 #endif
     test_slow_spectrum_consumer_keeps_capture_running();
     test_ws_shutdown_with_idle_client();

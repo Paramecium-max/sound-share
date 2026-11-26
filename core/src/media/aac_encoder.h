@@ -21,7 +21,9 @@ public:
 
     // 输入 interleaved stereo int16 PCM (建议每次 1024 采样)，回调输出带 7 字节 ADTS 头的完整 AAC 帧
     using AdtsCallback = std::function<void(const uint8_t* adts_data, size_t len)>;
-    void encode_pcm(const int16_t* stereo_pcm, size_t sample_frames, const AdtsCallback& cb);
+    using TimedAdtsCallback = std::function<void(const uint8_t*, size_t, uint64_t)>;
+    bool encode_pcm(const int16_t* stereo_pcm, size_t sample_frames, uint64_t pts90k,
+                    const TimedAdtsCallback& cb);
 
     static std::vector<uint8_t> wrap_adts(const uint8_t* raw_aac, size_t len, uint32_t sample_rate, uint32_t channels);
 

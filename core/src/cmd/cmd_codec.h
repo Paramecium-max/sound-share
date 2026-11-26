@@ -95,4 +95,27 @@ std::vector<uint8_t> encode_scalar_u32(uint32_t val);
 std::vector<uint8_t> encode_tlv_string(const std::string& key, const std::string& value);
 std::optional<std::string> decode_tlv_string(const std::vector<uint8_t>& buf, std::string* out_key = nullptr);
 
+// 接收端反向媒体控制事件（实机实证 0x0022 Notify TLV：key-pause / key-resume / key-prev / key-next / key-seek / volume）
+enum class RemoteControlAction {
+    Unknown = 0,
+    Pause,
+    Resume,
+    Next,
+    Previous,
+    Seek,
+    SetVolume
+};
+
+struct RemoteControlEvent {
+    RemoteControlAction action = RemoteControlAction::Unknown;
+    uint64_t position_ms = 0; // Seek 毫秒位置
+    int32_t volume = -1;      // SetVolume 0..100
+    std::string raw_key;
+};
+
+std::vector<RemoteControlEvent> decode_remote_control_events(uint16_t cmd_type,
+                                                             const std::vector<uint8_t>& payload);
+std::vector<uint8_t> encode_notify_control_key(const std::string& key);
+std::vector<uint8_t> encode_notify_seek_ms(uint64_t position_ms);
+
 } // namespace miplay::cmd

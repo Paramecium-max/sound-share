@@ -24,9 +24,7 @@ std::string trim_ws(std::string s) {
     return s.substr(start, end - start);
 }
 
-bool send_str(SocketHandle fd, const std::string& s) {
-    return net::send_all(fd, reinterpret_cast<const uint8_t*>(s.data()), s.size());
-}
+
 
 std::optional<std::string> take_rtsp_message(std::string& buffer, size_t header_end, size_t content_len) {
     const size_t header_len = header_end + 4;
@@ -213,10 +211,7 @@ bool WfdRtspServer::start(const std::string& device_id,
 
 void WfdRtspServer::stop() {
     stopping_.store(true);
-    if (!running_.exchange(false)) {
-        pending_cv_.notify_all();
-        return;
-    }
+    running_.store(false);
     pending_cv_.notify_all();
     // Let the accept thread leave its bounded wait before closing its listener.
     if (accept_th_.joinable()) accept_th_.join();
@@ -269,8 +264,7 @@ void WfdRtspServer::accept_loop() {
         SocketHandle client = accept(listen_sock_, reinterpret_cast<struct sockaddr*>(&peer), &plen);
         if (client == kInvalidSocket) continue;
 
-        // Winsock can inherit the listener's nonblocking mode.
-        if (!net::set_nonblocking(client, false)) {
+        if (!net::set_nonblocking(client, true)) {
             net::close_socket(client);
             continue;
         }
@@ -306,13 +300,20 @@ void WfdRtspServer::accept_loop() {
             client_ths_.emplace_back(&WfdRtspServer::handle_rtsp_control, this, client, std::move(peer_ip), peer_port);
         }
     }
+    net::close_socket(listen_sock_);
+    listen_sock_ = kInvalidSocket;
+    port_.store(0);
 }
 
 void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::string& peer_ip, uint16_t peer_port) {
-    if (!running_.load() || !net::set_socket_timeout(ctrl_sock, SO_SNDTIMEO, 100)) {
-        net::close_socket(ctrl_sock);
-        return;
-    }
+    auto ctrl_writer = std::make_shared<net::ConnectionWriter>(ctrl_sock, true);
+    std::shared_ptr<net::ConnectionWriter> data_writer;
+    auto send_str = [&](const std::string& message) {
+        if (ctrl_writer->write(reinterpret_cast<const uint8_t*>(message.data()), message.size(), 120)
+                == net::SendAllStatus::Ok) return true;
+        ctrl_writer->abort();
+        return false;
+    };
 
     auto report = [this](const std::string& s) {
         if (cbs_.on_status) cbs_.on_status(device_id_, s);
@@ -321,10 +322,7 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
     report("RTSP 已反连 (" + peer_ip + ")，正在 M1 OPTIONS 握手...");
 
     // M1 OPTIONS 使用 CSeq: 1，兼容所有官方设备及第三方接收端
-    if (!send_str(ctrl_sock, build_m1_options(sender_ip_, timer_port_, 1))) {
-        net::close_socket(ctrl_sock);
-        return;
-    }
+    bool peer_closed = !send_str(build_m1_options(sender_ip_, timer_port_, 1));
 
     std::string acc;
     char buf[4096];
@@ -334,7 +332,6 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
     bool sent_time_offset = false;
     bool setup_complete = false;
     bool streaming = false;
-    bool peer_closed = false;
     uint16_t media_port = 0;
     SocketHandle claimed_data_sock = kInvalidSocket;
     const std::string session_id = "1189641421";
@@ -342,14 +339,15 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
     while (running_.load() && !peer_closed) {
         if (!net::wait_readable(ctrl_sock, 50) || !running_.load()) continue;
         auto n = recv(ctrl_sock, buf, sizeof(buf), 0);
-        if (n == 0) break;
+        if (n == 0) { peer_closed = true; break; }
         if (n < 0) {
             if (net::last_socket_error_is_timeout()) continue;
+            peer_closed = true;
             break;
         }
         acc.append(buf, static_cast<size_t>(n));
 
-        while (running_.load()) {
+        while (running_.load() && !peer_closed) {
             auto hdr_end = acc.find("\r\n\r\n");
             if (hdr_end == std::string::npos) break;
             std::string hdr = acc.substr(0, hdr_end + 4);
@@ -367,7 +365,7 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                 std::ostringstream resp;
                 resp << "RTSP/1.0 200 OK\r\nCSeq: " << cseq
                      << "\r\nPublic: org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER\r\n\r\n";
-                send_str(ctrl_sock, resp.str());
+                if (!send_str(resp.str())) { peer_closed = true; break; }
 
                 if (!sent_m3) {
                     sent_m3 = true;
@@ -377,7 +375,7 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                     m3 << "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n"
                        << "CSeq: 2\r\nContent-Type: text/parameters\r\n"
                        << "Content-Length: " << body.size() << "\r\n\r\n" << body;
-                    send_str(ctrl_sock, m3.str());
+                    if (!send_str(m3.str())) { peer_closed = true; break; }
                 }
             } else if (msg.rfind("RTSP/1.0 200 OK", 0) == 0) {
                 if (cseq == "2" && !sent_m4) {
@@ -392,7 +390,7 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                     m4 << "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n"
                        << "CSeq: 3\r\nContent-Type: text/parameters\r\n"
                        << "Content-Length: " << b.size() << "\r\n\r\n" << b;
-                    send_str(ctrl_sock, m4.str());
+                    if (!send_str(m4.str())) { peer_closed = true; break; }
                 } else if (cseq == "3" && !sent_m5) {
                     sent_m5 = true;
                     report("RTSP M5 触发 SETUP...");
@@ -401,26 +399,26 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                     m5 << "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n"
                        << "CSeq: 4\r\nContent-Type: text/parameters\r\n"
                        << "Content-Length: " << b.size() << "\r\n\r\n" << b;
-                    send_str(ctrl_sock, m5.str());
+                    if (!send_str(m5.str())) { peer_closed = true; break; }
                 }
             } else if (msg.rfind("SETUP ", 0) == 0) {
                 report("RTSP M6 SETUP 建立数据通道...");
                 const std::string mp = extract_header(hdr, "MultiPort");
                 const int requested_port = mp.empty() ? 0 : parse_multi_port_media_port(mp);
                 if (requested_port < 0 || static_cast<uint16_t>(requested_port) == peer_port) {
-                    send_str(ctrl_sock, "RTSP/1.0 461 Unsupported Transport\r\nCSeq: " + cseq + "\r\n\r\n");
+                    if (!send_str("RTSP/1.0 461 Unsupported Transport\r\nCSeq: " + cseq + "\r\n\r\n")) { peer_closed = true; break; }
                     report("RTSP MultiPort 无效，未建立音频通道");
                     continue;
                 }
                 if (streaming && static_cast<uint16_t>(requested_port) != media_port) {
-                    send_str(ctrl_sock, "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: " + cseq + "\r\n\r\n");
+                    if (!send_str("RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: " + cseq + "\r\n\r\n")) { peer_closed = true; break; }
                     continue;
                 }
                 media_port = static_cast<uint16_t>(requested_port);
                 setup_complete = true;
                 if (media_port > 0 && !sent_time_offset) {
                     // 官方小米接收端（含 MultiPort）在 SETUP 响应前期望 TIME_OFFSET
-                    send_str(ctrl_sock, build_time_offset_req(time_offset_us_, 5));
+                    if (!send_str(build_time_offset_req(time_offset_us_, 5))) { peer_closed = true; break; }
                     sent_time_offset = true;
                 }
 
@@ -428,17 +426,20 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                 resp << "RTSP/1.0 200 OK\r\nCSeq: " << cseq
                      << "\r\nSession: " << session_id << ";timeout=60"
                      << "\r\nTransport: RTP/AVP/TCP;interleaved=0-1;\r\n\r\n";
-                send_str(ctrl_sock, resp.str());
+                if (!send_str(resp.str())) { peer_closed = true; break; }
             } else if (msg.rfind("PLAY ", 0) == 0) {
                 if (!setup_complete) {
-                    send_str(ctrl_sock, "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: " + cseq + "\r\n\r\n");
+                    if (!send_str("RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: " + cseq + "\r\n\r\n")) { peer_closed = true; break; }
                     continue;
                 }
                 if (!streaming && media_port > 0) {
                     claimed_data_sock = claim_pending_port_socket(media_port);
+                    if (claimed_data_sock != kInvalidSocket) {
+                        data_writer = std::make_shared<net::ConnectionWriter>(claimed_data_sock, true);
+                    }
                     if (!running_.load() || stopping_.load()) break;
                     if (claimed_data_sock == kInvalidSocket) {
-                        send_str(ctrl_sock, "RTSP/1.0 503 Service Unavailable\r\nCSeq: " + cseq + "\r\n\r\n");
+                        if (!send_str("RTSP/1.0 503 Service Unavailable\r\nCSeq: " + cseq + "\r\n\r\n")) { peer_closed = true; break; }
                         report("RTSP MultiPort 音频反连超时，接收端端口 " + std::to_string(media_port));
                         peer_closed = true;
                         break;
@@ -449,10 +450,10 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                 resp << "RTSP/1.0 200 OK\r\nCSeq: " << cseq
                      << "\r\nSession: " << session_id << ";timeout=60"
                      << "\r\nRange: npt=now-\r\n\r\n";
-                send_str(ctrl_sock, resp.str());
+                if (!send_str(resp.str())) { peer_closed = true; break; }
 
                 if (!sent_time_offset) {
-                    send_str(ctrl_sock, build_time_offset_req(time_offset_us_, 5));
+                    if (!send_str(build_time_offset_req(time_offset_us_, 5))) { peer_closed = true; break; }
                     sent_time_offset = true;
                 }
 
@@ -464,7 +465,10 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                                   "，音频 " + std::to_string(media_port) + ")")
                                : "RTSP M7 同步推流中 (TCP Interleaved，接收端未请求 MultiPort)");
                     SocketHandle out_sock = is_multi ? claimed_data_sock : ctrl_sock;
-                    if (cbs_.on_stream_ready) {
+                    if (cbs_.on_stream_connection) {
+                        cbs_.on_stream_connection(device_id_, peer_ip, is_multi ? data_writer : ctrl_writer,
+                            [ctrl_writer] { ctrl_writer->abort(); });
+                    } else if (cbs_.on_stream_ready) {
                         cbs_.on_stream_ready(device_id_, peer_ip, out_sock);
                     }
                 }
@@ -472,7 +476,7 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                 std::ostringstream resp;
                 resp << "RTSP/1.0 200 OK\r\nCSeq: " << cseq
                      << "\r\nSession: " << session_id << ";timeout=20\r\n\r\n";
-                send_str(ctrl_sock, resp.str());
+                if (!send_str(resp.str())) { peer_closed = true; break; }
             } else if (msg.rfind("VIDEO_LATENCY ", 0) == 0) {
                 RtspLatencyReport rep;
                 rep.device_id = device_id_;
@@ -486,29 +490,33 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                 } catch (...) {}
                 if (cbs_.on_latency_report) cbs_.on_latency_report(rep);
             } else if (msg.rfind("TEARDOWN ", 0) == 0) {
+                if (streaming && cbs_.on_stop_media) cbs_.on_stop_media(device_id_);
                 std::ostringstream resp;
                 resp << "RTSP/1.0 200 OK\r\nCSeq: " << cseq << "\r\n\r\n";
-                send_str(ctrl_sock, resp.str());
+                if (!send_str(resp.str())) { peer_closed = true; break; }
                 peer_closed = true;
                 break;
             }
         }
     }
 
+    if (streaming && cbs_.on_stop_media) cbs_.on_stop_media(device_id_);
+    running_.store(false);
+    pending_cv_.notify_all();
     if (stopping_.load() && !peer_closed) {
         const std::string body = "wfd_trigger_method: TEARDOWN\r\n";
         std::ostringstream request;
         request << "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n"
                 << "CSeq: 99\r\nContent-Type: text/parameters\r\n"
                 << "Content-Length: " << body.size() << "\r\n\r\n" << body;
-        if (send_str(ctrl_sock, request.str())) {
+        if (send_str(request.str())) {
             // Give the sink time to finish the WFD exchange before closing TCP.
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(75);
             while (std::chrono::steady_clock::now() < deadline) {
                 if (const auto start = acc.find("TEARDOWN "); start != std::string::npos &&
                     acc.find("\r\n\r\n", start) != std::string::npos) {
                     const std::string cseq = extract_header(acc.substr(start), "CSeq");
-                    send_str(ctrl_sock, "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\n\r\n");
+                    send_str("RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\n\r\n");
                     break;
                 }
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -524,10 +532,8 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
         report("RTSP 会话已关闭");
         if (cbs_.on_session_closed) cbs_.on_session_closed(device_id_);
     }
-    if (claimed_data_sock != kInvalidSocket && claimed_data_sock != ctrl_sock) {
-        net::close_socket(claimed_data_sock);
-    }
-    net::close_socket(ctrl_sock);
+    if (data_writer) data_writer->abort();
+    ctrl_writer->abort();
     std::vector<SocketHandle> extra_conns;
     {
         std::lock_guard<std::mutex> lock(pending_mu_);

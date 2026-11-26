@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -49,7 +50,9 @@ public:
                               SocketHandle data_sock,
                               int32_t delay_bias_ms = 0,
                               bool owns_socket = true,
-                              uint64_t session_id = 0);
+                              uint64_t session_id = 0,
+                              std::shared_ptr<net::ConnectionWriter> connection = {},
+                              std::function<void()> on_failure = {});
 
     // session_id == 0 表示按 device_id 无条件删除；非 0 表示仅当当前目标 session_id 匹配时删除
     void remove_target(const std::string& device_id, uint64_t session_id = 0);
@@ -73,6 +76,10 @@ public:
         uint32_t ssrc = 0xDEADBEEFU,
         bool marker = true);
 
+    // Pack one access unit into interleaved RTP fragments and advance the wire sequence.
+    static size_t append_rtp_batch(std::vector<uint8_t>& wire, const std::vector<uint8_t>& ts_bytes,
+                                   uint16_t& sequence, uint32_t timestamp);
+
     std::vector<MirrorTargetNode> snapshot_nodes() const;
 
 private:
@@ -87,6 +94,8 @@ private:
         std::string peer_ip;
         SocketHandle tcp_data_sock = kInvalidSocket;
         bool owns_socket = true;
+        std::shared_ptr<net::ConnectionWriter> connection;
+        std::function<void()> on_failure;
         TsAudioStreamType stream_type = TsAudioStreamType::WfdLpcm;
         std::atomic<int32_t> delay_bias_ms{0};
         std::atomic<uint64_t> packets_sent{0};

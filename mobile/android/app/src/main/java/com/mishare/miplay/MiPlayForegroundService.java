@@ -40,7 +40,7 @@ public class MiPlayForegroundService extends Service {
         super.onCreate();
         createNotificationChannel();
         acquireLocks();
-        MultiRoomManager.getInstance().ensureStartedAsync();
+        MultiRoomManager.getInstance().ensureStartedAsync(getApplicationContext());
     }
 
     @Override
@@ -70,7 +70,7 @@ public class MiPlayForegroundService extends Service {
                         projectionCallback = new MediaProjection.Callback() {
                             @Override
                             public void onStop() {
-                                releaseProjection(true);
+                                if (activeProjection == mp) releaseProjection(true);
                             }
                         };
                         mp.registerCallback(projectionCallback, new Handler(Looper.getMainLooper()));

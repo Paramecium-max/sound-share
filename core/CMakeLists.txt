@@ -5,11 +5,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
 
 find_package(Threads REQUIRED)
 
 add_library(miplay_core STATIC
     src/crypto/mini_crypto.cpp
+    src/util/json.cpp
     src/platform/net_platform.cpp
     src/sync/master_clock.cpp
     src/sync/timer_service.cpp
@@ -20,6 +24,7 @@ add_library(miplay_core STATIC
     src/media/rtp_sender.cpp
     src/media/aac_encoder.cpp
     src/media/audio_pipeline.cpp
+    src/media/media_control.cpp
     src/rtsp/wfd_rtsp_server.cpp
     src/engine/multiroom_engine.cpp
     src/c_api/miplay_c_api.cpp
@@ -60,3 +65,10 @@ add_executable(miplay_core_tests
 target_include_directories(miplay_core_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(miplay_core_tests PRIVATE miplay_core)
 add_test(NAME protocol_and_sync COMMAND miplay_core_tests)
+
+target_compile_definitions(miplay_core_tests PRIVATE MIPLAY_TEST_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME sidecar_rpc COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sidecar_rpc.py"
+                                    "$<TARGET_FILE:miplay_core_sidecar>")
+endif()

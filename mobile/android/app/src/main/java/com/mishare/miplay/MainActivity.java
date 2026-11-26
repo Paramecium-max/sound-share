@@ -25,6 +25,7 @@ public class MainActivity extends Activity {
     private static final int REQ_MEDIA_PROJECTION = 2001;
     private static final int REQ_PICK_WAV = 2002;
     private static final int REQ_PERMISSIONS = 2003;
+    private static final int REQ_PICK_LRC = 2004;
 
     private WebView webView;
 
@@ -38,7 +39,7 @@ public class MainActivity extends Activity {
         // 异步启动核心，绝不在 UI 主线程做任何网络 IO
         MultiRoomManager mgr = MultiRoomManager.getInstance();
         mgr.setUiActionDelegate(() -> runOnUiThread(this::requestMediaProjection));
-        mgr.ensureStartedAsync();
+        mgr.ensureStartedAsync(getApplicationContext());
 
         try {
             Intent svc = new Intent(this, MiPlayForegroundService.class);
@@ -133,6 +134,13 @@ public class MainActivity extends Activity {
                         .onWavFileSelected(getApplicationContext(), uri, uri.getLastPathSegment()),
                         "MiPlay-LoadWav").start();
             }
+        } else if (requestCode == REQ_PICK_LRC && resultCode == RESULT_OK && data != null) {
+            Uri uri = data.getData();
+            if (uri != null) {
+                new Thread(() -> MultiRoomManager.getInstance()
+                        .onLrcFileSelected(getApplicationContext(), uri),
+                        "MiPlay-LoadLrc").start();
+            }
         }
     }
 
@@ -141,7 +149,7 @@ public class MainActivity extends Activity {
         public String getSidecarConfigJson() {
             try {
                 MultiRoomManager mgr = MultiRoomManager.getInstance();
-                mgr.ensureStartedAsync();
+                mgr.ensureStartedAsync(getApplicationContext());
                 int port = mgr.awaitWsPort(1500);
                 JSONObject o = new JSONObject();
                 o.put("port", port);
@@ -159,6 +167,25 @@ public class MainActivity extends Activity {
                 i.addCategory(Intent.CATEGORY_OPENABLE);
                 i.setType("audio/*");
                 startActivityForResult(i, REQ_PICK_WAV);
+            });
+        }
+
+        @JavascriptInterface
+        public void openLrcPicker() {
+            runOnUiThread(() -> {
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("*/*");
+                startActivityForResult(i, REQ_PICK_LRC);
+            });
+        }
+
+        @JavascriptInterface
+        public void openNotificationAccessSettings() {
+            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+                } catch (Exception ignored) {}
             });
         }
     }

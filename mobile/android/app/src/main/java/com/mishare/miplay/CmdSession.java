@@ -29,27 +29,68 @@ public class CmdSession {
     public static final int CMD_OPEN                 = 0x0000;
     public static final int CMD_CLOSE                = 0x0002;
     public static final int CMD_PAUSE                = 0x0004;
+    public static final int CMD_PAUSE_ACK            = 0x0005;
     public static final int CMD_RESUME               = 0x0006;
+    public static final int CMD_RESUME_ACK           = 0x0007;
     public static final int CMD_SET_VOLUME           = 0x000C;
     public static final int CMD_SET_MEDIA_INFO       = 0x0012;
     public static final int CMD_HEARTBEAT            = 0x001A;
     public static final int CMD_GET_DEVICE_INFO      = 0x001E;
+    public static final int CMD_NOTIFY               = 0x0022;
     public static final int CMD_CHALLENGE            = 0x0028;
     public static final int CMD_CHALLENGE_ACK        = 0x0029;
     public static final int CMD_GET_VERSION          = 0x0036;
     public static final int CMD_GET_VERSION_ACK      = 0x0037;
     public static final int CMD_SET_PLAY_SOURCE      = 0x0040;
     public static final int CMD_SET_POSITION         = 0x0056;
+    public static final int CMD_SET_POSITION_ACK     = 0x0057;
     public static final int CMD_SET_LOCAL_DEV_INFO   = 0x0058;
     public static final int CMD_SAFETY_INFO          = 0x1400;
     public static final int CMD_SAFETY_INFO_ACK      = 0x1401;
     public static final int CMD_SAFETY_AUTH          = 0x1402;
     public static final int CMD_SAFETY_AUTH_ACK      = 0x1403;
 
+    public enum RemoteControlAction {
+        UNKNOWN,
+        PAUSE,
+        RESUME,
+        NEXT,
+        PREVIOUS,
+        SEEK,
+        SET_VOLUME
+    }
+
+    public static final class RemoteControlEvent {
+        public final RemoteControlAction action;
+        public final long positionMs;
+        public final int volume;
+        public final String rawKey;
+
+        public RemoteControlEvent(RemoteControlAction action, long positionMs, int volume, String rawKey) {
+            this.action = action;
+            this.positionMs = positionMs;
+            this.volume = volume;
+            this.rawKey = rawKey == null ? "" : rawKey;
+        }
+    }
+
+    public static final class MediaInfo {
+        public String title = "";
+        public String artist = "";
+        public String album = "";
+        public long durationMs = 0L;
+        public long positionMs = 0L;
+        public String lyrics = "";
+        public String lyricLine = "";
+        public String sourceName = "MiPlay Android";
+        public int metaChangeType = 0;
+    }
+
     public interface Callbacks {
         void onVersion(String remoteVersion);
         void onStateChanged(boolean connected);
         void onStatus(String status);
+        default void onRemoteControl(RemoteControlEvent ev) {}
     }
 
     private static class SafetyCipher {
@@ -157,9 +198,12 @@ public class CmdSession {
     private SafetyCipher decCandType1;
     private SafetyCipher decCandType2;
 
-    public CmdSession(String ip, int port) {
+    private final String bindIp;
+
+    public CmdSession(String ip, int port, String bindIp) {
         this.ip = ip;
         this.port = port;
+        this.bindIp = bindIp;
     }
 
     public boolean isConnected() {
@@ -190,7 +234,8 @@ public class CmdSession {
         if (safetyAuthLatch != null) safetyAuthLatch.countDown();
     }
 
-    public boolean connect(Callbacks cbs) {
+    public boolean connect(Callbacks cbs, java.util.function.BooleanSupplier cancelled) {
+        if (cancelled.getAsBoolean()) return false;
         disconnect();
         aborted.set(false);
         this.cbs = cbs;
@@ -198,13 +243,14 @@ public class CmdSession {
         try {
             Socket s = new Socket();
             socket = s;
-            if (aborted.get()) {
+            if (aborted.get() || cancelled.getAsBoolean()) {
                 try { s.close(); } catch (Exception ignored) {}
                 return false;
             }
             s.setTcpNoDelay(true);
+            s.bind(new InetSocketAddress(bindIp, 0));
             s.connect(new InetSocketAddress(ip, port), 2500);
-            if (aborted.get()) {
+            if (aborted.get() || cancelled.getAsBoolean()) {
                 try { s.close(); } catch (Exception ignored) {}
                 return false;
             }
@@ -371,15 +417,211 @@ public class CmdSession {
         return sendCmd(CMD_SET_VOLUME, payload, true);
     }
 
+    public boolean sendPause() {
+        return sendCmd(CMD_PAUSE, new byte[0], true);
+    }
+
+    public boolean sendResume() {
+        return sendCmd(CMD_RESUME, new byte[0], true);
+    }
+
+    public boolean sendSetPositionMs(long positionMs) {
+        long p = Math.max(0L, positionMs);
+        byte[] payload = new byte[8];
+        for (int i = 0; i < 8; i++) {
+            payload[i] = (byte) ((p >>> (8 * i)) & 0xFFL);
+        }
+        return sendCmd(CMD_SET_POSITION, payload, true);
+    }
+
     public boolean sendSetMediaInfo(String title, String artist, String album, long durationMs) {
-        String safeTitle = title == null ? "" : title.replace("\"", "");
-        String safeArtist = artist == null ? "" : artist.replace("\"", "");
-        String safeAlbum = album == null ? "" : album.replace("\"", "");
-        String json = "{\"title\":\"" + safeTitle + "\",\"artist\":\"" + safeArtist
-                + "\",\"album\":\"" + safeAlbum + "\",\"mTitle\":\"" + safeTitle
-                + "\",\"mArtist\":\"" + safeArtist + "\",\"mAlbum\":\"" + safeAlbum
-                + "\",\"mDuration\":" + durationMs + "}";
-        return sendCmd(CMD_SET_MEDIA_INFO, json.getBytes(StandardCharsets.UTF_8), true);
+        MediaInfo info = new MediaInfo();
+        info.title = title == null ? "" : title;
+        info.artist = artist == null ? "" : artist;
+        info.album = album == null ? "" : album;
+        info.durationMs = Math.max(0L, durationMs);
+        return sendSetMediaInfo(info);
+    }
+
+    public boolean sendSetMediaInfo(MediaInfo info) {
+        try {
+            String t = info.title == null ? "" : info.title;
+            String a = info.artist == null ? "" : info.artist;
+            String al = info.album == null ? "" : info.album;
+            String lrc = (info.lyrics != null && !info.lyrics.isEmpty())
+                    ? info.lyrics
+                    : (info.lyricLine != null ? info.lyricLine : "");
+            String line = info.lyricLine == null ? "" : info.lyricLine;
+            String src = (info.sourceName == null || info.sourceName.isEmpty()) ? "MiPlay Android" : info.sourceName;
+
+            JSONObject obj = new JSONObject();
+            obj.put("title", t);
+            obj.put("mTitle", t);
+            obj.put("artist", a);
+            obj.put("mArtist", a);
+            obj.put("album", al);
+            obj.put("mAlbum", al);
+            obj.put("duration_ms", Math.max(0L, info.durationMs));
+            obj.put("durationMs", Math.max(0L, info.durationMs));
+            obj.put("mDuration", Math.max(0L, info.durationMs));
+            obj.put("position_ms", Math.max(0L, info.positionMs));
+            obj.put("positionMs", Math.max(0L, info.positionMs));
+            obj.put("mPosition", Math.max(0L, info.positionMs));
+            obj.put("sourceName", src);
+            obj.put("source_name", src);
+            obj.put("mMetaChangeType", String.valueOf(info.metaChangeType));
+            obj.put("metaChangeType", String.valueOf(info.metaChangeType));
+            obj.put("metadata_change_type", info.metaChangeType);
+            if (!lrc.isEmpty()) {
+                obj.put("mLrc", lrc);
+                obj.put("lyrics", lrc);
+                obj.put("lrc", lrc);
+            }
+            if (!line.isEmpty()) {
+                obj.put("lyric_line", line);
+                obj.put("lyricLine", line);
+                obj.put("currentLyric", line);
+            }
+            return sendCmd(CMD_SET_MEDIA_INFO, obj.toString().getBytes(StandardCharsets.UTF_8), true);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public static byte[] encodeNotifyControlKey(String key) {
+        byte[] k = key.getBytes(StandardCharsets.US_ASCII);
+        byte[] out = new byte[k.length + 3];
+        out[0] = (byte) k.length;
+        System.arraycopy(k, 0, out, 1, k.length);
+        out[k.length + 1] = 0x00;
+        out[k.length + 2] = 0x01;
+        return out;
+    }
+
+    public static byte[] encodeNotifySeekMs(long positionMs) {
+        byte[] k = "key-seek".getBytes(StandardCharsets.US_ASCII);
+        byte[] out = new byte[18];
+        out[0] = 8;
+        System.arraycopy(k, 0, out, 1, 8);
+        out[9] = 0x09;
+        for (int i = 0; i < 8; i++) {
+            out[10 + i] = (byte) ((positionMs >>> ((7 - i) * 8)) & 0xFFL);
+        }
+        return out;
+    }
+
+    public static java.util.List<RemoteControlEvent> decodeRemoteControlEvents(int cmdType, byte[] payload) {
+        java.util.List<RemoteControlEvent> out = new java.util.ArrayList<>();
+        if (payload == null) payload = new byte[0];
+        if (cmdType == CMD_NOTIFY) {
+            parseNotifyTlvStream(payload, 0, payload.length, out);
+            return out;
+        }
+        if (cmdType == CMD_PAUSE) {
+            out.add(new RemoteControlEvent(RemoteControlAction.PAUSE, 0L, -1, "cmd-pause"));
+            return out;
+        }
+        if (cmdType == CMD_RESUME) {
+            out.add(new RemoteControlEvent(RemoteControlAction.RESUME, 0L, -1, "cmd-resume"));
+            return out;
+        }
+        if (cmdType == CMD_SET_POSITION && payload.length >= 8) {
+            long le = 0L, be = 0L;
+            for (int i = 0; i < 8; i++) {
+                le |= ((payload[i] & 0xFFL) << (8 * i));
+                be = (be << 8) | (payload[i] & 0xFFL);
+            }
+            long maxMs = 86_400_000L;
+            long pos = (le >= 0L && le <= maxMs) ? le : ((be >= 0L && be <= maxMs) ? be : le);
+            out.add(new RemoteControlEvent(RemoteControlAction.SEEK, Math.max(0L, pos), -1, "cmd-setposition"));
+            return out;
+        }
+        return out;
+    }
+
+    private static void parseNotifyTlvStream(byte[] data, int off, int end, java.util.List<RemoteControlEvent> out) {
+        while (off + 2 <= end) {
+            int klen = data[off++] & 0xFF;
+            if (klen == 0 || off + klen + 1 > end) break;
+            String key = new String(data, off, klen, StandardCharsets.UTF_8);
+            off += klen;
+            int vtype = data[off++] & 0xFF;
+
+            long intVal = 0L;
+            boolean hasInt = false;
+            String strVal = "";
+
+            if (vtype == 0x00 || vtype == 0x01 || vtype == 0x02 || vtype == 0x03) {
+                if (off + 1 > end) break;
+                intVal = data[off++] & 0xFFL;
+                hasInt = true;
+            } else if (vtype == 0x04 || vtype == 0x05 || vtype == 0x06 || vtype == 0x07) {
+                if (off + 4 <= end) {
+                    intVal = ((data[off] & 0xFFL) << 24) | ((data[off + 1] & 0xFFL) << 16)
+                            | ((data[off + 2] & 0xFFL) << 8) | (data[off + 3] & 0xFFL);
+                    off += 4;
+                    hasInt = true;
+                } else if (off + 2 <= end) {
+                    intVal = ((data[off] & 0xFFL) << 8) | (data[off + 1] & 0xFFL);
+                    off += 2;
+                    hasInt = true;
+                } else {
+                    break;
+                }
+            } else if (vtype == 0x08 || vtype == 0x09) {
+                if (off + 8 > end) break;
+                for (int i = 0; i < 8; i++) intVal = (intVal << 8) | (data[off + i] & 0xFFL);
+                off += 8;
+                hasInt = true;
+            } else if (vtype == 0x14 || vtype == 0x1E) {
+                if (off + 4 > end) break;
+                int vlen = ((data[off] & 0xFF) << 24) | ((data[off + 1] & 0xFF) << 16)
+                        | ((data[off + 2] & 0xFF) << 8) | (data[off + 3] & 0xFF);
+                off += 4;
+                if (vlen < 0 || off + vlen > end) break;
+                strVal = new String(data, off, vlen, StandardCharsets.UTF_8);
+                off += vlen;
+            } else if (vtype == 0x16) {
+                if (off + 4 > end) break;
+                int vlen = ((data[off] & 0xFF) << 24) | ((data[off + 1] & 0xFF) << 16)
+                        | ((data[off + 2] & 0xFF) << 8) | (data[off + 3] & 0xFF);
+                off += 4;
+                if (vlen < 0 || off + vlen > end) break;
+                parseNotifyTlvStream(data, off, off + vlen, out);
+                off += vlen;
+                continue;
+            } else {
+                break;
+            }
+
+            String k = key.toLowerCase(java.util.Locale.US);
+            if ("key-pause".equals(k) || "pause".equals(k)) {
+                out.add(new RemoteControlEvent(RemoteControlAction.PAUSE, 0L, -1, key));
+            } else if ("key-resume".equals(k) || "key-play".equals(k) || "resume".equals(k) || "play".equals(k)) {
+                out.add(new RemoteControlEvent(RemoteControlAction.RESUME, 0L, -1, key));
+            } else if ("key-next".equals(k) || "next".equals(k)) {
+                out.add(new RemoteControlEvent(RemoteControlAction.NEXT, 0L, -1, key));
+            } else if ("key-prev".equals(k) || "key-previous".equals(k) || "prev".equals(k) || "previous".equals(k)) {
+                out.add(new RemoteControlEvent(RemoteControlAction.PREVIOUS, 0L, -1, key));
+            } else if ("key-seek".equals(k) || "seek".equals(k)) {
+                long pos = 0L;
+                if (hasInt) pos = Math.max(0L, intVal);
+                else if (!strVal.isEmpty()) {
+                    try { pos = Math.max(0L, Long.parseLong(strVal.trim())); } catch (NumberFormatException ignored) {}
+                }
+                out.add(new RemoteControlEvent(RemoteControlAction.SEEK, pos, -1, key));
+            } else if ("volume".equals(k)) {
+                int vol = -1;
+                if (hasInt && intVal >= 0L && intVal <= 100L) vol = (int) intVal;
+                else if (!strVal.isEmpty()) {
+                    try {
+                        int v = Integer.parseInt(strVal.trim());
+                        if (v >= 0 && v <= 100) vol = v;
+                    } catch (NumberFormatException ignored) {}
+                }
+                if (vol >= 0) out.add(new RemoteControlEvent(RemoteControlAction.SET_VOLUME, 0L, vol, key));
+            }
+        }
     }
 
     private boolean sendRawLocked(int cmdType, int seqNum, byte[] payload) {
@@ -535,6 +777,31 @@ public class CmdSession {
                             safetyAuthLatch.countDown();
                         }
                     }
+                }
+                return;
+            }
+
+            // 业务阶段入向帧：先按状态化 Safety CBC 解密（避免遗漏解密导致后续 CBC IV 偏移）
+            byte[] plain = payload;
+            if (safetyActive.get() && decCipher != null && payload != null && payload.length >= 25) {
+                byte[] dec = decCipher.decryptBlob(payload);
+                if (dec != null) plain = dec;
+            }
+
+            if (cmd == CMD_PAUSE || cmd == CMD_RESUME || cmd == CMD_SET_POSITION) {
+                int ackCmd = cmd + 1;
+                synchronized (sendLock) {
+                    byte[] ackPayload = new byte[0];
+                    if (safetyActive.get() && encCipher != null) {
+                        ackPayload = encCipher.encryptBlob(ackPayload);
+                    }
+                    sendRawLocked(ackCmd, frameSeq, ackPayload);
+                }
+            }
+
+            if (cbs != null) {
+                for (RemoteControlEvent ev : decodeRemoteControlEvents(cmd, plain)) {
+                    cbs.onRemoteControl(ev);
                 }
             }
         } catch (Exception e) {

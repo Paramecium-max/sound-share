@@ -14,7 +14,6 @@ constexpr size_t kMaxTsPerRtp = 7; // 7 * 188 = 1316 bytes < MTU 1500
 void MultiAudioSender::ActiveTarget::start_writer() {
     if (tcp_data_sock != kInvalidSocket) {
         net::set_tcp_nodelay(tcp_data_sock, true);
-        net::set_socket_timeout(tcp_data_sock, SO_SNDTIMEO, 120);
     }
     writer_th = std::thread([this]() {
         TsPacketizer packetizer(stream_type);
@@ -60,35 +59,10 @@ void MultiAudioSender::ActiveTarget::start_writer() {
             const uint32_t rtp_ts = static_cast<uint32_t>(static_cast<uint64_t>(adj_pts) & 0xFFFFFFFFULL);
 
             wire_batch.clear();
-            uint32_t pkt_cnt = 0;
-            const size_t chunk_max = kMaxTsPerRtp * kTsPktSize;
-            size_t off = 0;
-
-            // 若本帧带 PAT+PMT+PCR（前 3 个 TS 包）且整帧超过 7 个 TS 包，先将 PAT+PMT+PCR 独立发包 (M=0)，
-            // 保证随后完整 Audio PES（如 >720B 的高码率 AAC 需 5~7 个 TS 包）绝不被 7-TS 边界腰斩触发 MiPCAudio ATSParser 报错！
-            if (ts_bytes.size() > chunk_max && ts_bytes.size() >= 4 * kTsPktSize &&
-                ts_bytes[0] == 0x47 && ((ts_bytes[1] & 0x1F) == 0x00 && ts_bytes[2] == 0x00)) {
-                const size_t psi_len = 3 * kTsPktSize;
-                auto psi_pkt = build_rtp_over_tcp_packet(
-                    rtp_seq++, rtp_ts, ts_bytes.data(), psi_len, 0xDEADBEEFU, false);
-                wire_batch.insert(wire_batch.end(), psi_pkt.begin(), psi_pkt.end());
-                ++pkt_cnt;
-                off = psi_len;
-            }
-
-            while (off < ts_bytes.size()) {
-                const size_t len = std::min(chunk_max, ts_bytes.size() - off);
-                // 严格按 RFC 3550：仅整帧最后一个 RTP 分片设置 Marker=1 (0xA1)，其余分片为 0 (0x21)，防止接收端提前 flush 半截 PES
-                const bool is_last = (off + len >= ts_bytes.size());
-                auto pkt = build_rtp_over_tcp_packet(
-                    rtp_seq++, rtp_ts, ts_bytes.data() + off, len, 0xDEADBEEFU, is_last);
-                wire_batch.insert(wire_batch.end(), pkt.begin(), pkt.end());
-                ++pkt_cnt;
-                off += len;
-            }
+            const size_t pkt_cnt = append_rtp_batch(wire_batch, ts_bytes, rtp_seq, rtp_ts);
 
             if (stop_requested.load()) break;
-            const auto send_res = net::send_all_checked(tcp_data_sock, wire_batch.data(), wire_batch.size());
+            const auto send_res = connection->write(wire_batch.data(), wire_batch.size(), 120, &stop_requested);
             if (send_res == net::SendAllStatus::Ok) {
                 consecutive_timeouts = 0;
                 last_pts_90k = adj_pts;
@@ -111,6 +85,10 @@ void MultiAudioSender::ActiveTarget::start_writer() {
                 break;
             }
         }
+        if (!healthy.load() && !stop_requested.load()) {
+            connection->abort();
+            if (on_failure) on_failure();
+        }
     });
 }
 
@@ -127,7 +105,7 @@ void MultiAudioSender::ActiveTarget::stop_and_join() {
     q_cv.notify_all();
     if (writer_th.joinable()) writer_th.join();
     if (owns_socket && tcp_data_sock != kInvalidSocket) {
-        net::close_socket(tcp_data_sock);
+        connection.reset();
         tcp_data_sock = kInvalidSocket;
     }
 }
@@ -147,7 +125,9 @@ void MultiAudioSender::add_or_update_target(
     SocketHandle data_sock,
     int32_t delay_bias_ms,
     bool owns_socket,
-    uint64_t session_id) {
+    uint64_t session_id,
+    std::shared_ptr<net::ConnectionWriter> connection,
+    std::function<void()> on_failure) {
     std::shared_ptr<ActiveTarget> replaced;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -155,7 +135,7 @@ void MultiAudioSender::add_or_update_target(
         if (it != targets_.end()) {
             // 防止过期的旧会话回写覆盖新会话目标
             if (session_id != 0 && it->second->session_id != 0 && session_id < it->second->session_id) {
-                if (owns_socket && data_sock != kInvalidSocket) net::close_socket(data_sock);
+                if (!connection && owns_socket && data_sock != kInvalidSocket) net::close_socket(data_sock);
                 return;
             }
             replaced = std::move(it->second);
@@ -167,6 +147,9 @@ void MultiAudioSender::add_or_update_target(
         node->peer_ip = peer_ip;
         node->tcp_data_sock = data_sock;
         node->owns_socket = owns_socket;
+        node->connection = connection ? std::move(connection)
+                                      : std::make_shared<net::ConnectionWriter>(data_sock, owns_socket);
+        node->on_failure = std::move(on_failure);
         node->stream_type = stream_type_;
         node->delay_bias_ms.store(std::clamp(delay_bias_ms, -300, 300));
         node->healthy.store(data_sock != kInvalidSocket);
@@ -229,6 +212,27 @@ bool MultiAudioSender::has_streaming_target() const {
         const auto& target = *entry.second;
         return target.healthy.load() && target.tcp_data_sock != kInvalidSocket;
     });
+}
+
+size_t MultiAudioSender::append_rtp_batch(std::vector<uint8_t>& wire, const std::vector<uint8_t>& ts,
+                                          uint16_t& sequence, uint32_t timestamp) {
+    constexpr size_t chunk_max = kMaxTsPerRtp * kTsPktSize;
+    size_t count = 0;
+    size_t offset = 0;
+    auto append = [&](size_t len) {
+        auto packet = build_rtp_over_tcp_packet(sequence++, timestamp, ts.data() + offset,
+                                                len, 0xDEADBEEFU, offset + len == ts.size());
+        wire.insert(wire.end(), packet.begin(), packet.end());
+        offset += len;
+        ++count;
+    };
+
+    // Keep PSI/PCR in its own RTP frame when it would otherwise split the PES earlier.
+    if (ts.size() > chunk_max && ts[0] == 0x47 && (ts[1] & 0x1F) == 0 && ts[2] == 0) {
+        append(3 * kTsPktSize);
+    }
+    while (offset < ts.size()) append(std::min(chunk_max, ts.size() - offset));
+    return count;
 }
 
 std::vector<uint8_t> MultiAudioSender::build_rtp_over_tcp_packet(

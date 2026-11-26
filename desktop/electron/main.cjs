@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const { SmtcBridge } = require('./smtc_bridge.cjs');
 
 const MAX_AUTO_RESTARTS = 3;
 const STARTUP_TIMEOUT_MS = 8000;
@@ -9,6 +10,7 @@ const STARTUP_TIMEOUT_MS = 8000;
 let mainWindow = null;
 let sidecarProc = null;
 let sidecarConfig = null;
+let smtcBridge = null;
 let isQuitting = false;
 let restartCount = 0;
 let restartTimer = null;
@@ -226,6 +228,9 @@ function createWindow() {
 
   mainWindow.webContents.on('did-finish-load', () => {
     notifySidecarStatus();
+    if (smtcBridge && smtcBridge.lastTrack) {
+      mainWindow.webContents.send('media:systemTrack', smtcBridge.lastTrack);
+    }
   });
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
@@ -255,8 +260,25 @@ ipcMain.handle('dialog:openWav', async () => {
   });
   return res.canceled ? null : res.filePaths[0];
 });
+ipcMain.handle('dialog:openLrc', async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: '选择 LRC 歌词文件',
+    filters: [{ name: 'LRC Lyrics', extensions: ['lrc', 'txt'] }],
+    properties: ['openFile'],
+  });
+  return res.canceled ? null : res.filePaths[0];
+});
+ipcMain.handle('media:dispatchControl', async (_ev, action, positionMs) => {
+  return smtcBridge ? smtcBridge.dispatchAction(action, positionMs) : false;
+});
 
 app.whenReady().then(async () => {
+  smtcBridge = new SmtcBridge((track) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('media:systemTrack', track);
+    }
+  });
+  smtcBridge.start();
   try {
     await startSidecar();
   } catch (err) {
@@ -267,6 +289,10 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  if (smtcBridge) {
+    smtcBridge.stop();
+    smtcBridge = null;
+  }
   if (restartTimer) {
     clearTimeout(restartTimer);
     restartTimer = null;

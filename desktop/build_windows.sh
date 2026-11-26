@@ -25,6 +25,7 @@ mkdir -p "${CORE_DIR}/build-win64"
   -D_WIN32_WINNT=0x0A00 -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
   -I"${CORE_DIR}/include" -I"${CORE_DIR}/src" \
   "${CORE_DIR}/src/crypto/mini_crypto.cpp" \
+  "${CORE_DIR}/src/util/json.cpp" \
   "${CORE_DIR}/src/platform/net_platform.cpp" \
   "${CORE_DIR}/src/sync/master_clock.cpp" \
   "${CORE_DIR}/src/sync/timer_service.cpp" \
@@ -35,12 +36,13 @@ mkdir -p "${CORE_DIR}/build-win64"
   "${CORE_DIR}/src/media/rtp_sender.cpp" \
   "${CORE_DIR}/src/media/aac_encoder.cpp" \
   "${CORE_DIR}/src/media/audio_pipeline.cpp" \
+  "${CORE_DIR}/src/media/media_control.cpp" \
   "${CORE_DIR}/src/rtsp/wfd_rtsp_server.cpp" \
   "${CORE_DIR}/src/engine/multiroom_engine.cpp" \
   "${CORE_DIR}/src/c_api/miplay_c_api.cpp" \
   "${CORE_DIR}/src/sidecar/ws_server.cpp" \
   "${CORE_DIR}/src/sidecar/main_sidecar.cpp" \
-  -lws2_32 -liphlpapi -lole32 -luuid \
+  -lws2_32 -liphlpapi -lole32 -luuid -luser32 \
   -static \
   -o "${CORE_DIR}/build-win64/miplay_core_sidecar.exe"
 
@@ -62,7 +64,7 @@ mv "${STAGE_DIR}/electron.exe" "${STAGE_DIR}/MiPlayMultiRoom.exe"
 rm -rf "${STAGE_DIR}/resources/default_app.asar"
 mkdir -p "${STAGE_DIR}/resources/app/electron" "${STAGE_DIR}/resources/app/dist" "${STAGE_DIR}/resources/bin"
 cp "${DESKTOP_DIR}/package.json" "${STAGE_DIR}/resources/app/"
-cp "${DESKTOP_DIR}/electron/main.cjs" "${DESKTOP_DIR}/electron/preload.cjs" "${STAGE_DIR}/resources/app/electron/"
+cp "${DESKTOP_DIR}/electron/main.cjs" "${DESKTOP_DIR}/electron/preload.cjs" "${DESKTOP_DIR}/electron/smtc_bridge.cjs" "${STAGE_DIR}/resources/app/electron/"
 cp -r "${DESKTOP_DIR}/dist/"* "${STAGE_DIR}/resources/app/dist/"
 cp "${CORE_DIR}/build-win64/miplay_core_sidecar.exe" "${STAGE_DIR}/resources/bin/miplay_core_sidecar.exe"
 

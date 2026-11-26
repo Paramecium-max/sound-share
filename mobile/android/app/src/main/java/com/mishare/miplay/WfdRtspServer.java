@@ -2,7 +2,6 @@ package com.mishare.miplay;
 
 import android.util.Log;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -24,7 +23,8 @@ public class WfdRtspServer {
     private static final int MAX_PENDING_SOCKETS = 4;
 
     public interface Callbacks {
-        void onStreamReady(String deviceId, String peerIp, Socket dataSock);
+        void onStreamReady(String deviceId, String peerIp, ConnectionWriter writer, Runnable failure);
+        void onStopMedia(String deviceId);
         void onLatencyReport(String deviceId, int latencyMs, int bitrate, long rtpPacketNum);
         void onSessionClosed(String deviceId);
         void onStatus(String deviceId, String status);
@@ -35,6 +35,7 @@ public class WfdRtspServer {
     private final Object socketLock = new Object();
     private ServerSocket serverSocket;
     private Socket activeCtrlSock;
+    private ConnectionWriter activeCtrlWriter;
     private Socket activeDataSock;
     private volatile int listenPort = 0;
     private String deviceId;
@@ -84,6 +85,7 @@ public class WfdRtspServer {
 
     public void stop() {
         Socket ctrl;
+        ConnectionWriter writer;
         Socket data;
         ServerSocket listener;
         List<Socket> pending;
@@ -93,7 +95,9 @@ public class WfdRtspServer {
             listener = serverSocket;
             serverSocket = null;
             ctrl = activeCtrlSock;
+            writer = activeCtrlWriter;
             activeCtrlSock = null;
+            activeCtrlWriter = null;
             data = activeDataSock;
             activeDataSock = null;
             pending = new ArrayList<>(pendingMultiPorts.values());
@@ -110,9 +114,7 @@ public class WfdRtspServer {
                 String td = "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n"
                         + "CSeq: 99\r\nContent-Type: text/parameters\r\n"
                         + "Content-Length: " + body.length() + "\r\n\r\n" + body;
-                OutputStream os = ctrl.getOutputStream();
-                os.write(td.getBytes(StandardCharsets.UTF_8));
-                os.flush();
+                sendStr(writer, td);
             } catch (Exception ignored) {}
             try { ctrl.shutdownOutput(); } catch (Exception ignored) {}
             try { ctrl.close(); } catch (Exception ignored) {}
@@ -143,8 +145,10 @@ public class WfdRtspServer {
                         closeSocket(client);
                     } else if (activeCtrlSock == null) {
                         activeCtrlSock = client;
+                        ConnectionWriter writer = new ConnectionWriter(client);
+                        activeCtrlWriter = writer;
                         String peerIp = client.getInetAddress().getHostAddress();
-                        new Thread(() -> handleControl(client, peerIp), "MiPlay-RTSPCtrl-" + deviceId).start();
+                        new Thread(() -> handleControl(writer, peerIp), "MiPlay-RTSPCtrl-" + deviceId).start();
                     } else if (activeCtrlSock.getInetAddress().equals(client.getInetAddress())
                             && pendingMultiPorts.size() < MAX_PENDING_SOCKETS) {
                         Socket replaced = pendingMultiPorts.put(client.getPort(), client);
@@ -206,17 +210,16 @@ public class WfdRtspServer {
         return "";
     }
 
-    private static void sendStr(OutputStream out, String s) throws Exception {
-        out.write(s.getBytes(StandardCharsets.UTF_8));
-        out.flush();
+    private static void sendStr(ConnectionWriter out, String s) throws Exception {
+        out.write(s.getBytes(StandardCharsets.UTF_8), 120);
     }
 
-    private void handleControl(Socket ctrl, String peerIp) {
+    private void handleControl(ConnectionWriter out, String peerIp) {
+        Socket ctrl = out.socket;
         Socket dataSock = null;
         try {
             ctrl.setSoTimeout(500);
             InputStream in = ctrl.getInputStream();
-            OutputStream out = ctrl.getOutputStream();
 
             report("RTSP 已反连 (" + peerIp + ")，正在 M1 OPTIONS 握手...");
             long ipU32 = ipv4ToUint32(senderIp);
@@ -371,7 +374,10 @@ public class WfdRtspServer {
                             report(dataSock != null
                                     ? "RTSP M7 同步推流中 (MultiPort，控制 " + ctrl.getPort() + "，音频 " + dataSock.getPort() + ")"
                                     : "RTSP M7 同步推流中 (TCP Interleaved，接收端未请求 MultiPort)");
-                            if (cbs != null) cbs.onStreamReady(deviceId, peerIp, dataSock != null ? dataSock : ctrl);
+                            if (cbs != null) {
+                                ConnectionWriter media = dataSock != null ? new ConnectionWriter(dataSock) : out;
+                                cbs.onStreamReady(deviceId, peerIp, media, out::abort);
+                            }
                         }
                     } else if (msg.startsWith("GET_PARAMETER ")) {
                         sendStr(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
@@ -385,6 +391,7 @@ public class WfdRtspServer {
                             cbs.onLatencyReport(deviceId, lat, br, pkts);
                         }
                     } else if (msg.startsWith("TEARDOWN ")) {
+                        if (streaming && cbs != null) cbs.onStopMedia(deviceId);
                         sendStr(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\n\r\n");
                         return;
                     }
@@ -399,6 +406,7 @@ public class WfdRtspServer {
                 if (ownsSession) {
                     running.set(false);
                     activeCtrlSock = null;
+                    activeCtrlWriter = null;
                     activeDataSock = null;
                     if (serverSocket != null) {
                         try { serverSocket.close(); } catch (Exception ignored) {}
@@ -410,6 +418,7 @@ public class WfdRtspServer {
                 }
             }
             if (ownsSession) {
+                if (cbs != null) cbs.onStopMedia(deviceId);
                 closeSocket(dataSock);
                 closeSocket(ctrl);
                 if (!stopping.get() && cbs != null) cbs.onSessionClosed(deviceId);

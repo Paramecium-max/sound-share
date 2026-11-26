@@ -5,12 +5,14 @@ import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.util.Log;
 import java.io.ByteArrayOutputStream;
-import java.io.OutputStream;
+import java.io.IOException;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.function.Consumer;
+import java.util.function.IntSupplier;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -57,12 +59,14 @@ public class TsAndRtpSender {
         public final long sessionId;
         public final String peerIp;
         public final Socket sock;
-        public final OutputStream out;
+        private final ConnectionWriter out;
+        private final Runnable onFailure;
         public int rtpSeq = 0;
         public volatile int delayBiasMs = 0;
         public volatile long packetsSent = 0;
         public volatile long droppedFrames = 0;
         public volatile boolean healthy = true;
+        private final AtomicBoolean forcePsi = new AtomicBoolean(true);
         public final AtomicBoolean stopRequested = new AtomicBoolean(false);
         private final ArrayBlockingQueue<AudioFrame> queue = new ArrayBlockingQueue<>(MAX_QUEUED_FRAMES);
         private final TsPacker packer;
@@ -71,14 +75,16 @@ public class TsAndRtpSender {
         private long lastPts = -1;
         public final Thread writerThread;
 
-        private TargetNode(String id, long sessionId, String ip, Socket s, int bias, int streamType) throws Exception {
+        private TargetNode(String id, long sessionId, String ip, ConnectionWriter writer, int bias, int streamType, Runnable onFailure) {
             this.deviceId = id;
             this.sessionId = sessionId;
             this.peerIp = ip;
+            Socket s = writer.socket;
             this.sock = s;
+            this.onFailure = onFailure;
             try { s.setTcpNoDelay(true); } catch (Exception ignored) {}
             try { s.setSendBufferSize(Math.max(s.getSendBufferSize(), 65536)); } catch (Exception ignored) {}
-            this.out = s.getOutputStream();
+            this.out = writer;
             this.delayBiasMs = bias;
             this.packer = new TsPacker(streamType);
             this.frameDuration90k = streamType == STREAM_WFD_LPCM ? 900 : 1920;
@@ -98,6 +104,10 @@ public class TsAndRtpSender {
                     break;
                 } catch (Exception e) {
                     healthy = false;
+                    if (!stopRequested.get()) {
+                        out.abort();
+                        onFailure.run();
+                    }
                     break;
                 }
             }
@@ -105,87 +115,30 @@ public class TsAndRtpSender {
 
         private void writeFrame(AudioFrame frame) throws Exception {
             long pts = Math.max(0, frame.pts + delayBiasMs * 90L);
-            // A lower delay may make buffered access units overlap already-sent audio.
-            // Drop those whole units before assigning transport continuity counters.
+            // Discard overlapping AUs before allocating continuity counters.
             if (lastPts >= 0 && pts < lastPts + frameDuration90k) {
                 droppedFrames++;
+                forcePsi.set(true);
                 return;
             }
-            lastPts = pts;
-            byte[] ts = packer.pack(frame.data, pts);
+            byte[] ts = packer.pack(frame.data, pts, forcePsi.getAndSet(false));
             wireBatch.reset();
-            int pktCount = 0;
-            byte[] hdr = new byte[16];
-            final int chunkMax = 7 * 188;
-            int off = 0;
-
-            // 若本帧含 PAT+PMT+PCR（前 3 个 TS 包）且整帧超 7 个 TS 包（如 >720B 的高码率 AAC 需 5 个 Audio TS 包），
-            // 先独立发出 PAT+PMT+PCR (Marker=0, 0x21)，确保随后的 Audio PES 完整落入单个 RTP 包内，
-            // 杜绝在 4*184-16=720B 边界被腰斩导致 MiPCAudio ATSParser 报 PES length insufficient！
-            if (ts.length > chunkMax && ts.length >= 4 * 188
-                    && ts[0] == 0x47 && (ts[1] & 0x1F) == 0 && ts[2] == 0) {
-                int psiLen = 3 * 188;
-                int size = 12 + psiLen;
-                int seq = rtpSeq++ & 0xFFFF;
-                hdr[0] = 0x24;
-                hdr[1] = 0x00;
-                hdr[2] = (byte) (size >>> 8);
-                hdr[3] = (byte) size;
-                hdr[4] = (byte) 0x80;
-                hdr[5] = (byte) 0x21; // Marker = 0
-                hdr[6] = (byte) (seq >>> 8);
-                hdr[7] = (byte) seq;
-                hdr[8] = (byte) (pts >>> 24);
-                hdr[9] = (byte) (pts >>> 16);
-                hdr[10] = (byte) (pts >>> 8);
-                hdr[11] = (byte) pts;
-                hdr[12] = (byte) 0xDE;
-                hdr[13] = (byte) 0xAD;
-                hdr[14] = (byte) 0xBE;
-                hdr[15] = (byte) 0xEF;
-                wireBatch.write(hdr, 0, 16);
-                wireBatch.write(ts, 0, psiLen);
-                pktCount++;
-                off = psiLen;
-            }
-
-            while (off < ts.length && !stopRequested.get()) {
-                int length = Math.min(chunkMax, ts.length - off);
-                boolean isLast = (off + length >= ts.length);
-                int size = 12 + length;
-                int seq = rtpSeq++ & 0xFFFF;
-                hdr[0] = 0x24;
-                hdr[1] = 0x00;
-                hdr[2] = (byte) (size >>> 8);
-                hdr[3] = (byte) size;
-                hdr[4] = (byte) 0x80;
-                hdr[5] = (byte) (isLast ? 0xA1 : 0x21); // 仅整帧最后一个 RTP 分片置 Marker=1
-                hdr[6] = (byte) (seq >>> 8);
-                hdr[7] = (byte) seq;
-                hdr[8] = (byte) (pts >>> 24);
-                hdr[9] = (byte) (pts >>> 16);
-                hdr[10] = (byte) (pts >>> 8);
-                hdr[11] = (byte) pts;
-                hdr[12] = (byte) 0xDE;
-                hdr[13] = (byte) 0xAD;
-                hdr[14] = (byte) 0xBE;
-                hdr[15] = (byte) 0xEF;
-                wireBatch.write(hdr, 0, 16);
-                wireBatch.write(ts, off, length);
-                pktCount++;
-                off += length;
-            }
-            if (!stopRequested.get() && wireBatch.size() > 0) {
-                wireBatch.writeTo(out);
-                out.flush();
-                packetsSent += pktCount;
+            int count = appendRtpBatch(wireBatch, ts, rtpSeq, pts);
+            if (!stopRequested.get() && count > 0) {
+                out.write(wireBatch.toByteArray(), 120);
+                rtpSeq = (rtpSeq + count) & 0xffff;
+                lastPts = pts;
+                packetsSent += count;
             }
         }
 
         private void enqueueFrame(AudioFrame frame) {
             if (!healthy || stopRequested.get()) return;
             while (!queue.offer(frame)) {
-                if (queue.poll() != null) droppedFrames++;
+                if (queue.poll() != null) {
+                    droppedFrames++;
+                    forcePsi.set(true);
+                }
             }
         }
 
@@ -222,7 +175,38 @@ public class TsAndRtpSender {
         }
     }
 
-    private static class TsPacker {
+    static int appendRtpBatch(ByteArrayOutputStream wire, byte[] ts, int seq, long pts) {
+        final int chunkMax = 7 * 188;
+        int count = 0;
+        int off = 0;
+        if (ts.length > chunkMax && ts[0] == 0x47 && (ts[1] & 0x1f) == 0 && ts[2] == 0) {
+            off = 3 * 188;
+            appendRtpFragment(wire, ts, 0, off, seq++, pts);
+            count++;
+        }
+        while (off < ts.length) {
+            int length = Math.min(chunkMax, ts.length - off);
+            appendRtpFragment(wire, ts, off, length, seq++, pts);
+            off += length;
+            count++;
+        }
+        return count;
+    }
+
+    private static void appendRtpFragment(ByteArrayOutputStream wire, byte[] ts, int off,
+                                          int length, int seq, long pts) {
+        int size = 12 + length;
+        byte[] header = {
+                0x24, 0, (byte) (size >>> 8), (byte) size, (byte) 0x80,
+                (byte) (off + length == ts.length ? 0xa1 : 0x21), (byte) (seq >>> 8), (byte) seq,
+                (byte) (pts >>> 24), (byte) (pts >>> 16), (byte) (pts >>> 8), (byte) pts,
+                (byte) 0xde, (byte) 0xad, (byte) 0xbe, (byte) 0xef,
+        };
+        wire.write(header, 0, header.length);
+        wire.write(ts, off, length);
+    }
+
+    static class TsPacker {
         int streamType;
         int ccPat = 0, ccPmt = 0, ccAudio = 0;
         long frameCounter = 0;
@@ -292,9 +276,9 @@ public class TsAndRtpSender {
             out.write(pkt, 0, 188);
         }
 
-        byte[] pack(byte[] payload, long pts90k) {
+        byte[] pack(byte[] payload, long pts90k, boolean forcePsi) {
             ByteArrayOutputStream out = new ByteArrayOutputStream(188 * 8);
-            if (frameCounter % 4 == 0) {
+            if (forcePsi || frameCounter % 4 == 0) {
                 appendPat(out);
                 appendPmt(out);
                 appendPcr(out, pts90k);
@@ -357,28 +341,115 @@ public class TsAndRtpSender {
     private final Object lock = new Object();
     private final ConcurrentHashMap<String, TargetNode> targets = new ConcurrentHashMap<>();
     private final ArrayDeque<AudioFrame> pendingPcm = new ArrayDeque<>();
-    private final MediaCodec.BufferInfo outputInfo = new MediaCodec.BufferInfo();
-    private MediaCodec aacEncoder;
+    private Encoder aacEncoder;
+    private final EncoderFactory encoderFactory;
+    private final Consumer<RuntimeException> reportCodecError;
     private volatile boolean useLpcm = false;
     private volatile int sampleRate = 48000;
-    private long lastOutputPts90k = -1L;
+    private final ArrayDeque<Long> acceptedPcmPts = new ArrayDeque<>();
+    private int codecFailures;
+    private Runnable onEncoderFailed;
     private boolean reportedInputOverflow;
-    private boolean reportedCodecError;
+
+    static final class EncodedAudio {
+        final byte[] data;
+        final long ptsUs;
+        EncodedAudio(byte[] data, long ptsUs) {
+            this.data = data;
+            this.ptsUs = ptsUs;
+        }
+    }
+
+    interface Encoder {
+        int acquireInput();
+        ByteBuffer inputBuffer(int index);
+        void submitInput(int index, int size, long ptsUs);
+        EncodedAudio takeOutput();
+        void close();
+    }
+
+    interface EncoderFactory {
+        Encoder create(int rate) throws Exception;
+    }
+
+    public TsAndRtpSender() {
+        this(NativeEncoder::new, error -> Log.e("MiPlayRTP", "AAC encoding failed", error));
+    }
+
+    TsAndRtpSender(EncoderFactory encoderFactory, Consumer<RuntimeException> reportCodecError) {
+        this.encoderFactory = encoderFactory;
+        this.reportCodecError = reportCodecError;
+    }
+
+    private static final class NativeEncoder implements Encoder {
+        private final MediaCodec codec;
+        private final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+
+        NativeEncoder(int rate) throws IOException {
+            codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+            try {
+                MediaFormat fmt = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, rate, 2);
+                fmt.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+                fmt.setInteger(MediaFormat.KEY_BIT_RATE, 256000);
+                fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384);
+                codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                codec.start();
+            } catch (RuntimeException error) {
+                close();
+                throw error;
+            }
+        }
+
+        @Override public int acquireInput() { return codec.dequeueInputBuffer(0); }
+
+        @Override public ByteBuffer inputBuffer(int index) { return codec.getInputBuffer(index); }
+
+        @Override public void submitInput(int index, int size, long ptsUs) {
+            codec.queueInputBuffer(index, 0, size, ptsUs, 0);
+        }
+
+        @Override public EncodedAudio takeOutput() {
+            for (int attempts = 0; attempts < 16; attempts++) {
+                int index = codec.dequeueOutputBuffer(info, 0);
+                if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ||
+                    index == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) continue;
+                if (index < 0) return null;
+                try {
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 || info.size == 0) continue;
+                    ByteBuffer output = codec.getOutputBuffer(index);
+                    if (output == null || info.size < 0 || info.size > 8191 - 7) {
+                        throw new IllegalStateException("Invalid AAC output buffer");
+                    }
+                    byte[] raw = new byte[info.size];
+                    output.position(info.offset);
+                    output.get(raw);
+                    return new EncodedAudio(raw, info.presentationTimeUs);
+                } finally {
+                    codec.releaseOutputBuffer(index, false);
+                }
+            }
+            throw new IllegalStateException("AAC output did not settle");
+        }
+
+        @Override public void close() {
+            try { codec.stop(); } catch (RuntimeException ignored) {}
+            try { codec.release(); } catch (RuntimeException ignored) {}
+        }
+    }
 
     /**
      * 配置编码器并返回实际生效的音频配置（SS-07：AAC 初始化失败回退 LPCM 时，外层 RTSP 与采集帧长立即同步）
      */
-    public AudioConfig configure(boolean preferLpcm, int reqSampleRate) {
+    public AudioConfig configure(boolean preferLpcm, int reqSampleRate, Runnable onEncoderFailed) {
         synchronized (lock) {
+            pendingPcm.clear();
             releaseEncoder();
+            this.onEncoderFailed = onEncoderFailed;
             this.sampleRate = (reqSampleRate == 44100 && preferLpcm) ? 44100 : 48000;
             this.useLpcm = preferLpcm;
-            this.lastOutputPts90k = -1L;
+            this.codecFailures = 0;
             this.reportedInputOverflow = false;
-            this.reportedCodecError = false;
-            if (!preferLpcm) {
-                initAacEncoder(this.sampleRate);
-            }
+            if (!preferLpcm && !initAacEncoder(this.sampleRate)) this.useLpcm = true;
             int frameSamples = this.useLpcm ? (this.sampleRate == 44100 ? 441 : 480) : 1024;
             return new AudioConfig(this.useLpcm, this.sampleRate, frameSamples);
         }
@@ -388,44 +459,42 @@ public class TsAndRtpSender {
         return useLpcm;
     }
 
-    private void initAacEncoder(int sr) {
+    private boolean initAacEncoder(int sr) {
         try {
-            aacEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-            MediaFormat fmt = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sr, 2);
-            fmt.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
-            fmt.setInteger(MediaFormat.KEY_BIT_RATE, 256000);
-            fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384);
-            aacEncoder.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            aacEncoder.start();
+            aacEncoder = encoderFactory.create(sr);
+            return true;
         } catch (Exception e) {
             releaseEncoder();
-            this.useLpcm = true;
+            return false;
         }
     }
 
     private void releaseEncoder() {
-        pendingPcm.clear();
+        acceptedPcmPts.clear();
         if (aacEncoder != null) {
-            try { aacEncoder.stop(); } catch (Exception ignored) {}
-            try { aacEncoder.release(); } catch (Exception ignored) {}
+            aacEncoder.close();
             aacEncoder = null;
         }
     }
 
-    public void addTarget(String id, long sessionId, String ip, Socket sock, int delayBiasMs) {
+    public void addTarget(String id, long sessionId, String ip, ConnectionWriter writer,
+                          int delayBiasMs, Runnable failure) {
         try {
             TargetNode prev = targets.get(id);
             if (prev != null && sessionId > 0 && prev.sessionId > sessionId) {
-                try { sock.close(); } catch (Exception ignored) {}
+                writer.abort();
                 return;
             }
             int streamType = useLpcm ? STREAM_WFD_LPCM : STREAM_ADTS_AAC;
-            TargetNode node = new TargetNode(id, sessionId, ip, sock, delayBiasMs, streamType);
+            TargetNode node = new TargetNode(id, sessionId, ip, writer, delayBiasMs, streamType, failure);
             TargetNode replaced = targets.put(id, node);
             if (replaced != null) {
                 replaced.stopAndClose();
             }
-        } catch (Exception ignored) {}
+        } catch (RuntimeException error) {
+            writer.abort();
+            failure.run();
+        }
     }
 
     public void removeTarget(String id, long sessionId) {
@@ -468,7 +537,9 @@ public class TsAndRtpSender {
             n.stopAndClose();
         }
         synchronized (lock) {
+            pendingPcm.clear();
             releaseEncoder();
+            onEncoderFailed = null;
         }
     }
 
@@ -505,81 +576,81 @@ public class TsAndRtpSender {
         return out;
     }
 
-    /**
-     * SS-08: 将 MediaCodec 输出帧的 presentationTimeUs 转换为精确的 90kHz PTS，
-     * 并在单次 drain 产生多帧输出时保证单调递增（48kHz AAC 帧步进 = 1920 ticks）。
-     */
-    public static long computeOutputPts90k(long outputPtsUs, long fallbackPts90k, long prevPts90k, int sampleRate) {
-        long pts90k = (outputPtsUs >= 0) ? ((outputPtsUs * 90L + 500L) / 1000L) : fallbackPts90k;
-        long frameStep90k = (1024L * 90000L) / Math.max(1, sampleRate); // 48kHz -> 1920
-        if (prevPts90k >= 0) {
-            pts90k = Math.max(pts90k, prevPts90k + frameStep90k);
-        }
-        return pts90k;
-    }
-
-    public void broadcastPcmFrame(byte[] stereoPcmLe, long basePts90k) {
+    public void broadcastPcmFrame(byte[] stereoPcmLe, long samplePts90k,
+                                  IntSupplier baseDelayMs) {
         synchronized (lock) {
             if (useLpcm) {
-                if (!targets.isEmpty()) fanoutEncodedFrame(wrapWfdLpcm(stereoPcmLe, sampleRate), basePts90k);
+                if (!targets.isEmpty()) {
+                    fanoutEncodedFrame(wrapWfdLpcm(stereoPcmLe, sampleRate),
+                                       samplePts90k + baseDelayMs.getAsInt() * 90L);
+                }
                 return;
             }
-            if (aacEncoder == null) return;
-            if (targets.isEmpty() && pendingPcm.isEmpty()) return;
+            if (aacEncoder == null || (targets.isEmpty() && pendingPcm.isEmpty())) return;
+            if (stereoPcmLe.length != 1024 * 4) throw new IllegalArgumentException("AAC-LC needs 1024 stereo samples");
 
-            try {
-                drainAac(basePts90k);
-                if (pendingPcm.size() == MAX_PENDING_PCM_FRAMES) {
-                    pendingPcm.removeFirst();
-                    if (!reportedInputOverflow) {
-                        reportedInputOverflow = true;
-                        Log.w("MiPlayRTP", "AAC input backpressure exceeded the PCM buffer");
-                    }
+            if (pendingPcm.size() == MAX_PENDING_PCM_FRAMES) {
+                pendingPcm.removeFirst();
+                if (!reportedInputOverflow) {
+                    reportedInputOverflow = true;
+                    Log.w("MiPlayRTP", "AAC input backpressure exceeded the PCM buffer");
                 }
-                pendingPcm.addLast(new AudioFrame(stereoPcmLe.clone(), basePts90k));
+            }
+            pendingPcm.addLast(new AudioFrame(stereoPcmLe.clone(), samplePts90k));
+            try {
+                drainAac(baseDelayMs);
                 while (!pendingPcm.isEmpty()) {
-                    int index = aacEncoder.dequeueInputBuffer(0);
+                    if (acceptedPcmPts.size() >= 64) throw new IllegalStateException("AAC output stalled");
+                    int index = aacEncoder.acquireInput();
                     if (index < 0) break;
-                    AudioFrame frame = pendingPcm.removeFirst();
-                    ByteBuffer input = aacEncoder.getInputBuffer(index);
+                    AudioFrame frame = pendingPcm.getFirst();
+                    ByteBuffer input = aacEncoder.inputBuffer(index);
                     if (input == null || input.capacity() < frame.data.length) {
-                        throw new IllegalStateException("AAC input buffer is too small");
+                        throw new IllegalStateException("AAC input buffer is unavailable or too small");
                     }
                     input.clear();
                     input.put(frame.data);
-                    aacEncoder.queueInputBuffer(index, 0, frame.data.length, frame.pts * 1000L / 90L, 0);
+                    aacEncoder.submitInput(index, frame.data.length, frame.pts * 1000L / 90L);
+                    pendingPcm.removeFirst();
+                    acceptedPcmPts.addLast(frame.pts);
                 }
-                drainAac(basePts90k);
+                drainAac(baseDelayMs);
             } catch (RuntimeException error) {
-                if (!reportedCodecError) {
-                    reportedCodecError = true;
-                    Log.e("MiPlayRTP", "AAC encoding failed", error);
+                // Releasing the codec returns every acquired slot, including an unsubmitted slot.
+                reportCodecError.accept(error);
+                releaseEncoder();
+                if (++codecFailures >= 3 || !initAacEncoder(sampleRate)) {
+                    pendingPcm.clear();
+                    if (onEncoderFailed != null) onEncoderFailed.run();
                 }
             }
         }
     }
 
-    private void drainAac(long fallbackPts) {
-        while (true) {
-            int index = aacEncoder.dequeueOutputBuffer(outputInfo, 0);
-            if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ||
-                index == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) continue;
-            if (index < 0) return;
-            try {
-                ByteBuffer output = aacEncoder.getOutputBuffer(index);
-                if (output == null || outputInfo.size == 0 ||
-                    (outputInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) continue;
-                byte[] raw = new byte[outputInfo.size];
-                output.position(outputInfo.offset);
-                output.get(raw);
-                long pts = computeOutputPts90k(outputInfo.presentationTimeUs, fallbackPts,
-                                               lastOutputPts90k, sampleRate);
-                lastOutputPts90k = pts;
-                fanoutEncodedFrame(wrapAdts(raw, sampleRate), pts);
-            } finally {
-                aacEncoder.releaseOutputBuffer(index, false);
+    private void drainAac(IntSupplier baseDelayMs) {
+        for (int attempts = 0; attempts < 64; attempts++) {
+            EncodedAudio output = aacEncoder.takeOutput();
+            if (output == null) return;
+            if (acceptedPcmPts.isEmpty()) throw new IllegalStateException("AAC output has no corresponding PCM");
+            // Match the codec timestamp on the PCM timeline. For absent or vendor-primed timestamps,
+            // the ordered accepted-input queue supplies the exact 90 kHz value.
+            Long matched = null;
+            if (output.ptsUs >= 0) {
+                for (long accepted : acceptedPcmPts) {
+                    if (Math.abs(accepted * 1000L / 90L - output.ptsUs) <= 1) {
+                        matched = accepted;
+                        break;
+                    }
+                }
             }
+            if (matched != null) {
+                while (!acceptedPcmPts.getFirst().equals(matched)) acceptedPcmPts.removeFirst();
+            }
+            long pts = acceptedPcmPts.removeFirst() + baseDelayMs.getAsInt() * 90L;
+            fanoutEncodedFrame(wrapAdts(output.data, sampleRate), pts);
+            codecFailures = 0;
         }
+        throw new IllegalStateException("AAC output did not settle");
     }
 
     private void fanoutEncodedFrame(byte[] encodedFrame, long pts) {

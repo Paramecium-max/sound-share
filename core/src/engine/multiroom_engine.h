@@ -8,9 +8,11 @@
 #include "rtsp/wfd_rtsp_server.h"
 #include "sync/master_clock.h"
 #include "sync/timer_service.h"
+#include "util/json.h"
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -45,6 +47,7 @@ struct DeviceSnapshot {
 
 struct EngineStateSnapshot {
     std::string bind_ip;
+    bool auto_bind = true;
     bool discovery_running = false;
     bool multiroom_running = false;
     bool loopback_supported = true;
@@ -74,7 +77,7 @@ public:
 
     bool start_discovery();
     void stop_discovery();
-    void refresh_discovery();
+    void refresh_discovery(bool automatic = false);
 
     std::string add_manual_device(const std::string& name, const std::string& ip, uint16_t cmd_port = 8899);
     bool remove_device(const std::string& device_id);
@@ -92,6 +95,11 @@ public:
 
     bool set_source_mode(media::AudioSourceMode mode, const std::string& param = "", std::string* err_out = nullptr);
     void push_external_pcm(const int16_t* stereo_pcm, size_t frame_samples);
+    void set_media_metadata(const cmd::MediaInfoPayload& info, bool broadcast = true);
+    void set_media_position_ms(uint64_t position_ms, bool broadcast = true);
+    bool load_lrc_file(const std::string& path, std::string* err_out = nullptr);
+    void set_remote_control_handled_by_host(bool handled);
+    void tick_media_sync();
     std::string last_error() const;
 
     static std::vector<media::LoopbackSourceInfo> list_loopback_sources();
@@ -102,6 +110,11 @@ public:
     void set_rtsp_bind_port_for_test(uint16_t port) { test_rtsp_bind_port_.store(port); }
 
     EngineStateSnapshot snapshot_state() const;
+    void publish_discovery_snapshot_for_test(const discovery::DiscoveredDevice& device) {
+        on_discovery_update(device);
+    }
+
+    json::Value snapshot_state_value() const;
     std::string snapshot_state_json() const;
 
 private:
@@ -116,6 +129,9 @@ private:
     struct SessionHandle {
         uint64_t session_id = 0;
         std::string device_id;
+        std::string local_ip;
+        std::string remote_ip;
+        uint16_t remote_port = 0;
         std::atomic<bool> cancelled{false};
         std::shared_ptr<cmd::CmdSession> cmd_session;
         std::unique_ptr<rtsp::WfdRtspServer> rtsp_server;
@@ -124,6 +140,8 @@ private:
 
     struct ManagedDevice {
         discovery::DiscoveredDevice info;
+        std::string discovery_key;
+        std::string manual_name;
         bool in_group = false;
         bool cmd_connected = false;
         bool rtsp_streaming = false;
@@ -136,20 +154,30 @@ private:
         std::shared_ptr<SessionHandle> session;
     };
 
+    bool start_discovery_locked();
+    void on_discovery_update(const discovery::DiscoveredDevice& device);
+    void reconcile_streams();
+    std::string sender_ip_for(const discovery::DiscoveredDevice& device) const;
     bool attach_device_stream_locked(ManagedDevice& dev, std::vector<std::shared_ptr<SessionHandle>>& detached_out);
     void detach_device_stream_locked(ManagedDevice& dev, std::vector<std::shared_ptr<SessionHandle>>& detached_out);
-    void cleanup_detached(std::vector<std::shared_ptr<SessionHandle>>& detached);
+    void cleanup_failed_sessions();
+    void cleanup_detached(std::vector<std::shared_ptr<SessionHandle>>& detached, bool graceful = true);
+    void handle_remote_control(const std::string& device_id, uint64_t session_id, const cmd::RemoteControlEvent& ev);
+    cmd::MediaInfoPayload build_effective_media_info_locked() const;
+    void broadcast_media_info(const cmd::MediaInfoPayload& info);
+    void broadcast_position_ms(uint64_t position_ms);
     void set_last_error(const std::string& err);
     void emit_event_json(const std::string& json);
     void emit_state_changed();
-    static std::string escape_json(const std::string& s);
 
     // 单独串行化引擎启停状态机，不阻塞回调访问状态锁 mu_
     std::mutex lifecycle_mu_;
     EngineLifecycle lifecycle_ = EngineLifecycle::Stopped;
 
     mutable std::mutex mu_;
+    std::mutex discovery_lifecycle_mu_;
     std::string bind_ip_;
+    bool auto_bind_ = true;
     bool discovery_running_ = false;
     bool multiroom_running_ = false;
     AudioStreamConfig active_audio_cfg_;
@@ -166,8 +194,19 @@ private:
     media::AudioPipeline audio_pipeline_;
 
     std::map<std::string, ManagedDevice> devices_;
+    bool has_external_media_ = false;
+    cmd::MediaInfoPayload external_media_;
+    media::LrcDocument external_lrc_;
+    bool external_media_paused_ = false;
+    std::string last_broadcast_media_sig_;
+    std::atomic<bool> remote_control_handled_by_host_{false};
     std::mutex cb_mu_;
     JsonEventCallback event_cb_;
+    std::mutex failed_mu_;
+    std::condition_variable failed_cv_;
+    bool stop_failed_worker_ = false;
+    std::vector<std::shared_ptr<SessionHandle>> failed_sessions_;
+    std::thread failed_worker_;
 };
 
 } // namespace miplay

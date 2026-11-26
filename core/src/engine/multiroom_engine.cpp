@@ -9,9 +9,11 @@
 namespace miplay {
 
 MultiRoomEngine::MultiRoomEngine(std::string bind_ip)
-    : bind_ip_(bind_ip.empty() ? net::pick_default_lan_ipv4() : std::move(bind_ip)) {
+    : bind_ip_(std::move(bind_ip)), auto_bind_(bind_ip_.empty()) {
     net::init_network();
+    if (auto_bind_) bind_ip_ = net::pick_default_lan_ipv4();
     audio_pipeline_.set_source_mode(media::AudioSourceMode::TestTone, "");
+    failed_worker_ = std::thread([this]() { cleanup_failed_sessions(); });
 }
 
 MultiRoomEngine::~MultiRoomEngine() {
@@ -28,6 +30,14 @@ MultiRoomEngine::~MultiRoomEngine() {
         }
     }
     cleanup_detached(leftovers);
+    {
+        std::lock_guard<std::mutex> lk(failed_mu_);
+        stop_failed_worker_ = true;
+    }
+    failed_cv_.notify_one();
+    if (failed_worker_.joinable()) {
+        failed_worker_.join();
+    }
 }
 
 void MultiRoomEngine::set_event_callback(JsonEventCallback cb) {
@@ -76,91 +86,176 @@ bool MultiRoomEngine::validate_audio_config(bool prefer_lpcm, uint32_t sample_ra
 }
 
 void MultiRoomEngine::set_bind_ip(const std::string& ip) {
-    if (ip.empty()) return;
-    bool was_disc = false;
     {
-        std::lock_guard<std::mutex> lock(mu_);
-        bind_ip_ = ip;
-        was_disc = discovery_running_;
+        std::lock_guard lifecycle(discovery_lifecycle_mu_);
+        bool restart;
+        {
+            std::lock_guard lock(mu_);
+            const bool automatic = ip.empty();
+            if (auto_bind_ == automatic && (automatic || bind_ip_ == ip)) return;
+            auto_bind_ = automatic;
+            bind_ip_ = automatic ? net::pick_default_lan_ipv4() : ip;
+            restart = discovery_running_;
+            discovery_running_ = false;
+        }
+        if (restart) {
+            discovery_.stop();
+            start_discovery_locked();
+        }
     }
-    if (was_disc) {
-        stop_discovery();
-        start_discovery();
-    }
+    reconcile_streams();
     emit_state_changed();
 }
 
 std::string MultiRoomEngine::bind_ip() const {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard lock(mu_);
     return bind_ip_;
 }
 
-bool MultiRoomEngine::start_discovery() {
+bool MultiRoomEngine::start_discovery_locked() {
     std::string ip;
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::lock_guard lock(mu_);
         if (discovery_running_) return true;
-        ip = bind_ip_;
+        ip = auto_bind_ ? "" : bind_ip_;
     }
-    bool ok = discovery_.start(ip, [this](const discovery::DiscoveredDevice& dev) {
-        bool changed = false;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = devices_.find(dev.id);
-            if (it == devices_.end()) {
-                ManagedDevice md;
-                md.info = dev;
-                devices_[dev.id] = std::move(md);
-                changed = true;
-            } else {
-                if (it->second.info.ip != dev.ip || it->second.info.cmd_port != dev.cmd_port) {
-                    changed = true;
-                }
-                it->second.info.ip = dev.ip;
-                it->second.info.cmd_port = dev.cmd_port;
-                if (!dev.name.empty() && it->second.info.name != dev.name) {
-                    it->second.info.name = dev.name;
-                    changed = true;
-                }
-                it->second.info.last_seen_us = dev.last_seen_us;
-            }
-        }
-        if (changed) emit_state_changed();
-    });
-    if (ok) {
-        std::lock_guard<std::mutex> lock(mu_);
-        discovery_running_ = true;
+    const bool ok = discovery_.start(ip, [this](const auto& device) { on_discovery_update(device); },
+                                     [this] { reconcile_streams(); });
+    {
+        std::lock_guard lock(mu_);
+        discovery_running_ = ok;
+    }
+    return ok;
+}
+
+bool MultiRoomEngine::start_discovery() {
+    bool ok;
+    {
+        std::lock_guard lifecycle(discovery_lifecycle_mu_);
+        ok = start_discovery_locked();
     }
     emit_state_changed();
     return ok;
 }
 
 void MultiRoomEngine::stop_discovery() {
-    discovery_.stop();
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::lock_guard lifecycle(discovery_lifecycle_mu_);
+        discovery_.stop();
+        std::lock_guard lock(mu_);
         discovery_running_ = false;
     }
     emit_state_changed();
 }
 
-void MultiRoomEngine::refresh_discovery() {
-    discovery_.trigger_query();
+void MultiRoomEngine::refresh_discovery(bool automatic) {
+    std::lock_guard lifecycle(discovery_lifecycle_mu_);
+    discovery_.trigger_query(automatic);
+}
+
+void MultiRoomEngine::on_discovery_update(const discovery::DiscoveredDevice& device) {
+    bool changed = false;
+    bool reconcile = false;
+    {
+        std::lock_guard lock(mu_);
+        auto it = std::find_if(devices_.begin(), devices_.end(), [&](const auto& entry) {
+            return entry.second.discovery_key == device.id;
+        });
+        if (it == devices_.end()) {
+            if (!device.online) return;
+            it = std::find_if(devices_.begin(), devices_.end(), [&](const auto& entry) {
+                return entry.second.info.ip == device.ip && entry.second.info.cmd_port == device.cmd_port;
+            });
+        }
+        if (it == devices_.end()) {
+            ManagedDevice md;
+            md.discovery_key = device.id;
+            md.info = device;
+            devices_.emplace(device.id, std::move(md));
+            changed = true;
+        } else {
+            auto& md = it->second;
+            if (md.discovery_key == device.id && device.revision <= md.info.revision) return;
+            const auto old = md.info;
+            md.discovery_key = device.id;
+            md.info = device;
+            md.info.id = it->first;
+            md.info.is_manual = old.is_manual;
+            if (old.is_manual) {
+                md.info.online = true;
+                if (!md.manual_name.empty()) md.info.name = md.manual_name;
+            }
+            reconcile = old.ip != md.info.ip || old.cmd_port != md.info.cmd_port || old.online != md.info.online;
+            changed = reconcile || old.name != md.info.name || old.mac != md.info.mac ||
+                      old.room_name != md.info.room_name || old.device_type != md.info.device_type;
+        }
+    }
+    if (reconcile) reconcile_streams();
+    if (changed) emit_state_changed();
+}
+
+std::string MultiRoomEngine::sender_ip_for(const discovery::DiscoveredDevice& device) const {
+    if (auto_bind_) return net::local_ipv4_for_peer(device.ip, device.cmd_port);
+    return net::is_local_ipv4(bind_ip_) ? bind_ip_ : "";
+}
+
+void MultiRoomEngine::reconcile_streams() {
+    std::lock_guard lifecycle(lifecycle_mu_);
+    std::vector<std::shared_ptr<SessionHandle>> detached;
+    std::vector<std::string> restart;
+    bool changed = false;
+    {
+        std::lock_guard lock(mu_);
+        if (auto_bind_) {
+            auto available = net::pick_default_lan_ipv4();
+            changed = bind_ip_ != available;
+            bind_ip_ = std::move(available);
+        }
+        if (multiroom_running_) {
+            for (auto& [id, dev] : devices_) {
+                if (!dev.in_group) continue;
+                auto local_ip = sender_ip_for(dev.info);
+                if (dev.session && (dev.session->local_ip != local_ip || dev.session->remote_ip != dev.info.ip ||
+                                    dev.session->remote_port != dev.info.cmd_port || !dev.info.online)) {
+                    detach_device_stream_locked(dev, detached);
+                    changed = true;
+                }
+                if (!dev.session && dev.info.online) restart.push_back(id);
+            }
+        }
+    }
+    cleanup_detached(detached);
+    {
+        std::lock_guard lock(mu_);
+        for (const auto& id : restart) {
+            if (auto it = devices_.find(id); it != devices_.end() && it->second.in_group && it->second.info.online) {
+                attach_device_stream_locked(it->second, detached);
+                changed = true;
+            }
+        }
+    }
+    cleanup_detached(detached);
+    if (changed) emit_state_changed();
 }
 
 std::string MultiRoomEngine::add_manual_device(const std::string& name, const std::string& ip, uint16_t cmd_port) {
-    std::string id = "manual_" + ip + "_" + std::to_string(cmd_port);
+    std::string id;
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::lock_guard lock(mu_);
+        auto existing = std::find_if(devices_.begin(), devices_.end(), [&](const auto& entry) {
+            return entry.second.info.ip == ip && entry.second.info.cmd_port == cmd_port;
+        });
+        id = existing == devices_.end() ? "manual_" + ip + "_" + std::to_string(cmd_port) : existing->first;
         auto& md = devices_[id];
         md.info.id = id;
-        md.info.name = name.empty() ? ("MiPlay-" + ip) : name;
+        if (!name.empty()) md.manual_name = name;
+        if (!md.manual_name.empty()) md.info.name = md.manual_name;
+        else if (md.info.name.empty()) md.info.name = "MiPlay-" + ip;
         md.info.ip = ip;
         md.info.cmd_port = cmd_port;
+        md.info.port_source = discovery::PortSource::Manual;
         md.info.is_manual = true;
-        md.info.device_type = 4;
-        md.info.support_audio = true;
-        md.info.last_seen_us = sync::monotonic_now_us();
+        md.info.online = true;
     }
     emit_state_changed();
     return id;
@@ -234,17 +329,16 @@ bool MultiRoomEngine::start_multiroom(bool prefer_lpcm, uint32_t sample_rate, ui
             cfg.sample_rate,
             cfg.frame_samples,
             [this, use_aac, active_rate](const int16_t* stereo_pcm, size_t samples) {
-                master_clock_.catch_up_to_now(static_cast<uint32_t>(samples));
+                auto ts = master_clock_.next_frame_timestamps(static_cast<uint32_t>(samples), !use_aac);
                 if (use_aac) {
-                    // 由实际编码产出的每一帧独立申请 +1024 samples (+1920 ticks) 时间戳，杜绝 0 输出丢号与多输出重号
-                    aac_encoder_.encode_pcm(stereo_pcm, samples,
-                        [this](const uint8_t* adts, size_t len) {
-                            auto ts = master_clock_.next_frame_timestamps(1024);
-                            multi_sender_.broadcast_audio_frame(
-                                adts, len, ts.linear_pts_90khz, ts.rtp_ts_90khz);
-                        });
+                    if (!aac_encoder_.encode_pcm(stereo_pcm, samples, ts.linear_pts_90khz,
+                        [this](const uint8_t* adts, size_t len, uint64_t capture_pts) {
+                            const uint64_t pts = capture_pts + master_clock_.base_play_delay_ms() * 90ULL;
+                            multi_sender_.broadcast_audio_frame(adts, len, pts, static_cast<uint32_t>(pts));
+                        })) {
+                        set_last_error("Windows AAC 编码失败，已重置编码器并跳过受影响的 PCM");
+                    }
                 } else {
-                    auto ts = master_clock_.next_frame_timestamps(static_cast<uint32_t>(samples));
                     auto lpcm_frame = media::TsPacketizer::wrap_wfd_lpcm(stereo_pcm, samples, active_rate);
                     multi_sender_.broadcast_audio_frame(
                         lpcm_frame.data(), lpcm_frame.size(), ts.linear_pts_90khz, ts.rtp_ts_90khz);
@@ -260,7 +354,9 @@ bool MultiRoomEngine::start_multiroom(bool prefer_lpcm, uint32_t sample_rate, ui
                 oss << "]}";
                 emit_event_json(oss.str());
             },
-            [this] { return multi_sender_.has_streaming_target(); });
+            [this] { return multi_sender_.has_streaming_target(); },
+            [this](uint64_t skipped) { master_clock_.skip_samples(skipped); },
+            master_clock_.session_origin_us());
 
         lifecycle_ = EngineLifecycle::Running;
     }
@@ -301,7 +397,15 @@ bool MultiRoomEngine::attach_device_stream_locked(
     const std::string dev_ip = dev.info.ip;
     const uint16_t cmd_port = dev.info.cmd_port;
     const int32_t init_vol = dev.volume;
-    const std::string sender_ip = bind_ip_;
+    if (!dev.info.online) {
+        dev.status_text = "设备离线";
+        return false;
+    }
+    const std::string sender_ip = sender_ip_for(dev.info);
+    if (sender_ip.empty()) {
+        dev.status_text = auto_bind_ ? "找不到到达设备的本地 IPv4 地址" : "本地绑定地址不可用: " + bind_ip_;
+        return false;
+    }
     const AudioStreamConfig cfg = active_audio_cfg_;
     const uint64_t sid = next_session_id_.fetch_add(1);
     dev.active_session_id = sid;
@@ -310,10 +414,15 @@ bool MultiRoomEngine::attach_device_stream_locked(
     auto handle = std::make_shared<SessionHandle>();
     handle->session_id = sid;
     handle->device_id = dev_id;
+    handle->local_ip = sender_ip;
+    handle->remote_ip = dev_ip;
+    handle->remote_port = cmd_port;
     handle->rtsp_server = std::make_unique<rtsp::WfdRtspServer>();
 
     rtsp::RtspServerCallbacks rcbs;
-    rcbs.on_stream_ready = [this, sid](const std::string& id, const std::string& peer_ip, SocketHandle data_sock) {
+    rcbs.on_stream_connection = [this, sid](const std::string& id, const std::string& peer_ip,
+                                            std::shared_ptr<net::ConnectionWriter> writer,
+                                            std::function<void()> on_failure) {
         int32_t bias = 0;
         bool valid = false;
         {
@@ -325,7 +434,9 @@ bool MultiRoomEngine::attach_device_stream_locked(
                 bias = it->second.delay_bias_ms;
                 valid = true;
                 // 按全局唯一 session_id 原子注册目标，防旧会话回调覆盖新目标
-                multi_sender_.add_or_update_target(id, peer_ip, data_sock, bias, false, sid);
+                const auto fd = writer->socket();
+                multi_sender_.add_or_update_target(id, peer_ip, fd, bias, false, sid,
+                                                   std::move(writer), std::move(on_failure));
             }
         }
         if (valid) emit_state_changed();
@@ -337,18 +448,20 @@ bool MultiRoomEngine::attach_device_stream_locked(
             it->second.reported_latency_ms = rep.latency_ms;
         }
     };
-    rcbs.on_session_closed = [this, sid](const std::string& id) {
-        bool valid = false;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            auto it = devices_.find(id);
-            if (it != devices_.end() && it->second.active_session_id == sid) {
-                it->second.rtsp_streaming = false;
-                valid = true;
-            }
-        }
+    rcbs.on_stop_media = [this, sid](const std::string& id) {
         multi_sender_.remove_target(id, sid);
-        if (valid) emit_state_changed();
+    };
+    rcbs.on_session_closed = [this, sid](const std::string& id) {
+        {
+            std::lock_guard lk(mu_);
+            auto it = devices_.find(id);
+            if (it == devices_.end() || it->second.active_session_id != sid) return;
+            std::lock_guard failed_lock(failed_mu_);
+            detach_device_stream_locked(it->second, failed_sessions_);
+            it->second.status_text = "RTSP 音频会话已断开";
+        }
+        failed_cv_.notify_one();
+        emit_state_changed();
     };
     rcbs.on_status = [this, sid](const std::string& id, const std::string& st) {
         bool valid = false;
@@ -385,12 +498,12 @@ bool MultiRoomEngine::attach_device_stream_locked(
         return false;
     }
 
-    auto cmd_sess = std::make_shared<cmd::CmdSession>(dev_ip, cmd_port);
+    auto cmd_sess = std::make_shared<cmd::CmdSession>(dev_ip, cmd_port, sender_ip);
     handle->cmd_session = cmd_sess;
-    auto meta = audio_pipeline_.current_meta();
+    auto init_media = build_effective_media_info_locked();
 
     // SS-01：使用可取消、可等待的托管连接线程（绝不 detach）
-    handle->connect_thread = std::thread([this, handle, cmd_sess, dev_id, sender_ip, rtsp_port, init_vol, meta, sid]() {
+    handle->connect_thread = std::thread([this, handle, cmd_sess, dev_id, sender_ip, rtsp_port, init_vol, init_media, sid]() {
         if (handle->cancelled.load()) return;
 
         cmd::CmdSessionCallbacks ccbs;
@@ -405,6 +518,9 @@ bool MultiRoomEngine::attach_device_stream_locked(
                 }
             }
             if (valid) emit_state_changed();
+        };
+        ccbs.on_remote_control = [this, dev_id, sid](const cmd::RemoteControlEvent& ev) {
+            handle_remote_control(dev_id, sid, ev);
         };
         ccbs.on_state_changed = [this, dev_id, sid](bool conn) {
             bool valid = false;
@@ -433,15 +549,20 @@ bool MultiRoomEngine::attach_device_stream_locked(
 
         if (cmd_sess->connect(std::move(ccbs), &handle->cancelled)) {
             bool still_active = false;
+            cmd::MediaInfoPayload latest_media = init_media;
             if (!handle->cancelled.load()) {
                 std::lock_guard<std::mutex> lk(mu_);
                 auto it = devices_.find(dev_id);
                 still_active = (multiroom_running_ && it != devices_.end() &&
                                 it->second.in_group && it->second.active_session_id == sid);
+                if (still_active) latest_media = build_effective_media_info_locked();
             }
             if (still_active) {
                 cmd_sess->send_open_device(sender_ip, rtsp_port, 1);
-                cmd_sess->send_set_media_info(meta.title, meta.artist, meta.album, meta.duration_ms);
+                cmd_sess->send_set_media_info(latest_media);
+                if (latest_media.position_ms > 0) {
+                    cmd_sess->send_set_position_ms(latest_media.position_ms);
+                }
                 cmd_sess->send_set_volume(init_vol);
             } else {
                 cmd_sess->close_and_disconnect();
@@ -465,8 +586,24 @@ void MultiRoomEngine::detach_device_stream_locked(
     dev.status_text = "待机";
 }
 
-void MultiRoomEngine::cleanup_detached(std::vector<std::shared_ptr<SessionHandle>>& detached) {
-    auto cleanup = [this](const std::shared_ptr<SessionHandle>& h) {
+void MultiRoomEngine::cleanup_failed_sessions() {
+    while (true) {
+        std::vector<std::shared_ptr<SessionHandle>> failed;
+        {
+            std::unique_lock<std::mutex> lock(failed_mu_);
+            failed_cv_.wait(lock, [&] { return stop_failed_worker_ || !failed_sessions_.empty(); });
+            if (failed_sessions_.empty()) {
+                if (stop_failed_worker_) return;
+                continue;
+            }
+            failed.swap(failed_sessions_);
+        }
+        cleanup_detached(failed, false);
+    }
+}
+
+void MultiRoomEngine::cleanup_detached(std::vector<std::shared_ptr<SessionHandle>>& detached, bool graceful) {
+    auto cleanup = [this, graceful](const std::shared_ptr<SessionHandle>& h) {
         if (!h) return;
         h->cancelled.store(true);
         // 按唯一 session_id 移除音频目标，绝不误删同一 device_id 的新会话
@@ -476,7 +613,8 @@ void MultiRoomEngine::cleanup_detached(std::vector<std::shared_ptr<SessionHandle
             h->rtsp_server->stop();
         }
         if (h->cmd_session) {
-            h->cmd_session->send_close_and_abort();
+            if (graceful) h->cmd_session->send_close_and_abort();
+            else h->cmd_session->abort();
         }
         // 等连接线程完全退出后再由主线程安全 join CmdSession 内部线程并关闭 socket
         if (h->connect_thread.joinable() && h->connect_thread.get_id() != std::this_thread::get_id()) {
@@ -596,7 +734,53 @@ bool MultiRoomEngine::set_source_mode(media::AudioSourceMode mode, const std::st
         return false;
     }
     set_last_error("");
-    auto meta = audio_pipeline_.current_meta();
+    cmd::MediaInfoPayload info;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (mode != media::AudioSourceMode::SystemLoopback) {
+            has_external_media_ = false;
+        }
+        info = build_effective_media_info_locked();
+        last_broadcast_media_sig_.clear();
+    }
+    broadcast_media_info(info);
+    emit_state_changed();
+    return true;
+}
+
+void MultiRoomEngine::push_external_pcm(const int16_t* stereo_pcm, size_t frame_samples) {
+    audio_pipeline_.push_external_pcm(stereo_pcm, frame_samples);
+}
+
+cmd::MediaInfoPayload MultiRoomEngine::build_effective_media_info_locked() const {
+    const auto base = audio_pipeline_.current_meta();
+    cmd::MediaInfoPayload out;
+    if (has_external_media_ && audio_pipeline_.source_mode() == media::AudioSourceMode::SystemLoopback) {
+        out = external_media_;
+        if (out.title.empty()) out.title = base.title;
+        if (out.artist.empty()) out.artist = base.artist;
+        if (out.album.empty()) out.album = base.album;
+        if (!external_lrc_.empty()) {
+            if (out.lyrics.empty()) out.lyrics = external_lrc_.raw_text();
+            if (out.lyric_line.empty()) out.lyric_line = external_lrc_.line_at(out.position_ms);
+        }
+        return out;
+    }
+    out.title = base.title;
+    out.artist = base.artist;
+    out.album = base.album;
+    out.duration_ms = base.duration_ms;
+    out.position_ms = base.position_ms;
+    out.lyrics = base.lyrics;
+    out.lyric_line = base.lyric_line;
+    if (out.lyrics.empty() && !external_lrc_.empty()) {
+        out.lyrics = external_lrc_.raw_text();
+        out.lyric_line = external_lrc_.line_at(out.position_ms);
+    }
+    return out;
+}
+
+void MultiRoomEngine::broadcast_media_info(const cmd::MediaInfoPayload& info) {
     std::vector<std::shared_ptr<cmd::CmdSession>> sessions;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -607,14 +791,213 @@ bool MultiRoomEngine::set_source_mode(media::AudioSourceMode mode, const std::st
         }
     }
     for (auto& s : sessions) {
-        s->send_set_media_info(meta.title, meta.artist, meta.album, meta.duration_ms);
+        s->send_set_media_info(info);
     }
+}
+
+void MultiRoomEngine::broadcast_position_ms(uint64_t position_ms) {
+    std::vector<std::shared_ptr<cmd::CmdSession>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& [_, dev] : devices_) {
+            if (dev.session && dev.session->cmd_session && dev.session->cmd_session->is_connected()) {
+                sessions.push_back(dev.session->cmd_session);
+            }
+        }
+    }
+    for (auto& s : sessions) {
+        s->send_set_position_ms(position_ms);
+    }
+}
+
+void MultiRoomEngine::set_media_metadata(const cmd::MediaInfoPayload& info, bool broadcast) {
+    cmd::MediaInfoPayload effective;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        const bool same_track = has_external_media_ &&
+                                external_media_.title == info.title &&
+                                external_media_.artist == info.artist;
+        external_media_ = info;
+        if (!info.lyrics.empty()) {
+            external_lrc_ = media::LrcDocument::parse(info.lyrics);
+        } else if (!same_track) {
+            external_lrc_ = media::LrcDocument{};
+        }
+        if (!external_lrc_.empty() && external_media_.lyric_line.empty()) {
+            external_media_.lyric_line = external_lrc_.line_at(external_media_.position_ms);
+        }
+        has_external_media_ = !external_media_.title.empty() || !external_media_.lyrics.empty() ||
+                              !external_media_.lyric_line.empty();
+        effective = build_effective_media_info_locked();
+        last_broadcast_media_sig_ = effective.title + "|" + effective.artist + "|" + effective.album + "|" +
+                                    effective.lyric_line + "|" + std::to_string(effective.lyrics.size()) + "|" +
+                                    std::to_string(effective.duration_ms);
+    }
+    if (broadcast) {
+        broadcast_media_info(effective);
+        if (effective.position_ms > 0) broadcast_position_ms(effective.position_ms);
+    }
+    emit_state_changed();
+}
+
+void MultiRoomEngine::set_media_position_ms(uint64_t position_ms, bool broadcast) {
+    bool line_changed = false;
+    cmd::MediaInfoPayload effective;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        external_media_.position_ms = position_ms;
+        if (!external_lrc_.empty()) {
+            const std::string line = external_lrc_.line_at(position_ms);
+            if (line != external_media_.lyric_line) {
+                external_media_.lyric_line = line;
+                line_changed = true;
+            }
+        }
+        effective = build_effective_media_info_locked();
+        if (line_changed) {
+            effective.meta_change_type = 1;
+            last_broadcast_media_sig_ = effective.title + "|" + effective.artist + "|" + effective.album + "|" +
+                                        effective.lyric_line + "|" + std::to_string(effective.lyrics.size()) + "|" +
+                                        std::to_string(effective.duration_ms);
+        }
+    }
+    if (broadcast) {
+        if (line_changed) broadcast_media_info(effective);
+        broadcast_position_ms(position_ms);
+    }
+    if (line_changed) emit_state_changed();
+}
+
+bool MultiRoomEngine::load_lrc_file(const std::string& path, std::string* err_out) {
+    const std::string raw = media::LrcDocument::load_text_file(path);
+    if (raw.empty()) {
+        std::string err = "无法读取 LRC 歌词文件或文件为空";
+        if (err_out) *err_out = err;
+        set_last_error(err);
+        return false;
+    }
+    if (audio_pipeline_.source_mode() == media::AudioSourceMode::WavFile) {
+        audio_pipeline_.set_wav_lrc_text(raw);
+    }
+    cmd::MediaInfoPayload effective;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        external_lrc_ = media::LrcDocument::parse(raw);
+        external_media_.lyrics = external_lrc_.raw_text();
+        external_media_.lyric_line = external_lrc_.line_at(external_media_.position_ms);
+        effective = build_effective_media_info_locked();
+        last_broadcast_media_sig_.clear();
+    }
+    set_last_error("");
+    broadcast_media_info(effective);
     emit_state_changed();
     return true;
 }
 
-void MultiRoomEngine::push_external_pcm(const int16_t* stereo_pcm, size_t frame_samples) {
-    audio_pipeline_.push_external_pcm(stereo_pcm, frame_samples);
+void MultiRoomEngine::set_remote_control_handled_by_host(bool handled) {
+    remote_control_handled_by_host_.store(handled);
+}
+
+void MultiRoomEngine::tick_media_sync() {
+    bool running = false;
+    bool has_connected = false;
+    cmd::MediaInfoPayload effective;
+    bool should_broadcast_meta = false;
+    uint64_t pos_to_sync = 0;
+    bool should_broadcast_pos = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        running = multiroom_running_;
+        for (const auto& [_, dev] : devices_) {
+            if (dev.session && dev.session->cmd_session && dev.session->cmd_session->is_connected()) {
+                has_connected = true;
+                break;
+            }
+        }
+        if (running && has_connected) {
+            effective = build_effective_media_info_locked();
+            const std::string sig = effective.title + "|" + effective.artist + "|" + effective.album + "|" +
+                                    effective.lyric_line + "|" + std::to_string(effective.lyrics.size()) + "|" +
+                                    std::to_string(effective.duration_ms);
+            if (sig != last_broadcast_media_sig_) {
+                if (!last_broadcast_media_sig_.empty()) effective.meta_change_type = 1;
+                last_broadcast_media_sig_ = sig;
+                should_broadcast_meta = true;
+            }
+            if (effective.duration_ms > 0 || effective.position_ms > 0) {
+                pos_to_sync = effective.position_ms;
+                should_broadcast_pos = true;
+            }
+        }
+    }
+    if (should_broadcast_meta) {
+        broadcast_media_info(effective);
+    }
+    if (should_broadcast_pos) {
+        broadcast_position_ms(pos_to_sync);
+    }
+}
+
+void MultiRoomEngine::handle_remote_control(const std::string& device_id,
+                                            uint64_t session_id,
+                                            const cmd::RemoteControlEvent& ev) {
+    std::string dev_name = device_id;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = devices_.find(device_id);
+        if (it == devices_.end() || it->second.active_session_id != session_id) return;
+        dev_name = it->second.info.name.empty() ? device_id : it->second.info.name;
+        if (ev.action == cmd::RemoteControlAction::SetVolume && ev.volume >= 0 && ev.volume <= 100) {
+            it->second.volume = ev.volume;
+        }
+    }
+
+    if (ev.action == cmd::RemoteControlAction::SetVolume) {
+        emit_state_changed();
+        return;
+    }
+
+    const auto src_mode = audio_pipeline_.source_mode();
+    bool local_handled = false;
+    if (src_mode == media::AudioSourceMode::WavFile) {
+        if (ev.action == cmd::RemoteControlAction::Pause) {
+            audio_pipeline_.set_wav_paused(true);
+            local_handled = true;
+        } else if (ev.action == cmd::RemoteControlAction::Resume) {
+            audio_pipeline_.set_wav_paused(false);
+            local_handled = true;
+        } else if (ev.action == cmd::RemoteControlAction::Seek) {
+            audio_pipeline_.seek_wav_ms(ev.position_ms);
+            broadcast_position_ms(ev.position_ms);
+            local_handled = true;
+        }
+        std::vector<std::shared_ptr<cmd::CmdSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            for (auto& [_, d] : devices_) {
+                if (d.session && d.session->cmd_session && d.session->cmd_session->is_connected()) {
+                    sessions.push_back(d.session->cmd_session);
+                }
+            }
+        }
+        for (auto& s : sessions) {
+            if (ev.action == cmd::RemoteControlAction::Pause) s->send_pause();
+            else if (ev.action == cmd::RemoteControlAction::Resume) s->send_resume();
+        }
+    } else if (!remote_control_handled_by_host_.load()) {
+        local_handled = media::SystemMediaController::dispatch_action(ev.action, ev.position_ms);
+    }
+
+    const std::string evt = json::dump(json::Value::Object{
+        {"type", "remoteControl"},
+        {"deviceId", device_id},
+        {"deviceName", dev_name},
+        {"action", media::SystemMediaController::action_name(ev.action)},
+        {"positionMs", ev.position_ms},
+        {"handledLocally", local_handled},
+    });
+    emit_event_json(evt);
+    if (local_handled) emit_state_changed();
 }
 
 EngineStateSnapshot MultiRoomEngine::snapshot_state() const {
@@ -626,6 +1009,7 @@ EngineStateSnapshot MultiRoomEngine::snapshot_state() const {
 
     std::lock_guard<std::mutex> lock(mu_);
     snap.bind_ip = bind_ip_;
+    snap.auto_bind = auto_bind_;
     snap.discovery_running = discovery_running_;
     snap.multiroom_running = multiroom_running_;
     snap.loopback_supported = media::AudioPipeline::is_loopback_supported();
@@ -638,7 +1022,15 @@ EngineStateSnapshot MultiRoomEngine::snapshot_state() const {
     snap.source_mode = audio_pipeline_.source_mode();
     snap.source_param = audio_pipeline_.source_param();
     snap.last_error = last_error_;
+    const auto effective_media = build_effective_media_info_locked();
     snap.track_meta = audio_pipeline_.current_meta();
+    snap.track_meta.title = effective_media.title;
+    snap.track_meta.artist = effective_media.artist;
+    snap.track_meta.album = effective_media.album;
+    snap.track_meta.duration_ms = effective_media.duration_ms;
+    snap.track_meta.position_ms = effective_media.position_ms;
+    snap.track_meta.lyrics = effective_media.lyrics;
+    snap.track_meta.lyric_line = effective_media.lyric_line;
 
     for (const auto& [_, dev] : devices_) {
         DeviceSnapshot ds;
@@ -665,71 +1057,41 @@ EngineStateSnapshot MultiRoomEngine::snapshot_state() const {
     return snap;
 }
 
-std::string MultiRoomEngine::escape_json(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s) {
-        if (c == '"') out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else out.push_back(c);
+json::Value MultiRoomEngine::snapshot_state_value() const {
+    const auto snap = snapshot_state();
+    json::Value::Array devices;
+    for (const auto& d : snap.devices) {
+        devices.emplace_back(json::Value::Object{
+            {"id", d.info.id}, {"name", d.info.name}, {"ip", d.info.ip},
+            {"cmdPort", d.info.cmd_port}, {"mac", d.info.mac}, {"deviceType", d.info.device_type},
+            {"roomName", d.info.room_name}, {"online", d.info.online}, {"isManual", d.info.is_manual},
+            {"inGroup", d.in_group}, {"cmdConnected", d.cmd_connected}, {"rtspStreaming", d.rtsp_streaming},
+            {"volume", d.volume}, {"delayBiasMs", d.delay_bias_ms}, {"reportedLatencyMs", d.reported_latency_ms},
+            {"syncResidualUs", d.sync_residual_us}, {"syncPackets", d.sync_packets},
+            {"audioPacketsSent", d.audio_packets_sent}, {"remoteVersion", d.remote_version},
+            {"statusText", d.status_text},
+        });
     }
-    return out;
+    return json::Value::Object{
+        {"bindIp", snap.bind_ip}, {"autoBind", snap.auto_bind},
+        {"discoveryRunning", snap.discovery_running}, {"multiroomRunning", snap.multiroom_running},
+        {"loopbackSupported", snap.loopback_supported}, {"timerServicePort", snap.timer_service_port},
+        {"sessionTimeOffsetUs", snap.session_time_offset_us}, {"sampleRate", snap.sample_rate},
+        {"basePlayDelayMs", snap.base_play_delay_ms}, {"codec", snap.prefer_lpcm ? "LPCM" : "AAC_LC"},
+        {"masterVolume", snap.master_volume}, {"sourceMode", static_cast<int>(snap.source_mode)},
+        {"sourceParam", snap.source_param}, {"lastError", snap.last_error},
+        {"track", json::Value::Object{
+            {"title", snap.track_meta.title}, {"artist", snap.track_meta.artist}, {"album", snap.track_meta.album},
+            {"durationMs", snap.track_meta.duration_ms}, {"positionMs", snap.track_meta.position_ms},
+            {"lyricLine", snap.track_meta.lyric_line}, {"hasLyrics", !snap.track_meta.lyrics.empty() || !snap.track_meta.lyric_line.empty()},
+            {"paused", snap.track_meta.paused},
+        }},
+        {"devices", std::move(devices)},
+    };
 }
 
 std::string MultiRoomEngine::snapshot_state_json() const {
-    auto snap = snapshot_state();
-    std::ostringstream oss;
-    oss << "{"
-        << "\"bindIp\":\"" << escape_json(snap.bind_ip) << "\","
-        << "\"discoveryRunning\":" << (snap.discovery_running ? "true" : "false") << ","
-        << "\"multiroomRunning\":" << (snap.multiroom_running ? "true" : "false") << ","
-        << "\"loopbackSupported\":" << (snap.loopback_supported ? "true" : "false") << ","
-        << "\"timerServicePort\":" << snap.timer_service_port << ","
-        << "\"sessionTimeOffsetUs\":" << snap.session_time_offset_us << ","
-        << "\"sampleRate\":" << snap.sample_rate << ","
-        << "\"basePlayDelayMs\":" << snap.base_play_delay_ms << ","
-        << "\"codec\":\"" << (snap.prefer_lpcm ? "LPCM" : "AAC_LC") << "\","
-        << "\"masterVolume\":" << snap.master_volume << ","
-        << "\"sourceMode\":" << static_cast<int>(snap.source_mode) << ","
-        << "\"sourceParam\":\"" << escape_json(snap.source_param) << "\","
-        << "\"lastError\":\"" << escape_json(snap.last_error) << "\","
-        << "\"track\":{"
-            << "\"title\":\"" << escape_json(snap.track_meta.title) << "\","
-            << "\"artist\":\"" << escape_json(snap.track_meta.artist) << "\","
-            << "\"album\":\"" << escape_json(snap.track_meta.album) << "\","
-            << "\"durationMs\":" << snap.track_meta.duration_ms << ","
-            << "\"positionMs\":" << snap.track_meta.position_ms
-        << "},"
-        << "\"devices\":[";
-    for (size_t i = 0; i < snap.devices.size(); ++i) {
-        const auto& d = snap.devices[i];
-        if (i) oss << ",";
-        oss << "{"
-            << "\"id\":\"" << escape_json(d.info.id) << "\","
-            << "\"name\":\"" << escape_json(d.info.name) << "\","
-            << "\"ip\":\"" << escape_json(d.info.ip) << "\","
-            << "\"cmdPort\":" << d.info.cmd_port << ","
-            << "\"mac\":\"" << escape_json(d.info.mac) << "\","
-            << "\"deviceType\":" << d.info.device_type << ","
-            << "\"roomName\":\"" << escape_json(d.info.room_name) << "\","
-            << "\"isManual\":" << (d.info.is_manual ? "true" : "false") << ","
-            << "\"inGroup\":" << (d.in_group ? "true" : "false") << ","
-            << "\"cmdConnected\":" << (d.cmd_connected ? "true" : "false") << ","
-            << "\"rtspStreaming\":" << (d.rtsp_streaming ? "true" : "false") << ","
-            << "\"volume\":" << d.volume << ","
-            << "\"delayBiasMs\":" << d.delay_bias_ms << ","
-            << "\"reportedLatencyMs\":" << d.reported_latency_ms << ","
-            << "\"syncResidualUs\":" << d.sync_residual_us << ","
-            << "\"syncPackets\":" << d.sync_packets << ","
-            << "\"audioPacketsSent\":" << d.audio_packets_sent << ","
-            << "\"remoteVersion\":\"" << escape_json(d.remote_version) << "\","
-            << "\"statusText\":\"" << escape_json(d.status_text) << "\""
-            << "}";
-    }
-    oss << "]}";
-    return oss.str();
+    return json::dump(snapshot_state_value());
 }
 
 void MultiRoomEngine::emit_event_json(const std::string& json) {

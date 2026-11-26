@@ -3,11 +3,21 @@ package com.mishare.miplay;
 import android.content.Context;
 import android.media.projection.MediaProjection;
 import android.net.Uri;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import java.net.DatagramSocket;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -25,7 +35,14 @@ import org.json.JSONObject;
  */
 public class MultiRoomManager {
     public static class ManagedDevice {
-        public MdnsDiscovery.DiscoveredDevice info;
+        public volatile MdnsDiscovery.DiscoveredDevice info;
+        String discoveryKey = "";
+        String manualName = "";
+        String sessionLocalIp = "";
+        String sessionRemoteIp = "";
+        int sessionRemotePort;
+        CompletableFuture<Void> closing = CompletableFuture.completedFuture(null);
+        boolean attachPending;
         public volatile boolean inGroup = false;
         public volatile boolean cmdConnected = false;
         public volatile boolean rtspStreaming = false;
@@ -65,11 +82,12 @@ public class MultiRoomManager {
     private final AtomicBoolean initialized = new AtomicBoolean(false);
     private final CountDownLatch wsReadyLatch = new CountDownLatch(1);
     private final AtomicBoolean multiroomRunning = new AtomicBoolean(false);
-    private final AtomicLong totalSamples = new AtomicLong(0);
+    private long audioSessionId;
     private final AtomicLong lastBroadcastUs = new AtomicLong(0);
     private final AtomicLong nextSessionId = new AtomicLong(1);
 
     private volatile String bindIp = "127.0.0.1";
+    private String explicitBindIp = "";
     private volatile String wsToken = "";
     private volatile long sessionOriginUs = 0;
     private volatile int sampleRate = 48000;
@@ -77,51 +95,63 @@ public class MultiRoomManager {
     private volatile boolean preferLpcm = false;
     private volatile int masterVolume = 70;
     private volatile String lastError = "";
+    private volatile Context appContext;
     private volatile UiActionDelegate uiDelegate;
     private Thread telemetryTh;
+
+    // 实时系统曲目元数据与歌词状态（来自 MiPlayMediaListenerService 或手动导入的 LRC）
+    private volatile String extTitle = "";
+    private volatile String extArtist = "";
+    private volatile String extAlbum = "";
+    private volatile long extDurationMs = 0L;
+    private volatile long extPositionMs = 0L;
+    private volatile boolean extPaused = false;
+    private volatile String extLyricsRaw = "";
+    private volatile String extLyricLine = "";
+    private volatile List<AudioCaptureEngine.LrcLine> extLrcLines = java.util.Collections.emptyList();
+    private volatile String lastSentMediaSig = "";
 
     public void setUiActionDelegate(UiActionDelegate delegate) {
         this.uiDelegate = delegate;
     }
 
-    public void ensureStartedAsync() {
+    public void ensureStartedAsync(Context context) {
+        if (context != null) this.appContext = context.getApplicationContext();
         if (!startDispatched.compareAndSet(false, true)) return;
-        new Thread(this::initOnBackground, "MiPlay-CoreInit").start();
+        new Thread(() -> initOnBackground(context.getApplicationContext()), "MiPlay-CoreInit").start();
     }
 
-    private void initOnBackground() {
+    private void initOnBackground(Context context) {
         try {
             bindIp = MdnsDiscovery.pickWifiIpv4();
             wsToken = UUID.randomUUID().toString().replace("-", "");
             wsServer.start(wsToken, this::handleRpcRequest);
             wsReadyLatch.countDown();
 
-            discovery.start(dev -> {
-                if (dev.ip != null && dev.ip.equals(bindIp)) return;
-                ManagedDevice md = devices.get(dev.id);
-                boolean changed = false;
-                if (md == null) {
-                    md = new ManagedDevice();
-                    md.info = dev;
-                    devices.put(dev.id, md);
-                    changed = true;
-                } else {
-                    if (!safeEq(md.info.ip, dev.ip) || md.info.cmdPort != dev.cmdPort) changed = true;
-                    md.info.ip = dev.ip;
-                    md.info.cmdPort = dev.cmdPort;
-                    if (dev.name != null && !dev.name.isEmpty() && !dev.name.equals(md.info.name)) {
-                        md.info.name = dev.name;
-                        changed = true;
-                    }
-                    md.info.lastSeenUs = dev.lastSeenUs;
+            discovery.start(this::onDiscoveryUpdate, this::reconcileStreams);
+            ConnectivityManager connectivity = context.getSystemService(ConnectivityManager.class);
+            if (connectivity != null) {
+                try {
+                    NetworkRequest request = new NetworkRequest.Builder()
+                            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET).build();
+                    connectivity.registerNetworkCallback(request, new ConnectivityManager.NetworkCallback() {
+                        @Override public void onAvailable(Network network) { discovery.onNetworkChanged(); }
+                        @Override public void onLost(Network network) { discovery.onNetworkChanged(); }
+                        @Override public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
+                            discovery.onNetworkChanged();
+                        }
+                    });
+                } catch (RuntimeException ignored) {
+                    // The discovery loop also polls interfaces.
                 }
-                if (changed) broadcastStateThrottled(false);
-            });
+            }
 
             initialized.set(true);
             telemetryTh = new Thread(() -> {
                 while (initialized.get()) {
                     try { Thread.sleep(1000); } catch (InterruptedException ignored) { break; }
+                    tickMediaSync();
                     broadcastStateThrottled(true);
                 }
             }, "MiPlay-Telemetry");
@@ -131,8 +161,115 @@ public class MultiRoomManager {
         }
     }
 
-    private static boolean safeEq(String a, String b) {
-        return a == null ? b == null : a.equals(b);
+    private ManagedDevice findEndpoint(String ip, int port) {
+        for (ManagedDevice md : devices.values()) {
+            if (md.info.ip.equals(ip) && md.info.cmdPort == port) return md;
+        }
+        return null;
+    }
+
+    private void onDiscoveryUpdate(MdnsDiscovery.DiscoveredDevice snapshot) {
+        boolean changed;
+        synchronized (this) {
+            ManagedDevice md = null;
+            for (ManagedDevice candidate : devices.values()) {
+                if (candidate.discoveryKey.equals(snapshot.id)) {
+                    md = candidate;
+                    break;
+                }
+            }
+            if (md == null) {
+                if (!snapshot.online) return;
+                md = findEndpoint(snapshot.ip, snapshot.cmdPort);
+            }
+            if (md == null) {
+                md = new ManagedDevice();
+                md.discoveryKey = snapshot.id;
+                md.info = snapshot.copy();
+                devices.put(snapshot.id, md);
+                changed = true;
+            } else {
+                MdnsDiscovery.DiscoveredDevice old = md.info;
+                if (md.discoveryKey.equals(snapshot.id) && snapshot.revision <= old.revision) return;
+                md.discoveryKey = snapshot.id;
+                MdnsDiscovery.DiscoveredDevice updated = snapshot.copy();
+                updated.id = old.id;
+                updated.isManual = old.isManual;
+                if (old.isManual) {
+                    updated.online = true;
+                    if (!md.manualName.isEmpty()) updated.name = md.manualName;
+                }
+                md.info = updated;
+                boolean endpointChanged = !old.ip.equals(updated.ip) || old.cmdPort != updated.cmdPort ||
+                                          old.online != updated.online;
+                if (endpointChanged) reconcileDeviceLocked(md);
+                changed = endpointChanged || !old.name.equals(updated.name) || !old.mac.equals(updated.mac) ||
+                          !old.roomName.equals(updated.roomName) || old.deviceType != updated.deviceType;
+            }
+        }
+        if (changed) broadcastStateThrottled(true);
+    }
+
+    private synchronized void reconcileStreams() {
+        bindIp = explicitBindIp.isEmpty() ? MdnsDiscovery.pickWifiIpv4() : explicitBindIp;
+        if (multiroomRunning.get()) {
+            for (ManagedDevice md : devices.values()) reconcileDeviceLocked(md);
+        }
+        broadcastStateThrottled(true);
+    }
+
+    private void reconcileDeviceLocked(ManagedDevice md) {
+        if (!md.inGroup || !multiroomRunning.get()) return;
+        if (md.activeSessionId != 0 && (!md.info.online ||
+                !md.sessionLocalIp.equals(senderIpFor(md.info)) || !md.sessionRemoteIp.equals(md.info.ip) ||
+                md.sessionRemotePort != md.info.cmdPort)) {
+            detachDeviceLocked(md);
+        }
+        if (md.activeSessionId == 0 && md.info.online) attachDeviceLocked(md);
+    }
+
+    private String senderIpFor(MdnsDiscovery.DiscoveredDevice device) {
+        if (!explicitBindIp.isEmpty()) {
+            for (Inet4Address ip : MdnsDiscovery.ipv4Interfaces().keySet()) {
+                if (explicitBindIp.equals(ip.getHostAddress())) return explicitBindIp;
+            }
+            return "";
+        }
+        try (DatagramSocket route = new DatagramSocket()) {
+            route.connect(InetAddress.getByName(device.ip), device.cmdPort);
+            InetAddress local = route.getLocalAddress();
+            return local instanceof Inet4Address && !local.isAnyLocalAddress() ? local.getHostAddress() : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static boolean validIPv4(String ip) {
+        String[] parts = ip.split("\\.", -1);
+        if (parts.length != 4) return false;
+        for (String part : parts) {
+            if (part.length() == 0 || part.length() > 3 || !part.chars().allMatch(c -> c >= '0' && c <= '9') ||
+                Integer.parseInt(part) > 255) return false;
+        }
+        return !ip.equals("0.0.0.0");
+    }
+
+    private synchronized String addManualDevice(String name, String ip, int port) {
+        ManagedDevice md = findEndpoint(ip, port);
+        if (md == null) md = new ManagedDevice();
+        if (!name.isEmpty()) md.manualName = name;
+        MdnsDiscovery.DiscoveredDevice info = md.info == null ? new MdnsDiscovery.DiscoveredDevice() : md.info.copy();
+        if (info.id == null) info.id = "manual_" + ip + "_" + port;
+        if (!md.manualName.isEmpty()) info.name = md.manualName;
+        else if (info.name == null) info.name = "MiPlay-" + ip;
+        info.ip = ip;
+        info.cmdPort = port;
+        info.portSource = MdnsDiscovery.PortSource.MANUAL;
+        info.isManual = true;
+        info.online = true;
+        md.info = info;
+        devices.put(info.id, md);
+        return info.id;
     }
 
     public int awaitWsPort(long timeoutMs) {
@@ -164,7 +301,233 @@ public class MultiRoomManager {
     public void onWavFileSelected(Context ctx, Uri uri, String displayName) {
         String err = audioEngine.loadWavFromUri(ctx, uri, displayName);
         lastError = (err != null) ? err : "";
+        if (err == null) {
+            lastSentMediaSig = "";
+            broadcastMediaInfoAsync(buildEffectiveMediaInfo(), true);
+        }
         broadcastStateThrottled(true);
+    }
+
+    public void onLrcFileSelected(Context ctx, Uri uri) {
+        if (ctx == null || uri == null) return;
+        try (java.io.InputStream in = ctx.getContentResolver().openInputStream(uri)) {
+            if (in == null) {
+                lastError = "无法打开 LRC 歌词文件";
+                broadcastStateThrottled(true);
+                return;
+            }
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+                if (bos.size() > 2 * 1024 * 1024) break;
+            }
+            String text = new String(bos.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+            if (text.trim().isEmpty()) {
+                lastError = "LRC 歌词文件内容为空";
+                broadcastStateThrottled(true);
+                return;
+            }
+            audioEngine.setWavLrcText(text);
+            synchronized (this) {
+                extLyricsRaw = text.startsWith("\uFEFF") ? text.substring(1) : text;
+                extLrcLines = AudioCaptureEngine.parseLrcLines(extLyricsRaw);
+                extLyricLine = AudioCaptureEngine.lrcLineAt(extLrcLines, extPositionMs);
+                lastSentMediaSig = "";
+            }
+            lastError = "";
+            broadcastMediaInfoAsync(buildEffectiveMediaInfo(), false);
+            broadcastStateThrottled(true);
+        } catch (Exception e) {
+            lastError = "导入 LRC 歌词失败: " + e.getMessage();
+            broadcastStateThrottled(true);
+        }
+    }
+
+    public void onNotificationAccessStateChanged() {
+        broadcastStateThrottled(true);
+    }
+
+    public void onSystemMediaUpdate(String title, String artist, String album,
+                                    long durationMs, long positionMs, boolean paused, boolean forceMetadata) {
+        boolean metaChanged;
+        synchronized (this) {
+            boolean trackChanged = !extTitle.equals(title) || !extArtist.equals(artist) || !extAlbum.equals(album);
+            extTitle = title == null ? "" : title;
+            extArtist = artist == null ? "" : artist;
+            extAlbum = album == null ? "" : album;
+            extDurationMs = Math.max(0L, durationMs);
+            extPositionMs = Math.max(0L, positionMs);
+            extPaused = paused;
+            if (trackChanged) {
+                extLyricsRaw = "";
+                extLrcLines = java.util.Collections.emptyList();
+                extLyricLine = "";
+            } else if (!extLrcLines.isEmpty()) {
+                extLyricLine = AudioCaptureEngine.lrcLineAt(extLrcLines, extPositionMs);
+            }
+            metaChanged = trackChanged || forceMetadata;
+        }
+        if (multiroomRunning.get() && audioEngine.getMode() == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
+            CmdSession.MediaInfo info = buildEffectiveMediaInfo();
+            if (metaChanged) {
+                broadcastMediaInfoAsync(info, true);
+            }
+        }
+        if (metaChanged) broadcastStateThrottled(false);
+    }
+
+    public void onExternalLyricLine(String lyricLine) {
+        if (lyricLine == null || lyricLine.trim().isEmpty()) return;
+        String clean = lyricLine.trim();
+        synchronized (this) {
+            if (clean.equals(extLyricLine)) return;
+            extLyricLine = clean;
+        }
+        if (multiroomRunning.get() && audioEngine.getMode() == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
+            CmdSession.MediaInfo info = buildEffectiveMediaInfo();
+            info.metaChangeType = 1;
+            broadcastMediaInfoAsync(info, false);
+        }
+        broadcastStateThrottled(false);
+    }
+
+    private synchronized CmdSession.MediaInfo buildEffectiveMediaInfo() {
+        CmdSession.MediaInfo info = new CmdSession.MediaInfo();
+        info.sourceName = android.os.Build.MODEL != null && !android.os.Build.MODEL.isEmpty()
+                ? android.os.Build.MODEL : "MiPlay Android";
+        int m = audioEngine.getMode();
+        if (m == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && (!extTitle.isEmpty() || !extLyricLine.isEmpty() || !extLyricsRaw.isEmpty())) {
+            info.title = !extTitle.isEmpty() ? extTitle : audioEngine.getTrackTitle();
+            info.artist = !extArtist.isEmpty() ? extArtist : audioEngine.getTrackArtist();
+            info.album = !extAlbum.isEmpty() ? extAlbum : "MiPlay Multi-Room";
+            info.durationMs = extDurationMs;
+            info.positionMs = extPositionMs;
+            info.lyrics = extLyricsRaw;
+            info.lyricLine = extLyricLine;
+        } else if (m == AudioCaptureEngine.MODE_WAV_FILE) {
+            info.title = audioEngine.getTrackTitle();
+            info.artist = audioEngine.getTrackArtist();
+            info.album = "Local WAV Lossless";
+            info.durationMs = audioEngine.getWavDurationMs();
+            info.positionMs = audioEngine.getWavPositionMs();
+            info.lyrics = audioEngine.getWavLrcRaw();
+            info.lyricLine = audioEngine.getWavLyricLine();
+        } else {
+            info.title = audioEngine.getTrackTitle();
+            info.artist = audioEngine.getTrackArtist();
+            info.album = "MiPlay Multi-Room";
+            info.durationMs = 0L;
+            info.positionMs = 0L;
+            info.lyrics = extLyricsRaw;
+            info.lyricLine = extLyricLine;
+        }
+        return info;
+    }
+
+    private void broadcastMediaInfoAsync(CmdSession.MediaInfo info, boolean includePosition) {
+        final List<CmdSession> sessions = new ArrayList<>();
+        for (ManagedDevice md : devices.values()) {
+            CmdSession cs = md.cmdSession;
+            if (cs != null && cs.isConnected()) sessions.add(cs);
+        }
+        if (sessions.isEmpty()) return;
+        new Thread(() -> {
+            for (CmdSession cs : sessions) {
+                cs.sendSetMediaInfo(info);
+                if (includePosition && info.positionMs > 0L) {
+                    cs.sendSetPositionMs(info.positionMs);
+                }
+            }
+        }, "MiPlay-MediaSync").start();
+    }
+
+    private void tickMediaSync() {
+        if (!multiroomRunning.get()) return;
+        if (audioEngine.getMode() == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
+            MiPlayMediaListenerService.pollCurrentPosition();
+        }
+        CmdSession.MediaInfo info = buildEffectiveMediaInfo();
+        String sig = info.title + "|" + info.artist + "|" + info.album + "|" + info.lyricLine + "|" + info.lyrics.length() + "|" + info.durationMs;
+        boolean metaChanged = !sig.equals(lastSentMediaSig);
+        if (metaChanged) {
+            if (!lastSentMediaSig.isEmpty()) info.metaChangeType = 1;
+            lastSentMediaSig = sig;
+        }
+        final boolean sendMeta = metaChanged;
+        final boolean sendPos = info.durationMs > 0L || info.positionMs > 0L;
+        if (!sendMeta && !sendPos) return;
+        for (ManagedDevice md : devices.values()) {
+            CmdSession cs = md.cmdSession;
+            if (cs != null && cs.isConnected()) {
+                if (sendMeta) cs.sendSetMediaInfo(info);
+                if (sendPos) cs.sendSetPositionMs(info.positionMs);
+            }
+        }
+    }
+
+    private void handleRemoteControl(String devId, long sid, CmdSession.RemoteControlEvent ev) {
+        if (ev == null) return;
+        String devName = devId;
+        synchronized (this) {
+            ManagedDevice cur = devices.get(devId);
+            if (cur == null || cur.activeSessionId != sid) return;
+            devName = (cur.info != null && cur.info.name != null && !cur.info.name.isEmpty()) ? cur.info.name : devId;
+            if (ev.action == CmdSession.RemoteControlAction.SET_VOLUME && ev.volume >= 0 && ev.volume <= 100) {
+                cur.volume = ev.volume;
+            }
+        }
+        if (ev.action == CmdSession.RemoteControlAction.SET_VOLUME) {
+            broadcastStateThrottled(true);
+            return;
+        }
+
+        boolean handled = false;
+        int m = audioEngine.getMode();
+        if (m == AudioCaptureEngine.MODE_WAV_FILE) {
+            if (ev.action == CmdSession.RemoteControlAction.PAUSE) {
+                audioEngine.setWavPaused(true);
+                handled = true;
+            } else if (ev.action == CmdSession.RemoteControlAction.RESUME) {
+                audioEngine.setWavPaused(false);
+                handled = true;
+            } else if (ev.action == CmdSession.RemoteControlAction.SEEK) {
+                audioEngine.seekWavMs(ev.positionMs);
+                handled = true;
+            }
+            for (ManagedDevice md : devices.values()) {
+                CmdSession cs = md.cmdSession;
+                if (cs != null && cs.isConnected()) {
+                    if (ev.action == CmdSession.RemoteControlAction.PAUSE) cs.sendPause();
+                    else if (ev.action == CmdSession.RemoteControlAction.RESUME) cs.sendResume();
+                    else if (ev.action == CmdSession.RemoteControlAction.SEEK) cs.sendSetPositionMs(ev.positionMs);
+                }
+            }
+        } else {
+            handled = MiPlayMediaListenerService.dispatchControl(appContext, ev);
+        }
+
+        String actionStr;
+        switch (ev.action) {
+            case PAUSE: actionStr = "pause"; break;
+            case RESUME: actionStr = "resume"; break;
+            case NEXT: actionStr = "next"; break;
+            case PREVIOUS: actionStr = "previous"; break;
+            case SEEK: actionStr = "seek"; break;
+            default: actionStr = "unknown"; break;
+        }
+        try {
+            JSONObject evt = new JSONObject();
+            evt.put("type", "remoteControl");
+            evt.put("deviceId", devId);
+            evt.put("deviceName", devName);
+            evt.put("action", actionStr);
+            evt.put("positionMs", ev.positionMs);
+            evt.put("handledLocally", handled);
+            wsServer.broadcastText(evt.toString());
+        } catch (Exception ignored) {}
+        if (handled) broadcastStateThrottled(true);
     }
 
     public synchronized boolean startMultiroom(boolean lpcm, int sr, int delayMs) {
@@ -183,10 +546,10 @@ public class MultiRoomManager {
             return false;
         }
 
-        bindIp = MdnsDiscovery.pickWifiIpv4();
+        bindIp = explicitBindIp.isEmpty() ? MdnsDiscovery.pickWifiIpv4() : explicitBindIp;
         this.basePlayDelayMs = Math.max(100, Math.min(1000, delayMs));
         this.sessionOriginUs = TimerService.monotonicNowUs();
-        this.totalSamples.set(0);
+        final long audioSid = ++audioSessionId;
 
         if (!timerService.start()) {
             lastError = "TimerService UDP 校时服务启动失败";
@@ -195,7 +558,14 @@ public class MultiRoomManager {
         }
 
         // SS-07: 先配置编码器并取回实际生效配置（如 AAC 初始化失败自动回退 LPCM），统一驱动 RTSP/TS/采集
-        TsAndRtpSender.AudioConfig actualCfg = multiSender.configure(lpcm, reqRate);
+        TsAndRtpSender.AudioConfig actualCfg = multiSender.configure(lpcm, reqRate,
+                () -> new Thread(() -> {
+                    synchronized (MultiRoomManager.this) {
+                        if (audioSessionId != audioSid || !multiroomRunning.get()) return;
+                        lastError = "AAC 编码器持续失败，已停止推流，请重新启动全屋播放";
+                        stopMultiroom();
+                    }
+                }, "MiPlay-AacFailure").start());
         this.preferLpcm = actualCfg.useLpcm;
         this.sampleRate = actualCfg.sampleRate;
         this.lastError = "";
@@ -206,26 +576,11 @@ public class MultiRoomManager {
         }
 
         final int activeRate = actualCfg.sampleRate;
-        audioEngine.start(activeRate, actualCfg.frameSamples, new AudioCaptureEngine.Callbacks() {
+        audioEngine.start(activeRate, actualCfg.frameSamples, sessionOriginUs, new AudioCaptureEngine.Callbacks() {
             @Override
-            public void onPcmFrame(byte[] stereoPcmLe, int samples) {
-                // 若因等待系统抓音授权、切源或后台调度阻塞导致样本计数落后实时墙钟 >3 帧，立即按整帧边界追齐
-                long nowUs = TimerService.monotonicNowUs();
-                long elapsedUs = Math.max(0L, nowUs - sessionOriginUs);
-                long expectedSamples = (elapsedUs * activeRate) / 1_000_000L;
-                long curSamples = totalSamples.get();
-                long tolerance = (long) samples * 3L;
-                if (expectedSamples > curSamples + tolerance) {
-                    long aligned = (expectedSamples / samples) * samples;
-                    if (totalSamples.compareAndSet(curSamples, aligned)) {
-                        curSamples = aligned;
-                    } else {
-                        curSamples = totalSamples.get();
-                    }
-                }
-                totalSamples.addAndGet(samples);
-                long pts90k = ((curSamples * 90000L) / activeRate) + (basePlayDelayMs * 90L);
-                multiSender.broadcastPcmFrame(stereoPcmLe, pts90k);
+            public void onPcmFrame(byte[] stereoPcmLe, int samples, long samplePosition) {
+                long pts90k = samplePosition * 90000L / activeRate;
+                multiSender.broadcastPcmFrame(stereoPcmLe, pts90k, () -> basePlayDelayMs);
             }
 
             @Override
@@ -256,27 +611,54 @@ public class MultiRoomManager {
     }
 
     private void attachDeviceLocked(ManagedDevice dev) {
-        detachDeviceLocked(dev);
+        if (dev.activeSessionId != 0 || !dev.info.online) return;
         final String devId = dev.info.id;
+        if (!dev.closing.isDone()) {
+            if (!dev.attachPending) {
+                dev.attachPending = true;
+                dev.closing.whenCompleteAsync((unused, error) -> {
+                    synchronized (MultiRoomManager.this) {
+                        dev.attachPending = false;
+                        if (devices.get(devId) == dev && dev.inGroup && multiroomRunning.get()) attachDeviceLocked(dev);
+                    }
+                    broadcastStateThrottled(true);
+                });
+            }
+            return;
+        }
+        final String curBindIp = senderIpFor(dev.info);
+        if (curBindIp.isEmpty()) {
+            dev.statusText = explicitBindIp.isEmpty() ? "找不到到达设备的本地 IPv4 地址" :
+                    "本地绑定地址不可用: " + explicitBindIp;
+            return;
+        }
         final long sid = nextSessionId.getAndIncrement();
         dev.activeSessionId = sid;
+        dev.sessionLocalIp = curBindIp;
+        dev.sessionRemoteIp = dev.info.ip;
+        dev.sessionRemotePort = dev.info.cmdPort;
         dev.statusText = "正在启动 RTSP 与 8899 握手...";
 
         WfdRtspServer rtsp = new WfdRtspServer();
-        boolean rtspOk = rtsp.start(devId, bindIp, timerService.getPort(), sessionOriginUs, preferLpcm, sampleRate,
+        boolean rtspOk = rtsp.start(devId, curBindIp, timerService.getPort(), sessionOriginUs, preferLpcm, sampleRate,
                 new WfdRtspServer.Callbacks() {
                     @Override
-                    public void onStreamReady(String id, String peerIp, java.net.Socket dataSock) {
+                    public void onStreamReady(String id, String peerIp, ConnectionWriter writer, Runnable failure) {
                         synchronized (MultiRoomManager.this) {
                             ManagedDevice cur = devices.get(id);
                             if (cur == null || cur.activeSessionId != sid || !cur.inGroup || !multiroomRunning.get()) {
-                                try { dataSock.close(); } catch (Exception ignored) {}
+                                writer.abort();
                                 return;
                             }
                             cur.rtspStreaming = true;
-                            multiSender.addTarget(id, sid, peerIp, dataSock, cur.delayBiasMs);
+                            multiSender.addTarget(id, sid, peerIp, writer, cur.delayBiasMs, failure);
                         }
                         broadcastStateThrottled(true);
+                    }
+
+                    @Override
+                    public void onStopMedia(String id) {
+                        multiSender.stopTargetForTeardown(id, sid);
                     }
 
                     @Override
@@ -295,7 +677,8 @@ public class MultiRoomManager {
                         synchronized (MultiRoomManager.this) {
                             ManagedDevice cur = devices.get(id);
                             if (cur != null && cur.activeSessionId == sid) {
-                                cur.rtspStreaming = false;
+                                detachDeviceLocked(cur);
+                                cur.statusText = "RTSP 音频会话已断开";
                                 changed = true;
                             }
                         }
@@ -329,11 +712,11 @@ public class MultiRoomManager {
         }
 
         dev.rtspServer = rtsp;
-        final String curBindIp = bindIp;
-        final CmdSession cs = new CmdSession(dev.info.ip, dev.info.cmdPort);
+        final CmdSession cs = new CmdSession(dev.info.ip, dev.info.cmdPort, curBindIp);
         dev.cmdSession = cs;
 
         new Thread(() -> {
+            if (dev.activeSessionId != sid) return;
             boolean ok = cs.connect(new CmdSession.Callbacks() {
                 @Override
                 public void onVersion(String v) {
@@ -373,7 +756,12 @@ public class MultiRoomManager {
                     }
                     if (changed) broadcastStateThrottled(false);
                 }
-            });
+
+                @Override
+                public void onRemoteControl(CmdSession.RemoteControlEvent ev) {
+                    handleRemoteControl(devId, sid, ev);
+                }
+            }, () -> dev.activeSessionId != sid);
             boolean stillActive;
             int initVol = 65;
             synchronized (MultiRoomManager.this) {
@@ -383,7 +771,9 @@ public class MultiRoomManager {
             }
             if (stillActive) {
                 cs.sendOpenDevice(curBindIp, rtspPort);
-                cs.sendSetMediaInfo(audioEngine.getTrackTitle(), audioEngine.getTrackArtist(), "MiPlay MultiRoom", 0);
+                CmdSession.MediaInfo info = buildEffectiveMediaInfo();
+                cs.sendSetMediaInfo(info);
+                if (info.positionMs > 0L) cs.sendSetPositionMs(info.positionMs);
                 cs.sendSetVolume(initVol);
             } else if (ok) {
                 cs.closeGracefully();
@@ -407,10 +797,10 @@ public class MultiRoomManager {
         dev.rtspStreaming = false;
         dev.statusText = "待机";
         if (oldCs != null || oldRtsp != null) {
-            new Thread(() -> {
+            dev.closing = dev.closing.handle((unused, error) -> null).thenRunAsync(() -> {
                 if (oldRtsp != null) oldRtsp.stop();
                 if (oldCs != null) oldCs.closeGracefully();
-            }, "MiPlay-Detach-" + dev.info.id + "-" + oldSid).start();
+            });
         }
     }
 
@@ -428,12 +818,27 @@ public class MultiRoomManager {
                     break;
                 case "net.listInterfaces": {
                     JSONArray arr = new JSONArray();
-                    JSONObject iface = new JSONObject();
-                    iface.put("name", "wlan0");
-                    iface.put("ipv4", bindIp);
-                    iface.put("isLoopback", false);
-                    arr.put(iface);
+                    for (Map.Entry<Inet4Address, NetworkInterface> entry : MdnsDiscovery.ipv4Interfaces().entrySet()) {
+                        JSONObject iface = new JSONObject();
+                        iface.put("name", entry.getValue().getName());
+                        iface.put("ipv4", entry.getKey().getHostAddress());
+                        iface.put("isLoopback", entry.getKey().isLoopbackAddress());
+                        arr.put(iface);
+                    }
                     result = arr;
+                    break;
+                }
+                case "net.setBindIp": {
+                    String ip = req.getString("ip");
+                    if (!ip.isEmpty() && !validIPv4(ip)) {
+                        error = "无效的本地 IPv4 地址";
+                        break;
+                    }
+                    synchronized (this) {
+                        explicitBindIp = ip;
+                        reconcileStreams();
+                        result = buildStateJson();
+                    }
                     break;
                 }
                 case "source.listLoopback": {
@@ -446,23 +851,23 @@ public class MultiRoomManager {
                     break;
                 }
                 case "discovery.refresh":
-                    new Thread(discovery::triggerQuery, "MiPlay-Refresh").start();
+                    discovery.triggerQuery(req.optBoolean("automatic", false));
                     break;
                 case "device.addManual": {
                     String name = req.optString("name", "");
-                    String ip = req.optString("ip", "").trim();
-                    int port = req.optInt("cmdPort", 8899);
-                    String devId = "manual_" + ip + "_" + port;
-                    ManagedDevice md = new ManagedDevice();
-                    md.info = new MdnsDiscovery.DiscoveredDevice();
-                    md.info.id = devId;
-                    md.info.name = name.isEmpty() ? ("MiPlay-" + ip) : name;
-                    md.info.ip = ip;
-                    md.info.cmdPort = port;
-                    md.info.isManual = true;
-                    devices.put(devId, md);
+                    String ip = req.getString("ip").trim();
+                    Object value = req.opt("cmdPort");
+                    if (value != null && !(value instanceof Integer)) {
+                        error = "控制端口必须为 1–65535 的整数";
+                        break;
+                    }
+                    int port = value == null ? 8899 : (Integer) value;
+                    if (!validIPv4(ip) || port < 1 || port > 65535) {
+                        error = "无效的设备 IPv4 地址或控制端口";
+                        break;
+                    }
+                    result = addManualDevice(name, ip, port);
                     broadcastStateThrottled(true);
-                    result = devId;
                     break;
                 }
                 case "device.remove": {
@@ -594,9 +999,10 @@ public class MultiRoomManager {
         }
     }
 
-    private JSONObject buildStateJson() throws Exception {
+    private synchronized JSONObject buildStateJson() throws Exception {
         JSONObject root = new JSONObject();
         root.put("bindIp", bindIp);
+        root.put("autoBind", explicitBindIp.isEmpty());
         root.put("discoveryRunning", true);
         root.put("multiroomRunning", multiroomRunning.get());
         root.put("loopbackSupported", true);
@@ -609,13 +1015,19 @@ public class MultiRoomManager {
         root.put("sourceMode", audioEngine.getMode());
         root.put("sourceParam", "");
         root.put("lastError", lastError);
+        root.put("notificationAccessGranted", MiPlayMediaListenerService.isNotificationAccessGranted(appContext));
 
+        CmdSession.MediaInfo curMedia = buildEffectiveMediaInfo();
         JSONObject track = new JSONObject();
-        track.put("title", audioEngine.getTrackTitle());
-        track.put("artist", audioEngine.getTrackArtist());
-        track.put("album", "MiPlay Multi-Room");
-        track.put("durationMs", 0);
-        track.put("positionMs", 0);
+        track.put("title", curMedia.title);
+        track.put("artist", curMedia.artist);
+        track.put("album", curMedia.album);
+        track.put("durationMs", curMedia.durationMs);
+        track.put("positionMs", curMedia.positionMs);
+        track.put("lyricLine", curMedia.lyricLine == null ? "" : curMedia.lyricLine);
+        track.put("hasLyrics", (curMedia.lyrics != null && !curMedia.lyrics.isEmpty())
+                || (curMedia.lyricLine != null && !curMedia.lyricLine.isEmpty()));
+        track.put("paused", audioEngine.getMode() == AudioCaptureEngine.MODE_WAV_FILE ? audioEngine.isWavPaused() : extPaused);
         root.put("track", track);
 
         Map<String, TimerService.ClientTelemetry> tmap = timerService.snapshotTelemetry();
@@ -631,6 +1043,7 @@ public class MultiRoomManager {
             d.put("deviceType", md.info.deviceType);
             d.put("roomName", md.info.roomName);
             d.put("isManual", md.info.isManual);
+            d.put("online", md.info.online);
             d.put("inGroup", md.inGroup);
             d.put("cmdConnected", md.cmdConnected);
             d.put("rtspStreaming", md.rtspStreaming);

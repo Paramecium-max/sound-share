@@ -13,9 +13,22 @@
 
 namespace miplay::cmd {
 
+struct MediaInfoPayload {
+    std::string title;
+    std::string artist;
+    std::string album;
+    uint64_t duration_ms = 0;
+    uint64_t position_ms = 0;
+    std::string lyrics;
+    std::string lyric_line;
+    std::string source_name = "MiPlay MultiRoom";
+    int meta_change_type = 0;
+};
+
 struct CmdSessionCallbacks {
     std::function<void(const std::string& remote_version)> on_version;
     std::function<void(const CmdFrame& frame)> on_frame;
+    std::function<void(const RemoteControlEvent& ev)> on_remote_control;
     std::function<void(bool connected)> on_state_changed;
     std::function<void(const std::string& status)> on_status;
 };
@@ -33,7 +46,7 @@ public:
         Failed
     };
 
-    CmdSession(std::string ip, uint16_t port = 8899);
+    CmdSession(std::string ip, uint16_t port = 8899, std::string bind_ip = {});
     ~CmdSession();
 
     bool connect(CmdSessionCallbacks cbs, const std::atomic<bool>* cancelled = nullptr);
@@ -58,6 +71,7 @@ public:
     bool send_set_position_ms(uint64_t position_ms);
     bool send_set_media_info(const std::string& title, const std::string& artist,
                              const std::string& album, uint64_t duration_ms);
+    bool send_set_media_info(const MediaInfoPayload& info);
 
 private:
     bool send_raw_locked(uint16_t cmd_type, uint16_t seq, const std::vector<uint8_t>& payload);
@@ -70,6 +84,7 @@ private:
 
     std::string ip_;
     uint16_t port_;
+    std::string bind_ip_;
     std::string local_ip_;
     uint16_t local_port_ = 0;
 

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -23,6 +24,9 @@ struct RtspLatencyReport {
 
 struct RtspServerCallbacks {
     std::function<void(const std::string& device_id, const std::string& peer_ip, SocketHandle data_sock)> on_stream_ready;
+    std::function<void(const std::string&, const std::string&,
+                       std::shared_ptr<net::ConnectionWriter>, std::function<void()>)> on_stream_connection;
+    std::function<void(const std::string&)> on_stop_media;
     std::function<void(const RtspLatencyReport& report)> on_latency_report;
     std::function<void(const std::string& device_id)> on_session_closed;
     std::function<void(const std::string& device_id, const std::string& status)> on_status;

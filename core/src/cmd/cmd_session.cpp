@@ -1,6 +1,7 @@
 #include "cmd/cmd_session.h"
 #include "crypto/mini_crypto.h"
 #include "sync/master_clock.h"
+#include "util/json.h"
 
 #include <chrono>
 #include <cstring>
@@ -32,8 +33,8 @@ bool connect_pending() {
 }
 } // namespace
 
-CmdSession::CmdSession(std::string ip, uint16_t port)
-    : ip_(std::move(ip)), port_(port) {}
+CmdSession::CmdSession(std::string ip, uint16_t port, std::string bind_ip)
+    : ip_(std::move(ip)), port_(port), bind_ip_(std::move(bind_ip)) {}
 
 CmdSession::~CmdSession() {
     disconnect();
@@ -82,6 +83,17 @@ bool CmdSession::connect(CmdSessionCallbacks cbs, const std::atomic<bool>* cance
     if (s == kInvalidSocket) {
         emit_status("8899 Socket 创建失败");
         return false;
+    }
+
+    if (!bind_ip_.empty()) {
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        if (inet_pton(AF_INET, bind_ip_.c_str(), &local.sin_addr) != 1 ||
+            bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+            net::close_socket(s);
+            emit_status("8899 本地绑定地址不可用: " + bind_ip_);
+            return false;
+        }
     }
 
     net::set_tcp_nodelay(s, true);
@@ -465,11 +477,48 @@ bool CmdSession::send_set_position_ms(uint64_t position_ms) {
 
 bool CmdSession::send_set_media_info(const std::string& title, const std::string& artist,
                                      const std::string& album, uint64_t duration_ms) {
-    std::string json = "{\"title\":\"" + title + "\",\"artist\":\"" + artist +
-                       "\",\"album\":\"" + album + "\",\"mTitle\":\"" + title +
-                       "\",\"mArtist\":\"" + artist + "\",\"mAlbum\":\"" + album +
-                       "\",\"mDuration\":" + std::to_string(duration_ms) + "}";
-    std::vector<uint8_t> p(json.begin(), json.end());
+    MediaInfoPayload info;
+    info.title = title;
+    info.artist = artist;
+    info.album = album;
+    info.duration_ms = duration_ms;
+    return send_set_media_info(info);
+}
+
+bool CmdSession::send_set_media_info(const MediaInfoPayload& info) {
+    // 若仅有实时单行歌词而无完整 LRC 文本，则同时填充 mLrc/lyrics 以便所有接收端展示
+    const std::string lrc_payload = !info.lyrics.empty() ? info.lyrics : info.lyric_line;
+    json::Value::Object obj{
+        {"title", info.title},
+        {"mTitle", info.title},
+        {"artist", info.artist},
+        {"mArtist", info.artist},
+        {"album", info.album},
+        {"mAlbum", info.album},
+        {"duration_ms", info.duration_ms},
+        {"durationMs", info.duration_ms},
+        {"mDuration", info.duration_ms},
+        {"position_ms", info.position_ms},
+        {"positionMs", info.position_ms},
+        {"mPosition", info.position_ms},
+        {"sourceName", info.source_name},
+        {"source_name", info.source_name},
+        {"mMetaChangeType", std::to_string(info.meta_change_type)},
+        {"metaChangeType", std::to_string(info.meta_change_type)},
+        {"metadata_change_type", info.meta_change_type},
+    };
+    if (!lrc_payload.empty()) {
+        obj["mLrc"] = lrc_payload;
+        obj["lyrics"] = lrc_payload;
+        obj["lrc"] = lrc_payload;
+    }
+    if (!info.lyric_line.empty()) {
+        obj["lyric_line"] = info.lyric_line;
+        obj["lyricLine"] = info.lyric_line;
+        obj["currentLyric"] = info.lyric_line;
+    }
+    const std::string json_str = json::dump(obj);
+    std::vector<uint8_t> p(json_str.begin(), json_str.end());
     return send_cmd(CmdType::SetMediaInfo, p, true);
 }
 
@@ -635,6 +684,23 @@ void CmdSession::handle_incoming_frame(const CmdFrame& f) {
     if (safety_active_.load() && dec_cipher_locked_ && f.payload.size() >= 25) {
         if (auto p = dec_cipher_.decrypt_blob(f.payload)) {
             out.payload = std::move(*p);
+        }
+    }
+    // 兼容直接发送 Pause/Resume/SetPosition 请求帧的接收端，及时回复对应 Ack
+    if (out.cmd_type == static_cast<uint16_t>(CmdType::Pause) ||
+        out.cmd_type == static_cast<uint16_t>(CmdType::Resume) ||
+        out.cmd_type == static_cast<uint16_t>(CmdType::SetPosition)) {
+        const uint16_t ack_cmd = static_cast<uint16_t>(out.cmd_type + 1);
+        std::lock_guard<std::mutex> slk(send_mu_);
+        std::vector<uint8_t> ack_payload;
+        if (safety_active_.load() && enc_cipher_.is_ready()) {
+            ack_payload = enc_cipher_.encrypt_blob(ack_payload);
+        }
+        send_raw_locked(ack_cmd, out.seq, ack_payload);
+    }
+    if (cbs_.on_remote_control) {
+        for (const auto& ev : decode_remote_control_events(out.cmd_type, out.payload)) {
+            cbs_.on_remote_control(ev);
         }
     }
     if (cbs_.on_frame) cbs_.on_frame(out);

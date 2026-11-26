@@ -28,7 +28,8 @@ public:
         uint32_t rtp_ts_90khz = 0;     // 32-bit RTP Timestamp
         uint64_t play_target_us = 0;   // 绝对物理目标播放时刻 (us, 主时钟域)
     };
-    FrameTimestamps next_frame_timestamps(uint32_t frame_samples);
+    FrameTimestamps next_frame_timestamps(uint32_t frame_samples, bool include_delay = true);
+    void skip_samples(uint64_t samples);
 
     // 当发生设备重路由、授权等待或进程挂起导致样本时钟明显落后实时墙钟时，按整帧倍数追齐到当前墙钟
     void catch_up_to_now(uint32_t frame_samples, uint64_t now_us = 0);

@@ -2,6 +2,7 @@
 #include "sync/master_clock.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -23,6 +24,7 @@
   #include <fcntl.h>
   #include <poll.h>
   #include <signal.h>
+  #include <spawn.h>
   #include <sys/types.h>
   #include <sys/wait.h>
   #include <unistd.h>
@@ -158,6 +160,25 @@ std::vector<WinRenderEndpointInfo> enum_active_render_endpoints(IMMDeviceEnumera
     return list;
 }
 
+bool active_endpoint(IMMDeviceEnumerator* enumerator, const std::wstring& id) {
+    IMMDevice* device = nullptr;
+    if (!enumerator || FAILED(enumerator->GetDevice(id.c_str(), &device)) || !device) return false;
+    DWORD state = 0;
+    const bool active = SUCCEEDED(device->GetState(&state)) && (state & DEVICE_STATE_ACTIVE);
+    device->Release();
+    return active;
+}
+
+bool endpoint_available(const std::wstring& id) {
+    const auto hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
+    IMMDeviceEnumerator* enumerator = nullptr;
+    const bool active = create_device_enumerator(&enumerator) && active_endpoint(enumerator, id);
+    if (enumerator) enumerator->Release();
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return active;
+}
+
 bool contains_icase_w(std::wstring_view haystack, std::wstring_view needle) {
     if (needle.empty() || haystack.size() < needle.size()) return false;
     auto to_low = [](wchar_t c) -> wchar_t {
@@ -236,11 +257,19 @@ public:
 
     // 将系统默认输出接管到指定或自动挑选的静默 eRender 端点，供原生 eRender WASAPI Loopback 直接抓取
     bool start(const std::wstring& requested_target_id = {}) {
+        if (is_active()) {
+            const bool target_present = active_endpoint(enumerator_, capture_endpoint_);
+            const bool owns_route = std::all_of(kPlaybackRoles.begin(), kPlaybackRoles.end(),
+                [&](auto role) { return default_playback_endpoint(enumerator_, role) == capture_endpoint_; });
+            if (requested_target_id == requested_target_id_ && target_present && owns_route) return true;
+            stop();
+        }
         if (!open()) return false;
-        if (read_saved_route() && !restore_endpoints()) {
+        if ((!virtual_endpoint_.empty() || read_saved_route()) && !restore_endpoints()) {
             stop();
             return false;
         }
+        virtual_endpoint_.clear();
         for (size_t i = 0; i < kPlaybackRoles.size(); ++i) {
             previous_[i] = default_playback_endpoint(enumerator_, kPlaybackRoles[i]);
         }
@@ -248,7 +277,9 @@ public:
         virtual_endpoint_ = requested_target_id.empty()
                                 ? find_best_takeover_render_endpoint(enumerator_, cur_def)
                                 : requested_target_id;
-        if (virtual_endpoint_.empty() || !valid_saved_route() || !record_route()) {
+        auto endpoints = enum_active_render_endpoints(enumerator_);
+        if (!valid_saved_route() || std::none_of(endpoints.begin(), endpoints.end(),
+                [&](const auto& ep) { return ep.id == virtual_endpoint_; }) || !record_route()) {
             virtual_endpoint_.clear();
             stop();
             return false;
@@ -262,17 +293,20 @@ public:
             }
         }
         capture_endpoint_ = virtual_endpoint_;
+        requested_target_id_ = requested_target_id;
         return true;
     }
 
-    bool is_active() const { return !virtual_endpoint_.empty(); }
+    bool is_active() const { return !capture_endpoint_.empty(); }
     const std::wstring& capture_endpoint() const { return capture_endpoint_; }
 
     void stop() {
         if (policy_ && !virtual_endpoint_.empty()) {
-            if (restore_endpoints() && !recovery_file_.empty()) DeleteFileW(recovery_file_.c_str());
+            if (restore_endpoints()) {
+                if (!recovery_file_.empty()) DeleteFileW(recovery_file_.c_str());
+                virtual_endpoint_.clear();
+            }
         }
-        virtual_endpoint_.clear();
         capture_endpoint_.clear();
         if (policy_) { policy_->Release(); policy_ = nullptr; }
         if (enumerator_) { enumerator_->Release(); enumerator_ = nullptr; }
@@ -349,6 +383,7 @@ private:
     const std::filesystem::path recovery_file_ = playback_recovery_file();
     std::wstring virtual_endpoint_;
     std::wstring capture_endpoint_;
+    std::wstring requested_target_id_;
     std::array<std::wstring, kPlaybackRoles.size()> previous_;
     IMMDeviceEnumerator* enumerator_ = nullptr;
     IPlaybackPolicyConfig* policy_ = nullptr;
@@ -363,7 +398,8 @@ class WasapiCapture {
 public:
     ~WasapiCapture() { stop(); }
 
-    bool start(uint32_t target_rate, size_t frame_samples, const std::wstring& requested_endpoint = {}) {
+    bool start(uint32_t target_rate, size_t frame_samples, const std::wstring& requested_endpoint,
+               const std::atomic<bool>& source_running) {
         stop();
         target_rate_ = target_rate > 0 ? target_rate : 48000;
         frame_samples_ = frame_samples > 0 ? frame_samples : 480;
@@ -373,15 +409,15 @@ public:
             fifo_.reset(target_rate_, frame_samples_);
         }
         stop_req_.store(false);
-        default_changed_.store(false);
         active_.store(false);
 
-        std::mutex init_mu;
-        std::condition_variable init_cv;
-        bool init_done = false;
-        bool init_ok = false;
-
-        capture_th_ = std::thread([this, &init_mu, &init_cv, &init_done, &init_ok]() {
+        struct Startup {
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::optional<bool> result;
+        };
+        auto startup = std::make_shared<Startup>();
+        capture_th_ = std::thread([this, startup, &source_running]() {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             const HRESULT hr_com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             const bool com_init = SUCCEEDED(hr_com);
@@ -405,10 +441,12 @@ public:
             std::wstring active_ep_id;
 
             auto cleanup = [&]() {
-                if (audio_client) { audio_client->Stop(); audio_client->Release(); }
+                if (audio_client) audio_client->Stop();
                 if (capture_client) capture_client->Release();
-                if (keepalive_client) { keepalive_client->Stop(); keepalive_client->Release(); }
+                if (audio_client) audio_client->Release();
+                if (keepalive_client) keepalive_client->Stop();
                 if (keepalive_render) keepalive_render->Release();
+                if (keepalive_client) keepalive_client->Release();
                 if (mix_fmt) CoTaskMemFree(mix_fmt);
                 if (device) device->Release();
                 if (enumerator) enumerator->Release();
@@ -416,18 +454,16 @@ public:
             };
 
             bool ok = false;
-            bool is_float32 = false;
-            bool is_pcm16 = false;
-            bool is_pcm24 = false;
-            bool is_pcm32 = false;
+            CaptureSampleFormat sample_format = CaptureSampleFormat::Pcm16;
             uint32_t src_rate = target_rate_;
             uint32_t src_ch = 2;
             uint32_t src_block_align = 4;
+            uint32_t channel_mask = 0;
 
             do {
-                if (!create_device_enumerator(&enumerator) || !enumerator) break;
+                if (!com_init || !create_device_enumerator(&enumerator) || !enumerator) break;
                 if (!requested_endpoint_.empty()) {
-                    enumerator->GetDevice(requested_endpoint_.c_str(), &device);
+                    if (FAILED(enumerator->GetDevice(requested_endpoint_.c_str(), &device)) || !device) break;
                 }
                 if (!device) {
                     following_default = true;
@@ -455,40 +491,22 @@ public:
                 bool use_native_mix = false;
                 if (SUCCEEDED(audio_client->GetMixFormat(&mix_fmt)) && mix_fmt && mix_fmt->nChannels >= 1 &&
                     mix_fmt->nSamplesPerSec >= 8000) {
-                    bool fmt_supported = false;
-                    if (mix_fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT && mix_fmt->wBitsPerSample == 32) {
-                        is_float32 = true;
-                        fmt_supported = true;
-                    } else if (mix_fmt->wFormatTag == WAVE_FORMAT_PCM && mix_fmt->wBitsPerSample == 16) {
-                        is_pcm16 = true;
-                        fmt_supported = true;
-                    } else if (mix_fmt->wFormatTag == WAVE_FORMAT_PCM && mix_fmt->wBitsPerSample == 24) {
-                        is_pcm24 = true;
-                        fmt_supported = true;
-                    } else if (mix_fmt->wFormatTag == WAVE_FORMAT_PCM && mix_fmt->wBitsPerSample == 32) {
-                        is_pcm32 = true;
-                        fmt_supported = true;
-                    } else if (mix_fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix_fmt->cbSize >= 22) {
+                    bool pcm = mix_fmt->wFormatTag == WAVE_FORMAT_PCM;
+                    bool floating = mix_fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
+                    if (mix_fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix_fmt->cbSize >= 22) {
                         const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix_fmt);
-                        if (std::memcmp(&ext->SubFormat, &kSubIeeeFloat, sizeof(GUID)) == 0 &&
-                            mix_fmt->wBitsPerSample == 32) {
-                            is_float32 = true;
-                            fmt_supported = true;
-                        } else if (std::memcmp(&ext->SubFormat, &kSubPcm, sizeof(GUID)) == 0 &&
-                                   mix_fmt->wBitsPerSample == 16) {
-                            is_pcm16 = true;
-                            fmt_supported = true;
-                        } else if (std::memcmp(&ext->SubFormat, &kSubPcm, sizeof(GUID)) == 0 &&
-                                   mix_fmt->wBitsPerSample == 24) {
-                            is_pcm24 = true;
-                            fmt_supported = true;
-                        } else if (std::memcmp(&ext->SubFormat, &kSubPcm, sizeof(GUID)) == 0 &&
-                                   mix_fmt->wBitsPerSample == 32) {
-                            is_pcm32 = true;
-                            fmt_supported = true;
-                        }
+                        channel_mask = ext->dwChannelMask;
+                        floating = std::memcmp(&ext->SubFormat, &kSubIeeeFloat, sizeof(GUID)) == 0;
+                        pcm = std::memcmp(&ext->SubFormat, &kSubPcm, sizeof(GUID)) == 0;
                     }
-                    if (fmt_supported &&
+                    const auto bits = mix_fmt->wBitsPerSample;
+                    const bool fmt_supported = (floating && bits == 32) ||
+                                               (pcm && (bits == 16 || bits == 24 || bits == 32));
+                    if (floating) sample_format = CaptureSampleFormat::Float32;
+                    else if (bits == 24) sample_format = CaptureSampleFormat::Pcm24;
+                    else if (bits == 32) sample_format = CaptureSampleFormat::Pcm32;
+
+                    if (fmt_supported && mix_fmt->nBlockAlign >= mix_fmt->nChannels * (bits / 8) &&
                         SUCCEEDED(audio_client->Initialize(
                             AUDCLNT_SHAREMODE_SHARED, loopback_flag, 2000000, 0, mix_fmt, nullptr))) {
                         use_native_mix = true;
@@ -499,10 +517,8 @@ public:
                 }
 
                 if (!use_native_mix) {
-                    is_float32 = false;
-                    is_pcm24 = false;
-                    is_pcm32 = false;
-                    is_pcm16 = true;
+                    sample_format = CaptureSampleFormat::Pcm16;
+                    channel_mask = 0;
                     src_rate = target_rate_;
                     src_ch = 2;
                     src_block_align = 4;
@@ -547,17 +563,17 @@ public:
                     }
                 }
 
-                if (FAILED(audio_client->Start())) break;
+                if (stop_req_.load() || !source_running.load() || FAILED(audio_client->Start())) break;
                 ok = true;
             } while (false);
 
             {
-                std::lock_guard<std::mutex> lk(init_mu);
-                init_ok = ok;
-                init_done = true;
+                std::lock_guard<std::mutex> lk(startup->mutex);
+                ok = ok && !stop_req_.load() && source_running.load();
                 active_.store(ok);
+                startup->result = ok;
+                startup->cv.notify_one();
             }
-            init_cv.notify_one();
 
             if (!ok) {
                 cleanup();
@@ -573,6 +589,7 @@ public:
             std::vector<int16_t> resampled;
             StreamLinearResampler resampler;
             resampler.reset(src_rate, target_rate_);
+            StereoDownmixer downmixer(sample_format, src_ch, channel_mask, src_block_align);
             auto next_def_check = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
 
             while (!stop_req_.load()) {
@@ -601,41 +618,8 @@ public:
                         converted.resize(static_cast<size_t>(num_frames) * 2);
                         if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) || !data) {
                             std::fill(converted.begin(), converted.end(), 0);
-                        } else if (is_float32) {
-                            for (UINT32 i = 0; i < num_frames; ++i) {
-                                const float* f = reinterpret_cast<const float*>(data + i * src_block_align);
-                                float fl = std::clamp(std::isfinite(f[0]) ? f[0] : 0.0f, -1.0f, 1.0f);
-                                float fr = (src_ch >= 2) ? std::clamp(std::isfinite(f[1]) ? f[1] : 0.0f, -1.0f, 1.0f) : fl;
-                                converted[i * 2]     = static_cast<int16_t>(std::lround(fl * 32767.0f));
-                                converted[i * 2 + 1] = static_cast<int16_t>(std::lround(fr * 32767.0f));
-                            }
-                        } else if (is_pcm16) {
-                            for (UINT32 i = 0; i < num_frames; ++i) {
-                                const int16_t* p = reinterpret_cast<const int16_t*>(data + i * src_block_align);
-                                converted[i * 2]     = p[0];
-                                converted[i * 2 + 1] = (src_ch >= 2) ? p[1] : p[0];
-                            }
-                        } else if (is_pcm24) {
-                            for (UINT32 i = 0; i < num_frames; ++i) {
-                                const uint8_t* p = data + i * src_block_align;
-                                auto read24 = [](const uint8_t* b) -> int16_t {
-                                    int32_t v = static_cast<int32_t>(b[0]) |
-                                                (static_cast<int32_t>(b[1]) << 8) |
-                                                (static_cast<int32_t>(b[2]) << 16);
-                                    if (v & 0x800000) v |= ~0xFFFFFF;
-                                    return static_cast<int16_t>(v >> 8);
-                                };
-                                int16_t l = read24(p);
-                                int16_t r = (src_ch >= 2) ? read24(p + 3) : l;
-                                converted[i * 2]     = l;
-                                converted[i * 2 + 1] = r;
-                            }
-                        } else if (is_pcm32) {
-                            for (UINT32 i = 0; i < num_frames; ++i) {
-                                const int32_t* p = reinterpret_cast<const int32_t*>(data + i * src_block_align);
-                                converted[i * 2]     = static_cast<int16_t>(p[0] >> 16);
-                                converted[i * 2 + 1] = static_cast<int16_t>(((src_ch >= 2) ? p[1] : p[0]) >> 16);
-                            }
+                        } else {
+                            downmixer.convert(data, num_frames, converted.data());
                         }
 
                         if (src_rate == target_rate_) {
@@ -649,7 +633,7 @@ public:
                             }
                         }
                     }
-                    capture_client->ReleaseBuffer(num_frames);
+                    if (FAILED(next = capture_client->ReleaseBuffer(num_frames))) break;
                 }
 
                 if (FAILED(next)) {
@@ -664,7 +648,6 @@ public:
                         std::wstring cur = default_playback_endpoint(enumerator, eMultimedia);
                         if (cur.empty()) cur = default_playback_endpoint(enumerator, eConsole);
                         if (!cur.empty() && cur != active_ep_id) {
-                            default_changed_.store(true);
                             active_.store(false);
                             break;
                         }
@@ -688,26 +671,23 @@ public:
             cleanup();
         });
 
-        std::unique_lock<std::mutex> lk(init_mu);
-        init_cv.wait(lk, [&]() { return init_done; });
-        if (!init_ok) {
-            stop();
-            return false;
-        }
-        return true;
+        std::unique_lock<std::mutex> lk(startup->mutex);
+        startup->cv.wait(lk, [&]() { return startup->result.has_value(); });
+        const bool ok = *startup->result;
+        lk.unlock();
+        if (!ok) stop();
+        return ok;
     }
 
     void stop() {
         stop_req_.store(true);
         if (capture_th_.joinable()) capture_th_.join();
         active_.store(false);
-        default_changed_.store(false);
         std::lock_guard<std::mutex> lk(fifo_mu_);
         fifo_.reset(target_rate_, frame_samples_);
     }
 
     bool is_active() const { return active_.load(); }
-    bool default_endpoint_changed() const { return default_changed_.load(); }
 
     void read_stereo_frame(int16_t* dst, size_t out_frames) {
         if (!active_.load()) {
@@ -721,7 +701,6 @@ public:
 private:
     std::atomic<bool> stop_req_{false};
     std::atomic<bool> active_{false};
-    std::atomic<bool> default_changed_{false};
     uint32_t target_rate_ = 48000;
     size_t frame_samples_ = 480;
     std::wstring requested_endpoint_;
@@ -763,73 +742,154 @@ private:
 void StreamLinearResampler::reset(uint32_t src_rate, uint32_t dst_rate) {
     src_rate_ = src_rate > 0 ? src_rate : 48000;
     dst_rate_ = dst_rate > 0 ? dst_rate : 48000;
-    step_ = static_cast<double>(src_rate_) / static_cast<double>(dst_rate_);
-    phase_ = 0.0;
+    phase_ = 0;
     has_prev_ = false;
-    prev_l_ = 0;
-    prev_r_ = 0;
+    previous_ = {};
+    history_ = {};
+    history_pos_ = 0;
+    warmup_ = 0;
+    if (src_rate_ <= dst_rate_) return;
+
+    const double cutoff = 0.45 * dst_rate_ / src_rate_;
+    constexpr size_t center = kFilterTaps / 2;
+    double sum = 0;
+    for (size_t i = 0; i < kFilterTaps; ++i) {
+        const double pos = static_cast<double>(i) - center;
+        const double sinc = pos == 0 ? 2 * cutoff : std::sin(kTwoPi * cutoff * pos) / (kTwoPi * 0.5 * pos);
+        const double angle = kTwoPi * i / (kFilterTaps - 1);
+        const double window = 0.42 - 0.5 * std::cos(angle) + 0.08 * std::cos(2 * angle);
+        filter_[i] = sinc * window;
+        sum += filter_[i];
+    }
+    for (double& tap : filter_) tap /= sum;
 }
 
-void StreamLinearResampler::process_interleaved_stereo(const int16_t* in_stereo, size_t in_frames,
-                                                       std::vector<int16_t>& out_stereo) {
-    out_stereo.clear();
-    if (!in_stereo || in_frames == 0) return;
+void StreamLinearResampler::process_interleaved_stereo(const int16_t* in, size_t frames,
+                                                       std::vector<int16_t>& out) {
+    out.clear();
+    if (!in || frames == 0) return;
     if (src_rate_ == dst_rate_) {
-        out_stereo.assign(in_stereo, in_stereo + in_frames * 2);
+        out.assign(in, in + frames * 2);
         return;
     }
 
-    // 精确跨包连续插值：
-    // - 首包有效索引为 [0 .. in_frames-1]，仅计算 phase_ < in_frames-1，留下末样本为 prev_
-    // - 后续包虚拟序列为 [prev_, in[0], ..., in[in_frames-1]]（共 in_frames+1 点），
-    //   计算 0 <= phase_ < in_frames，使每个跨包边界点都严格在 prev_ 与 in[0] 之间线性插值，零平顶毛刺！
-    const size_t approx_out = static_cast<size_t>(static_cast<double>(in_frames) / step_) + 4;
-    out_stereo.reserve(approx_out * 2);
-
-    if (!has_prev_) {
-        const double limit = static_cast<double>(in_frames - 1);
-        while (phase_ < limit) {
-            const size_t i0 = static_cast<size_t>(phase_);
-            const size_t i1 = i0 + 1;
-            const double frac = phase_ - static_cast<double>(i0);
-            const double ol = in_stereo[i0 * 2] * (1.0 - frac) + in_stereo[i1 * 2] * frac;
-            const double or_ = in_stereo[i0 * 2 + 1] * (1.0 - frac) + in_stereo[i1 * 2 + 1] * frac;
-            out_stereo.push_back(static_cast<int16_t>(std::clamp(std::lround(ol), -32768L, 32767L)));
-            out_stereo.push_back(static_cast<int16_t>(std::clamp(std::lround(or_), -32768L, 32767L)));
-            phase_ += step_;
+    out.reserve((static_cast<uint64_t>(frames) * dst_rate_ / src_rate_ + 2) * 2);
+    for (size_t i = 0; i < frames; ++i) {
+        std::array<double, 2> sample{static_cast<double>(in[i * 2]), static_cast<double>(in[i * 2 + 1])};
+        // Evaluate the FIR only when an output may use this or the next sample.
+        if (src_rate_ > dst_rate_) {
+            if (!has_prev_) {
+                initial_ = sample;
+                history_.fill(sample);
+            }
+            history_[history_pos_] = sample;
+            if (phase_ <= static_cast<uint64_t>(dst_rate_) * 2) {
+                sample = {};
+                size_t j = history_pos_;
+                for (double tap : filter_) {
+                    sample[0] += tap * history_[j][0];
+                    sample[1] += tap * history_[j][1];
+                    j = j == 0 ? kFilterTaps - 1 : j - 1;
+                }
+                if (warmup_ < 2 * kFilterTaps) {
+                    const double weight = 0.5 - 0.5 * std::cos(kTwoPi * warmup_ / (4 * kFilterTaps));
+                    for (size_t ch = 0; ch < 2; ++ch) sample[ch] = initial_[ch] + weight * (sample[ch] - initial_[ch]);
+                }
+            }
+            if (warmup_ < 2 * kFilterTaps) ++warmup_;
+            history_pos_ = (history_pos_ + 1) % kFilterTaps;
         }
-        phase_ -= limit;
-        prev_l_ = in_stereo[(in_frames - 1) * 2];
-        prev_r_ = in_stereo[(in_frames - 1) * 2 + 1];
+        while (phase_ <= dst_rate_) {
+            const double fraction = has_prev_ ? static_cast<double>(phase_) / dst_rate_ : 1.0;
+            for (size_t ch = 0; ch < 2; ++ch) {
+                const double value = previous_[ch] * (1 - fraction) + sample[ch] * fraction;
+                out.push_back(static_cast<int16_t>(std::clamp(std::lround(value), -32768L, 32767L)));
+            }
+            phase_ += src_rate_;
+            if (!has_prev_) {
+                phase_ += dst_rate_;
+                break;
+            }
+        }
+        phase_ -= dst_rate_;
+        previous_ = sample;
         has_prev_ = true;
-        return;
     }
+}
 
-    const double limit = static_cast<double>(in_frames);
-    while (phase_ < limit) {
-        const size_t idx0 = static_cast<size_t>(phase_);
-        const double frac = phase_ - static_cast<double>(idx0);
-        int16_t l0, r0, l1, r1;
-        if (idx0 == 0) {
-            l0 = prev_l_;
-            r0 = prev_r_;
-            l1 = in_stereo[0];
-            r1 = in_stereo[1];
-        } else {
-            l0 = in_stereo[(idx0 - 1) * 2];
-            r0 = in_stereo[(idx0 - 1) * 2 + 1];
-            l1 = in_stereo[idx0 * 2];
-            r1 = in_stereo[idx0 * 2 + 1];
+StereoDownmixer::StereoDownmixer(CaptureSampleFormat format, size_t channels, uint32_t mask, size_t stride)
+    : format_(format), stride_(stride),
+      sample_bytes_(format == CaptureSampleFormat::Pcm16 ? 2 : format == CaptureSampleFormat::Pcm24 ? 3 : 4),
+      weights_(channels) {
+    if (channels == 1) {
+        weights_[0] = {1, 1};
+    } else if (channels == 2) {
+        weights_[0] = {1, 0};
+        weights_[1] = {0, 1};
+    } else {
+        constexpr double surround = 0.7071067811865476;
+        const bool mapped = static_cast<size_t>(std::popcount(mask)) == channels;
+        for (size_t i = 0; i < channels; ++i) {
+            // For an unlabelled layout, keep the first pair stereo and fold remaining channels into both sides.
+            uint32_t position = mapped ? mask & (0u - mask) : (i < 2 ? 1u << i : 0u);
+            mask &= mask - 1;
+            switch (position) {
+            case 0x1: weights_[i] = {1, 0}; break; // Front left
+            case 0x2: weights_[i] = {0, 1}; break; // Front right
+            case 0x10: case 0x40: case 0x200: case 0x1000: case 0x8000:
+                weights_[i] = {surround, 0};
+                break;
+            case 0x20: case 0x80: case 0x400: case 0x4000: case 0x20000:
+                weights_[i] = {0, surround};
+                break;
+            case 0x8: weights_[i] = {0.5, 0.5}; break; // LFE
+            default: weights_[i] = {surround, surround}; break;
+            }
         }
-        const double ol = l0 * (1.0 - frac) + l1 * frac;
-        const double or_ = r0 * (1.0 - frac) + r1 * frac;
-        out_stereo.push_back(static_cast<int16_t>(std::clamp(std::lround(ol), -32768L, 32767L)));
-        out_stereo.push_back(static_cast<int16_t>(std::clamp(std::lround(or_), -32768L, 32767L)));
-        phase_ += step_;
+        std::array<double, 2> sum{};
+        for (const auto& weight : weights_) {
+            sum[0] += weight[0];
+            sum[1] += weight[1];
+        }
+        const double scale = std::max({1.0, sum[0], sum[1]});
+        for (auto& weight : weights_) {
+            weight[0] /= scale;
+            weight[1] /= scale;
+        }
     }
-    phase_ -= limit;
-    prev_l_ = in_stereo[(in_frames - 1) * 2];
-    prev_r_ = in_stereo[(in_frames - 1) * 2 + 1];
+}
+
+void StereoDownmixer::convert(const uint8_t* input, size_t frames, int16_t* output) const {
+    for (size_t i = 0; i < frames; ++i) {
+        std::array<double, 2> mix{};
+        for (size_t ch = 0; ch < weights_.size(); ++ch) {
+            const auto* src = input + i * stride_ + ch * sample_bytes_;
+            double sample = 0;
+            switch (format_) {
+            case CaptureSampleFormat::Float32: {
+                const float value = std::bit_cast<float>(read_u32_le(src));
+                if (std::isfinite(value)) sample = std::clamp(value, -1.0f, 1.0f) * 32768.0;
+                break;
+            }
+            case CaptureSampleFormat::Pcm16:
+                sample = std::bit_cast<int16_t>(read_u16_le(src));
+                break;
+            case CaptureSampleFormat::Pcm24:
+                // The two most significant bytes are the signed Q15 value.
+                sample = std::bit_cast<int16_t>(read_u16_le(src + 1));
+                break;
+            case CaptureSampleFormat::Pcm32:
+                // PCM32 and left-aligned PCM24-in-32 share these two high bytes.
+                sample = std::bit_cast<int16_t>(read_u16_le(src + 2));
+                break;
+            }
+            mix[0] += sample * weights_[ch][0];
+            mix[1] += sample * weights_[ch][1];
+        }
+        for (size_t ch = 0; ch < 2; ++ch) {
+            output[i * 2 + ch] = static_cast<int16_t>(std::clamp(std::lround(mix[ch]), -32768L, 32767L));
+        }
+    }
 }
 
 void SmoothLoopbackFifo::reset(uint32_t sample_rate, size_t frame_samples) {
@@ -846,6 +906,7 @@ void SmoothLoopbackFifo::reset(uint32_t sample_rate, size_t frame_samples) {
     high_water_frames_ = target_frames_ + ms30;
     max_frames_        = std::max(high_water_frames_ + frame_samples_ * 2, static_cast<size_t>(sample_rate_) / 4);
     primed_ = false;
+    splice_pending_ = false;
     last_l_ = 0;
     last_r_ = 0;
     ring_.clear();
@@ -853,6 +914,16 @@ void SmoothLoopbackFifo::reset(uint32_t sample_rate, size_t frame_samples) {
 
 void SmoothLoopbackFifo::push_interleaved_stereo(const int16_t* stereo_pcm, size_t frames) {
     if (!stereo_pcm || frames == 0) return;
+    if (frames > max_frames_ - available_frames()) {
+        splice_pending_ = primed_;
+        const size_t keep_incoming = std::min(frames, target_frames_);
+        const size_t keep_queued = target_frames_ - keep_incoming;
+        stereo_pcm += (frames - keep_incoming) * 2;
+        frames = keep_incoming;
+        if (available_frames() > keep_queued) {
+            ring_.erase(ring_.begin(), ring_.end() - static_cast<ptrdiff_t>(keep_queued * 2));
+        }
+    }
     ring_.insert(ring_.end(), stereo_pcm, stereo_pcm + frames * 2);
 }
 
@@ -882,21 +953,13 @@ void SmoothLoopbackFifo::pop_smooth_frame(int16_t* dst, size_t out_frames) {
         primed_ = true;
     }
 
-    // 极端积压保护（>200ms）：裁剪到目标水位，并在拼接点做 64 样本线性交叉淡化，杜绝硬切爆音
-    if (available_frames() > max_frames_) {
-        const size_t drop = available_frames() - target_frames_;
-        const size_t xfade = std::min<size_t>({64, drop, target_frames_});
-        std::vector<int16_t> head_save(xfade * 2);
-        for (size_t i = 0; i < xfade * 2; ++i) {
-            head_save[i] = ring_[i];
-        }
-        ring_.erase(ring_.begin(), ring_.begin() + static_cast<ptrdiff_t>(drop * 2));
-        for (size_t i = 0; i < xfade; ++i) {
-            const double w = static_cast<double>(i + 1) / static_cast<double>(xfade + 1);
-            const double l = head_save[i * 2] * (1.0 - w) + ring_[i * 2] * w;
-            const double r = head_save[i * 2 + 1] * (1.0 - w) + ring_[i * 2 + 1] * w;
-            ring_[i * 2]     = static_cast<int16_t>(std::clamp(std::lround(l), -32768L, 32767L));
-            ring_[i * 2 + 1] = static_cast<int16_t>(std::clamp(std::lround(r), -32768L, 32767L));
+    if (splice_pending_) {
+        splice_pending_ = false;
+        const size_t fade = std::min<size_t>(64, available_frames());
+        for (size_t i = 0; i < fade; ++i) {
+            const double weight = static_cast<double>(i + 1) / (fade + 1);
+            ring_[2 * i] = static_cast<int16_t>(std::lround(last_l_ * (1 - weight) + ring_[2 * i] * weight));
+            ring_[2 * i + 1] = static_cast<int16_t>(std::lround(last_r_ * (1 - weight) + ring_[2 * i + 1] * weight));
         }
     }
 
@@ -1038,7 +1101,13 @@ bool AudioPipeline::decode_wav_file(const std::string& path,
     out_error.clear();
     if (target_rate == 0) target_rate = 48000;
 
-    std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+    if (path.find('\0') != std::string::npos) {
+        out_error = "WAV 路径包含 NUL 字符";
+        return false;
+    }
+    const std::filesystem::path native_path(
+        std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
+    std::ifstream ifs(native_path, std::ios::binary | std::ios::ate);
     if (!ifs) {
         out_error = "无法打开 WAV 文件";
         return false;
@@ -1219,8 +1288,8 @@ bool AudioPipeline::decode_wav_file(const std::string& path,
         }
     }
 
-    auto slash = path.find_last_of("/\\");
-    out_meta.title = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    const auto file_name = native_path.filename().u8string();
+    out_meta.title.assign(reinterpret_cast<const char*>(file_name.data()), file_name.size());
     out_meta.artist = "Local WAV (" + std::to_string(src_rate / 1000) + "." +
                       std::to_string((src_rate % 1000) / 100) + "kHz " +
                       std::to_string(bits_per_sample) + "bit)";
@@ -1281,23 +1350,31 @@ bool AudioPipeline::set_source_mode(AudioSourceMode mode, const std::string& par
             if (err_out) *err_out = err;
             return false;
         }
+        const std::string sidecar_lrc = LrcDocument::load_sidecar_lrc_for_wav(param);
+        LrcDocument parsed_lrc = LrcDocument::parse(sidecar_lrc);
+        new_meta.lyrics = parsed_lrc.raw_text();
+        new_meta.lyric_line = parsed_lrc.line_at(0);
+        new_meta.paused = false;
         {
+            std::lock_guard publication(publication_mu_);
             std::lock_guard<std::mutex> lock(param_mu_);
             wav_pcm_ = std::move(decoded);
             wav_path_ = param;
             wav_decoded_rate_ = target_sr;
             wav_cursor_ = 0;
+            wav_paused_.store(false);
+            wav_lrc_ = std::move(parsed_lrc);
             source_param_ = param;
             meta_ = std::move(new_meta);
             last_error_.clear();
+            mode_.store(mode);
+            source_gen_.fetch_add(1);
         }
-        mode_.store(mode);
-        source_gen_.fetch_add(1);
-        stop_loopback_process();
         return true;
     }
 
     {
+        std::lock_guard publication(publication_mu_);
         std::lock_guard<std::mutex> lock(param_mu_);
         source_param_ = param;
         last_error_.clear();
@@ -1307,6 +1384,10 @@ bool AudioPipeline::set_source_mode(AudioSourceMode mode, const std::string& par
             meta_.album = "Multi-Room Sync Test";
             meta_.duration_ms = 0;
             meta_.position_ms = 0;
+            meta_.lyrics.clear();
+            meta_.lyric_line.clear();
+            meta_.paused = false;
+            wav_paused_.store(false);
         } else if (mode == AudioSourceMode::SystemLoopback) {
 #ifdef _WIN32
             meta_.title = "Windows 系统音频直抓 / 输出接管";
@@ -1317,11 +1398,14 @@ bool AudioPipeline::set_source_mode(AudioSourceMode mode, const std::string& par
             meta_.album = param.empty() ? "default" : param;
             meta_.duration_ms = 0;
             meta_.position_ms = 0;
+            meta_.lyrics.clear();
+            meta_.lyric_line.clear();
+            meta_.paused = false;
+            wav_paused_.store(false);
         }
+        mode_.store(mode);
+        source_gen_.fetch_add(1);
     }
-    mode_.store(mode);
-    source_gen_.fetch_add(1);
-    stop_loopback_process();
     return true;
 }
 
@@ -1340,17 +1424,37 @@ AudioTrackMeta AudioPipeline::current_meta() const {
     return meta_;
 }
 
+void AudioPipeline::set_wav_paused(bool paused) {
+    wav_paused_.store(paused);
+    std::lock_guard<std::mutex> lock(param_mu_);
+    meta_.paused = paused;
+}
+
+void AudioPipeline::seek_wav_ms(uint64_t position_ms) {
+    std::lock_guard<std::mutex> lock(param_mu_);
+    if (wav_pcm_.empty() || sample_rate_ == 0) return;
+    const size_t total_frames = wav_pcm_.size() / 2;
+    size_t target_frame = static_cast<size_t>((position_ms * sample_rate_) / 1000ULL);
+    if (target_frame >= total_frames) target_frame = total_frames > 0 ? total_frames - 1 : 0;
+    wav_cursor_ = target_frame * 2;
+    meta_.position_ms = (target_frame * 1000ULL) / sample_rate_;
+    if (!wav_lrc_.empty()) {
+        meta_.lyric_line = wav_lrc_.line_at(meta_.position_ms);
+    }
+}
+
+void AudioPipeline::set_wav_lrc_text(const std::string& lrc_text) {
+    LrcDocument doc = LrcDocument::parse(lrc_text);
+    std::lock_guard<std::mutex> lock(param_mu_);
+    wav_lrc_ = std::move(doc);
+    meta_.lyrics = wav_lrc_.raw_text();
+    meta_.lyric_line = wav_lrc_.line_at(meta_.position_ms);
+}
+
 void AudioPipeline::stop_loopback_process() {
 #if defined(__linux__)
-    int fd = -1;
-    int pid = -1;
-    {
-        std::lock_guard<std::mutex> lk(proc_mu_);
-        fd = loopback_fd_;
-        pid = loopback_pid_;
-        loopback_fd_ = -1;
-        loopback_pid_ = -1;
-    }
+    const int fd = std::exchange(loopback_fd_, -1);
+    const int pid = std::exchange(loopback_pid_, -1);
     if (fd >= 0) {
         ::close(fd);
     }
@@ -1360,7 +1464,7 @@ void AudioPipeline::stop_loopback_process() {
         bool reaped = false;
         for (int i = 0; i < 15; ++i) {
             pid_t r = ::waitpid(pid, &status, WNOHANG);
-            if (r == pid || r < 0) {
+            if (r == pid || (r < 0 && errno != EINTR)) {
                 reaped = true;
                 break;
             }
@@ -1368,7 +1472,7 @@ void AudioPipeline::stop_loopback_process() {
         }
         if (!reaped) {
             ::kill(pid, SIGKILL);
-            ::waitpid(pid, &status, 0);
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
         }
     }
 #endif
@@ -1376,10 +1480,14 @@ void AudioPipeline::stop_loopback_process() {
 
 bool AudioPipeline::start(uint32_t sample_rate, uint32_t frame_samples,
                           PcmFrameCallback pcm_cb, SpectrumCallback spec_cb,
-                          std::function<bool()> has_streaming_receiver) {
+                          std::function<bool()> has_streaming_receiver,
+                          std::function<void(uint64_t)> skip_samples, uint64_t session_origin_us) {
     if (running_.load()) return true;
-    sample_rate_ = sample_rate > 0 ? sample_rate : 48000;
-    frame_samples_ = frame_samples > 0 ? frame_samples : 480;
+    {
+        std::lock_guard lock(param_mu_);
+        sample_rate_ = sample_rate > 0 ? sample_rate : 48000;
+        frame_samples_ = frame_samples > 0 ? frame_samples : 480;
+    }
 
     // 若已加载 WAV 且目标采样率变化，自动按新采样率重新解码对齐播速
     {
@@ -1396,10 +1504,12 @@ bool AudioPipeline::start(uint32_t sample_rate, uint32_t frame_samples,
             std::string err;
             if (decode_wav_file(wav_path_copy, sample_rate_, redecoded, new_meta, err)) {
                 std::lock_guard<std::mutex> lock(param_mu_);
-                wav_pcm_ = std::move(redecoded);
-                wav_decoded_rate_ = sample_rate_;
-                wav_cursor_ = 0;
-                meta_ = std::move(new_meta);
+                if (wav_path_ == wav_path_copy && mode_.load() == AudioSourceMode::WavFile) {
+                    wav_pcm_ = std::move(redecoded);
+                    wav_decoded_rate_ = sample_rate_;
+                    wav_cursor_ = 0;
+                    meta_ = std::move(new_meta);
+                }
             }
         }
     }
@@ -1407,6 +1517,8 @@ bool AudioPipeline::start(uint32_t sample_rate, uint32_t frame_samples,
     pcm_cb_ = std::move(pcm_cb);
     spec_cb_ = std::move(spec_cb);
     has_streaming_receiver_ = std::move(has_streaming_receiver);
+    skip_samples_ = std::move(skip_samples);
+    session_origin_us_ = session_origin_us;
     running_.store(true);
     try {
         if (spec_cb_) spectrum_worker_ = std::thread(&AudioPipeline::spectrum_loop, this);
@@ -1425,16 +1537,17 @@ void AudioPipeline::stop() {
         pending_spectrum_.reset();
     }
     spectrum_cv_.notify_one();
-    stop_loopback_process();
     if (worker_.joinable()) worker_.join();
     if (spectrum_worker_.joinable()) spectrum_worker_.join();
-    stop_loopback_process();
 }
 
 void AudioPipeline::push_external_pcm(const int16_t* stereo_pcm, size_t frame_samples) {
+    const size_t max_samples = [&] {
+        std::lock_guard lock(param_mu_);
+        return sample_rate_ * 2;
+    }();
     std::lock_guard<std::mutex> lock(ext_mu_);
     ext_ring_.insert(ext_ring_.end(), stereo_pcm, stereo_pcm + frame_samples * 2);
-    const size_t max_samples = sample_rate_ * 2;
     if (ext_ring_.size() > max_samples) {
         ext_ring_.erase(ext_ring_.begin(),
                         ext_ring_.begin() + static_cast<ptrdiff_t>(ext_ring_.size() - max_samples));
@@ -1478,10 +1591,19 @@ void AudioPipeline::spectrum_loop() {
     }
 }
 
+uint64_t AudioPipeline::skipped_capture_samples(uint64_t scheduled_samples, uint32_t sample_rate,
+                                                 uint32_t frame_samples, uint64_t elapsed_us) {
+    if (sample_rate == 0 || frame_samples == 0) return 0;
+    const uint64_t due_samples = elapsed_us * sample_rate / 1000000ULL;
+    return due_samples > scheduled_samples
+        ? (due_samples - scheduled_samples) / frame_samples * frame_samples
+        : 0;
+}
+
 void AudioPipeline::worker_loop() {
     std::vector<int16_t> frame(frame_samples_ * 2, 0);
     // 使用有理数样点锚点计算绝对节拍时刻，彻底消除 1024/48000=21333.33us 的整数截断漂移
-    uint64_t tick_origin_us = sync::monotonic_now_us();
+    const uint64_t tick_origin_us = session_origin_us_ ? session_origin_us_ : sync::monotonic_now_us();
     uint64_t tick_samples = 0;
     uint64_t sample_idx = 0;
     uint64_t spec_div = 0;
@@ -1492,25 +1614,27 @@ void AudioPipeline::worker_loop() {
     WindowsPlaybackRoute playback_route;
     WasapiCapture wasapi;
     std::chrono::steady_clock::time_point next_route_attempt{};
-    std::chrono::steady_clock::time_point next_default_check{};
+    bool using_fallback = false;
+    std::wstring captured_endpoint;
     bool was_streaming_active = false;
     std::unique_ptr<void, decltype(&CloseHandle)> frame_timer(
         CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                TIMER_MODIFY_STATE | SYNCHRONIZE),
         &CloseHandle);
 #elif defined(__linux__)
-    std::vector<uint8_t> loopback_rem_bytes;
+    std::array<int16_t, 4098> read_buffer{};
+    auto* read_bytes = reinterpret_cast<uint8_t*>(read_buffer.data());
+    size_t remainder = 0;
     SmoothLoopbackFifo linux_fifo;
     linux_fifo.reset(sample_rate_, frame_samples_);
-    auto spawn_linux_loopback = [&]() {
-        stop_loopback_process();
+    auto spawn_linux_loopback = [&](const std::string& source_param) {
         std::vector<std::string> argv;
         {
             std::lock_guard<std::mutex> lk(param_mu_);
             if (!test_loopback_argv_.empty()) {
                 argv = test_loopback_argv_;
             } else {
-                std::string dev = source_param_.empty() ? "@DEFAULT_MONITOR@" : source_param_;
+                std::string dev = source_param.empty() ? "@DEFAULT_MONITOR@" : source_param;
                 argv = {
                     "parec",
                     "--format=s16le",
@@ -1522,75 +1646,81 @@ void AudioPipeline::worker_loop() {
                 };
             }
         }
+        std::vector<char*> cargv;
+        cargv.reserve(argv.size() + 1);
+        for (auto& a : argv) cargv.push_back(a.data());
+        cargv.push_back(nullptr);
         int pipefd[2]{-1, -1};
-        if (::pipe(pipefd) != 0) return;
-        pid_t pid = ::fork();
-        if (pid < 0) {
+        if (::pipe2(pipefd, O_CLOEXEC) != 0) return;
+        if (::fcntl(pipefd[0], F_SETFL, O_NONBLOCK) < 0) {
             ::close(pipefd[0]);
             ::close(pipefd[1]);
             return;
         }
-        if (pid == 0) {
-            ::close(pipefd[0]);
-            ::dup2(pipefd[1], STDOUT_FILENO);
-            ::close(pipefd[1]);
-            int devnull = ::open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                ::dup2(devnull, STDERR_FILENO);
-                ::close(devnull);
+        posix_spawn_file_actions_t actions;
+        int result = ::posix_spawn_file_actions_init(&actions);
+        pid_t pid = -1;
+        if (result == 0) {
+            result = ::posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+            if (result == 0) result = ::posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+            if (result == 0 && pipefd[1] != STDOUT_FILENO) {
+                result = ::posix_spawn_file_actions_addclose(&actions, pipefd[1]);
             }
-            std::vector<char*> cargv;
-            cargv.reserve(argv.size() + 1);
-            for (auto& a : argv) cargv.push_back(a.data());
-            cargv.push_back(nullptr);
-            ::execvp(cargv[0], cargv.data());
-            _exit(127);
+            if (result == 0) {
+                result = ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+            }
+            if (result == 0) result = ::posix_spawnp(&pid, cargv[0], &actions, nullptr, cargv.data(), environ);
+            ::posix_spawn_file_actions_destroy(&actions);
         }
         ::close(pipefd[1]);
-        int flags = ::fcntl(pipefd[0], F_GETFL, 0);
-        if (flags >= 0) ::fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
-        {
-            std::lock_guard<std::mutex> lk(proc_mu_);
-            if (!running_.load()) {
-                ::close(pipefd[0]);
-                ::kill(pid, SIGTERM);
-                ::waitpid(pid, nullptr, 0);
-                return;
-            }
-            loopback_fd_ = pipefd[0];
-            loopback_pid_ = static_cast<int>(pid);
+        if (result != 0) {
+            ::close(pipefd[0]);
+            return;
         }
-        loopback_rem_bytes.clear();
+        loopback_fd_ = pipefd[0];
+        loopback_pid_ = pid;
+        remainder = 0;
         linux_fifo.reset(sample_rate_, frame_samples_);
     };
 #endif
 
     while (running_.load()) {
-        const auto cur_mode = mode_.load();
-        const uint64_t cur_gen = source_gen_.load();
+        AudioSourceMode cur_mode;
+        uint64_t cur_gen;
+        std::string source_param;
+        {
+            std::lock_guard lock(param_mu_);
+            cur_mode = mode_.load();
+            cur_gen = source_gen_.load();
+            source_param = source_param_;
+        }
+        const auto now_before_frame = sync::monotonic_now_us();
+        const uint64_t elapsed = now_before_frame > tick_origin_us ? now_before_frame - tick_origin_us : 0;
+        if (const auto skipped = skipped_capture_samples(tick_samples, sample_rate_, frame_samples_, elapsed)) {
+            tick_samples += skipped;
+            sample_idx += skipped;
+            if (skip_samples_) skip_samples_(skipped);
+        }
         std::fill(frame.begin(), frame.end(), 0);
 
 #ifdef _WIN32
         const bool is_loopback_mode = (cur_mode == AudioSourceMode::SystemLoopback);
         const bool is_streaming = has_streaming_receiver_ && has_streaming_receiver_();
-        std::string win_param;
-        if (is_loopback_mode) {
-            std::lock_guard<std::mutex> lk(param_mu_);
-            win_param = source_param_;
-        }
+        const auto& win_param = source_param;
         const bool want_takeover = is_loopback_mode &&
                                    (win_param == "@TAKEOVER_AUTO@" || win_param.rfind("takeover:", 0) == 0);
-        if (!is_loopback_mode || cur_gen != last_gen ||
-            (want_takeover && is_streaming != was_streaming_active)) {
-            if (wasapi.is_active()) wasapi.stop();
-            if (playback_route.is_active()) playback_route.stop();
+        if (cur_gen != last_gen || (want_takeover && is_streaming != was_streaming_active)) {
+            wasapi.stop();
+            playback_route.stop();
+            using_fallback = false;
+            captured_endpoint.clear();
             next_route_attempt = {};
         }
         was_streaming_active = is_streaming;
 #elif defined(__linux__)
         if (cur_mode != AudioSourceMode::SystemLoopback || cur_gen != last_gen) {
             stop_loopback_process();
-            loopback_rem_bytes.clear();
+            remainder = 0;
             linux_fifo.reset(sample_rate_, frame_samples_);
         }
 #endif
@@ -1609,12 +1739,17 @@ void AudioPipeline::worker_loop() {
             }
         } else if (cur_mode == AudioSourceMode::WavFile) {
             std::lock_guard<std::mutex> lock(param_mu_);
-            if (!wav_pcm_.empty()) {
+            const bool paused = wav_paused_.load();
+            meta_.paused = paused;
+            if (!wav_pcm_.empty() && !paused) {
                 for (size_t i = 0; i < frame_samples_ * 2; ++i) {
                     frame[i] = wav_pcm_[wav_cursor_];
                     wav_cursor_ = (wav_cursor_ + 1) % wav_pcm_.size();
                 }
                 meta_.position_ms = (wav_cursor_ / 2) * 1000ULL / sample_rate_;
+                if (!wav_lrc_.empty()) {
+                    meta_.lyric_line = wav_lrc_.line_at(meta_.position_ms);
+                }
             }
         } else if (cur_mode == AudioSourceMode::ExternalPcm) {
             std::lock_guard<std::mutex> lock(ext_mu_);
@@ -1626,75 +1761,53 @@ void AudioPipeline::worker_loop() {
         } else if (cur_mode == AudioSourceMode::SystemLoopback) {
 #ifdef _WIN32
             const auto now = std::chrono::steady_clock::now();
-            // 热跟随系统默认输出设备切换（例如用户插拔耳机或切换任务栏输出设备）
-            if (wasapi.is_active() && !want_takeover && now >= next_default_check) {
-                next_default_check = now + std::chrono::milliseconds(500);
-                if (wasapi.default_endpoint_changed()) {
-                    wasapi.stop();
-                    next_route_attempt = {};
-                }
-            }
-            if (!wasapi.is_active() && now >= next_route_attempt) {
+            const bool wants_route = want_takeover && is_streaming;
+            if (now >= next_route_attempt && (!wasapi.is_active() || using_fallback || wants_route)) {
                 next_route_attempt = now + std::chrono::milliseconds(800);
                 std::wstring target_ep;
-                if (want_takeover && is_streaming) {
-                    std::wstring req_takeover;
+                const bool explicit_capture = win_param.rfind("loopback:", 0) == 0;
+                if (wants_route) {
+                    std::wstring requested;
                     if (win_param.rfind("takeover:", 0) == 0) {
-                        req_takeover = utf8_to_wide(std::string_view(win_param).substr(9));
+                        requested = utf8_to_wide(std::string_view(win_param).substr(9));
                     }
-                    if (playback_route.start(req_takeover)) {
-                        target_ep = playback_route.capture_endpoint();
-                    }
-                } else if (win_param.rfind("loopback:", 0) == 0) {
-                    target_ep = utf8_to_wide(std::string_view(win_param).substr(9));
+                    if (playback_route.start(requested)) target_ep = playback_route.capture_endpoint();
+                } else if (explicit_capture) {
+                    const auto requested = utf8_to_wide(std::string_view(win_param).substr(9));
+                    if (endpoint_available(requested)) target_ep = requested;
                 }
-                // 优先直接用原生 WASAPI eRender Loopback 抓取目标端点；若静默接管无可用次级端点则无缝回退默认输出直抓
-                if (!wasapi.start(sample_rate_, frame_samples_, target_ep)) {
-                    if (playback_route.is_active()) playback_route.stop();
-                    if (!target_ep.empty()) {
-                        wasapi.start(sample_rate_, frame_samples_, {});
+                using_fallback = (wants_route || explicit_capture) && target_ep.empty();
+                if (!wasapi.is_active() || captured_endpoint != target_ep) {
+                    if (wasapi.start(sample_rate_, frame_samples_, target_ep, running_)) {
+                        captured_endpoint = target_ep;
+                    } else if (!target_ep.empty()) {
+                        playback_route.stop();
+                        captured_endpoint.clear();
+                        using_fallback = true;
+                        if (running_.load()) wasapi.start(sample_rate_, frame_samples_, {}, running_);
                     }
                 }
-                tick_origin_us = sync::monotonic_now_us();
-                tick_samples = 0;
             }
             if (wasapi.is_active()) wasapi.read_stereo_frame(frame.data(), frame_samples_);
 #elif defined(__linux__)
-            int fd = -1;
-            {
-                std::lock_guard<std::mutex> lk(proc_mu_);
-                fd = loopback_fd_;
-            }
-            if (fd < 0 && running_.load()) {
-                spawn_linux_loopback();
-                std::lock_guard<std::mutex> lk(proc_mu_);
-                fd = loopback_fd_;
-                tick_origin_us = sync::monotonic_now_us();
-                tick_samples = 0;
-            }
-            if (fd >= 0) {
-                // 非阻塞吸尽当前管道可读数据推入平滑缓冲，不在稳态阻塞拖慢节拍
-                uint8_t tmp[8192];
-                for (;;) {
-                    ssize_t n = ::read(fd, tmp, sizeof(tmp));
+            if (loopback_fd_ < 0 && running_.load()) spawn_linux_loopback(source_param);
+            if (loopback_fd_ >= 0) {
+                size_t remaining_budget = sizeof(read_buffer) - 4;
+                for (int attempts = 0; attempts < 8 && remaining_budget && running_.load() &&
+                     cur_gen == source_gen_.load(); ++attempts) {
+                    const ssize_t n = ::read(loopback_fd_, read_bytes + remainder, remaining_budget);
                     if (n > 0) {
-                        loopback_rem_bytes.insert(loopback_rem_bytes.end(), tmp, tmp + n);
-                    } else if (n == 0) {
-                        stop_loopback_process();
-                        break;
+                        remaining_budget -= static_cast<size_t>(n);
+                        const size_t bytes = remainder + static_cast<size_t>(n);
+                        const size_t full_frames = bytes / 4;
+                        linux_fifo.push_interleaved_stereo(read_buffer.data(), full_frames);
+                        remainder = bytes % 4;
+                        std::memmove(read_bytes, read_bytes + full_frames * 4, remainder);
                     } else {
-                        if (errno == EINTR) continue;
-                        if (errno != EAGAIN && errno != EWOULDBLOCK) stop_loopback_process();
+                        if (n < 0 && errno == EINTR) continue;
+                        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) stop_loopback_process();
                         break;
                     }
-                }
-                const size_t full_frames = loopback_rem_bytes.size() / 4;
-                if (full_frames > 0) {
-                    std::vector<int16_t> aligned(full_frames * 2);
-                    std::memcpy(aligned.data(), loopback_rem_bytes.data(), full_frames * 4);
-                    linux_fifo.push_interleaved_stereo(aligned.data(), full_frames);
-                    loopback_rem_bytes.erase(loopback_rem_bytes.begin(),
-                                             loopback_rem_bytes.begin() + static_cast<ptrdiff_t>(full_frames * 4));
                 }
                 linux_fifo.pop_smooth_frame(frame.data(), frame_samples_);
             }
@@ -1702,11 +1815,14 @@ void AudioPipeline::worker_loop() {
         }
 
         if (!running_.load()) break;
-        if (pcm_cb_) {
-            pcm_cb_(frame.data(), frame_samples_);
-        }
-        if (++spec_div % 3 == 0) {
-            compute_spectrum(frame.data(), frame_samples_);
+        {
+            std::lock_guard publication(publication_mu_);
+            if (cur_gen == source_gen_.load()) {
+                if (pcm_cb_) pcm_cb_(frame.data(), frame_samples_);
+                if (++spec_div % 3 == 0) compute_spectrum(frame.data(), frame_samples_);
+            } else if (skip_samples_) {
+                skip_samples_(frame_samples_);
+            }
         }
 
         tick_samples += frame_samples_;
@@ -1732,9 +1848,6 @@ void AudioPipeline::worker_loop() {
                 uint64_t cur = sync::monotonic_now_us();
                 rem = (next_tick_us > cur) ? (next_tick_us - cur) : 0;
             }
-        } else if (now - next_tick_us > 80000ULL) {
-            tick_origin_us = now;
-            tick_samples = 0;
         }
     }
 

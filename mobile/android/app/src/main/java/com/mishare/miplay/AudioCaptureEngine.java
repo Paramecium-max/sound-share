@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
  * Android 三模式音源采集引擎：
@@ -30,7 +31,7 @@ public class AudioCaptureEngine {
     private static final int MAX_WAV_BYTES = 64 * 1024 * 1024;
 
     public interface Callbacks {
-        void onPcmFrame(byte[] stereoPcmLe, int sampleFrames);
+        void onPcmFrame(byte[] stereoPcmLe, int sampleFrames, long samplePosition);
         void onSpectrum(float[] bands16);
     }
 
@@ -42,8 +43,17 @@ public class AudioCaptureEngine {
     private volatile String lastError = "";
     private volatile byte[] wavData = null;
     private volatile int wavCursor = 0;
-    private volatile MediaProjection mediaProjection = null;
-    private volatile AudioRecord activeRecorder = null;
+    private final AtomicBoolean wavPaused = new AtomicBoolean(false);
+    private volatile long wavDurationMs = 0L;
+    private volatile long wavPositionMs = 0L;
+    private volatile String wavLrcRaw = "";
+    private volatile String wavLyricLine = "";
+    private volatile java.util.List<LrcLine> wavLrcLines = java.util.Collections.emptyList();
+    private volatile RecorderSource recorderSource;
+    private final Object captureLock = new Object();
+    private long captureGeneration;
+    private Recorder activeRecorder;
+    private long sessionOriginUs;
     private Thread worker;
     private Thread spectrumWorker;
     private final Object spectrumNotify = new Object();
@@ -52,48 +62,191 @@ public class AudioCaptureEngine {
     private int sampleRate = 48000;
     private int frameSamples = 1024;
 
+    interface Recorder {
+        void start();
+        int read(byte[] pcm, int offset, int length);
+        void stop();
+        void release();
+    }
+
+    interface RecorderSource {
+        Recorder create(int sampleRate, int frameSamples);
+    }
+
+    private final LongSupplier clock;
+    private final Runnable audioPriority;
+
+    public AudioCaptureEngine() {
+        this(TimerService::monotonicNowUs, () ->
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO));
+    }
+
+    AudioCaptureEngine(LongSupplier clock, Runnable audioPriority) {
+        this.clock = clock;
+        this.audioPriority = audioPriority;
+    }
+
     public int getMode() { return mode.get(); }
     public String getTrackTitle() { return trackTitle; }
     public String getTrackArtist() { return trackArtist; }
     public String getLastError() { return lastError; }
+    public boolean isWavPaused() { return wavPaused.get(); }
+    public long getWavDurationMs() { return wavDurationMs; }
+    public long getWavPositionMs() { return wavPositionMs; }
+    public String getWavLrcRaw() { return wavLrcRaw; }
+    public String getWavLyricLine() { return wavLyricLine; }
+
+    public static final class LrcLine {
+        public final long timeMs;
+        public final String text;
+        public LrcLine(long timeMs, String text) {
+            this.timeMs = timeMs;
+            this.text = text;
+        }
+    }
+
+    public static java.util.List<LrcLine> parseLrcLines(String rawText) {
+        java.util.List<LrcLine> result = new java.util.ArrayList<>();
+        if (rawText == null || rawText.isEmpty()) return result;
+        String cleaned = rawText.startsWith("\uFEFF") ? rawText.substring(1) : rawText;
+        long offsetMs = 0L;
+        java.util.List<LrcLine> rawEntries = new java.util.ArrayList<>();
+        for (String line : cleaned.split("\\r?\\n")) {
+            if (line.isEmpty()) continue;
+            java.util.List<Long> times = new java.util.ArrayList<>();
+            int pos = 0;
+            while (pos < line.length() && line.charAt(pos) == '[') {
+                int close = line.indexOf(']', pos + 1);
+                if (close < 0) break;
+                String tag = line.substring(pos + 1, close);
+                long ts = parseLrcTagMs(tag);
+                if (ts >= 0L) {
+                    times.add(ts);
+                } else if (tag.toLowerCase(java.util.Locale.US).startsWith("offset:")) {
+                    try { offsetMs = Long.parseLong(tag.substring(7).trim()); } catch (NumberFormatException ignored) {}
+                }
+                pos = close + 1;
+            }
+            if (times.isEmpty()) continue;
+            String lyric = line.substring(pos).trim();
+            for (long t : times) rawEntries.add(new LrcLine(t, lyric));
+        }
+        for (LrcLine e : rawEntries) {
+            result.add(new LrcLine(Math.max(0L, e.timeMs - offsetMs), e.text));
+        }
+        result.sort(java.util.Comparator.comparingLong(a -> a.timeMs));
+        return result;
+    }
+
+    public static String lrcLineAt(java.util.List<LrcLine> lines, long positionMs) {
+        if (lines == null || lines.isEmpty()) return "";
+        int lo = 0, hi = lines.size();
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (lines.get(mid).timeMs <= positionMs) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo > 0 ? lines.get(lo - 1).text : "";
+    }
+
+    private static long parseLrcTagMs(String tag) {
+        int colon = tag.indexOf(':');
+        if (colon <= 0 || colon + 1 >= tag.length()) return -1L;
+        try {
+            long mins = Long.parseLong(tag.substring(0, colon));
+            if (mins < 0 || mins > 9999) return -1L;
+            String rest = tag.substring(colon + 1);
+            int dot = rest.indexOf('.');
+            if (dot < 0) dot = rest.indexOf(':');
+            long secs;
+            long fracMs = 0L;
+            if (dot < 0) {
+                secs = Long.parseLong(rest);
+            } else {
+                secs = Long.parseLong(rest.substring(0, dot));
+                String f = rest.substring(dot + 1);
+                if (f.isEmpty()) return -1L;
+                if (f.length() == 1) fracMs = Long.parseLong(f) * 100L;
+                else if (f.length() == 2) fracMs = Long.parseLong(f) * 10L;
+                else fracMs = Long.parseLong(f.substring(0, 3));
+            }
+            if (secs < 0 || secs >= 60) return -1L;
+            return (mins * 60L + secs) * 1000L + fracMs;
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    public void setWavPaused(boolean paused) {
+        wavPaused.set(paused);
+    }
+
+    public void seekWavMs(long positionMs) {
+        synchronized (captureLock) {
+            byte[] wd = wavData;
+            if (wd == null || wd.length < 4 || sampleRate <= 0) return;
+            long totalFrames = wd.length / 4L;
+            long targetFrame = (Math.max(0L, positionMs) * sampleRate) / 1000L;
+            if (targetFrame >= totalFrames) targetFrame = Math.max(0L, totalFrames - 1L);
+            wavCursor = (int) (targetFrame * 4L);
+            wavPositionMs = (targetFrame * 1000L) / sampleRate;
+            wavLyricLine = lrcLineAt(wavLrcLines, wavPositionMs);
+        }
+    }
+
+    public void setWavLrcText(String rawLrc) {
+        String text = rawLrc == null ? "" : (rawLrc.startsWith("\uFEFF") ? rawLrc.substring(1) : rawLrc);
+        java.util.List<LrcLine> parsed = parseLrcLines(text);
+        synchronized (captureLock) {
+            wavLrcRaw = text;
+            wavLrcLines = parsed;
+            wavLyricLine = lrcLineAt(parsed, wavPositionMs);
+        }
+    }
 
     public void setMediaProjection(MediaProjection mp) {
-        synchronized (lifecycleLock) {
-            this.mediaProjection = mp;
-            if (mp != null) {
+        setCaptureSource(mp == null ? null : (rate, samples) -> buildPlaybackRecorder(mp, rate, samples));
+    }
+
+    void setCaptureSource(RecorderSource source) {
+        synchronized (captureLock) {
+            recorderSource = source;
+            invalidateCapture();
+            if (source != null) {
                 lastError = "";
-                setMode(MODE_SYSTEM_LOOPBACK, "Android AudioPlaybackCapture");
-            } else {
-                releaseActiveRecorder();
+                updateMode(MODE_SYSTEM_LOOPBACK, "Android AudioPlaybackCapture");
             }
         }
     }
 
     public void revokeMediaProjection(String reason) {
-        synchronized (lifecycleLock) {
-            this.mediaProjection = null;
-            releaseActiveRecorder();
-            if (mode.get() == MODE_SYSTEM_LOOPBACK) {
-                setMode(MODE_TEST_TONE, "");
-            }
-            if (reason != null && !reason.isEmpty()) {
-                lastError = reason;
-            }
+        synchronized (captureLock) {
+            recorderSource = null;
+            invalidateCapture();
+            if (mode.get() == MODE_SYSTEM_LOOPBACK) updateMode(MODE_TEST_TONE, "");
+            if (reason != null && !reason.isEmpty()) lastError = reason;
         }
     }
 
     public boolean hasMediaProjection() {
-        return mediaProjection != null;
+        return recorderSource != null;
     }
 
     public void setMode(int newMode, String param) {
+        synchronized (captureLock) {
+            invalidateCapture();
+            updateMode(newMode, param);
+        }
+    }
+
+    private void updateMode(int newMode, String param) {
         mode.set(newMode);
         if (newMode == MODE_TEST_TONE) {
             trackTitle = "全屋同步校准测试音 (A4/C#5/E5)";
             trackArtist = "MiPlay Sync Synth";
             lastError = "";
         } else if (newMode == MODE_SYSTEM_LOOPBACK) {
-            trackTitle = (mediaProjection != null) ? "手机全局音频抓取中" : "等待授予全局抓音权限";
+            trackTitle = (recorderSource != null) ? "手机全局音频抓取中" : "等待授予全局抓音权限";
             trackArtist = "AudioPlaybackCapture";
         } else if (newMode == MODE_WAV_FILE && param != null && !param.isEmpty()) {
             trackTitle = param;
@@ -270,10 +423,16 @@ public class AudioCaptureEngine {
             }
 
             // 全部验证与转换通过后才原子提交新曲目状态
-            wavData = converted;
-            wavCursor = 0;
-            lastError = "";
-            setMode(MODE_WAV_FILE, (displayName != null && !displayName.isEmpty()) ? displayName : "Local.wav");
+            synchronized (captureLock) {
+                invalidateCapture();
+                wavData = converted;
+                wavCursor = 0;
+                wavPaused.set(false);
+                wavDurationMs = (converted.length / 4L) * 1000L / targetRate;
+                wavPositionMs = 0L;
+                wavLyricLine = lrcLineAt(wavLrcLines, 0L);
+                updateMode(MODE_WAV_FILE, (displayName != null && !displayName.isEmpty()) ? displayName : "Local.wav");
+            }
             return null;
         } catch (Exception e) {
             lastError = "WAV 加载失败: " + e.getMessage();
@@ -299,23 +458,23 @@ public class AudioCaptureEngine {
         return (short) Math.round(f * 32767.0f);
     }
 
-    private void releaseActiveRecorder() {
-        AudioRecord rec = activeRecorder;
-        activeRecorder = null;
-        if (rec != null) {
-            try { rec.stop(); } catch (Exception ignored) {}
-            try { rec.release(); } catch (Exception ignored) {}
+    // Called under captureLock. The worker retains release ownership until read returns.
+    private void invalidateCapture() {
+        captureGeneration++;
+        pendingSpectrum.set(null);
+        if (activeRecorder != null) {
+            try { activeRecorder.stop(); } catch (RuntimeException ignored) {}
+            activeRecorder = null;
         }
     }
 
-    public void start(int sampleRate, int frameSamples, Callbacks cbs) {
+    public void start(int sampleRate, int frameSamples, long sessionOriginUs, Callbacks cbs) {
         synchronized (lifecycleLock) {
-            // SS-11: 确保旧 worker 完全退出后才启动新 worker，绝不同时存在两个抓音线程
             stopLocked();
             this.sampleRate = sampleRate;
             this.frameSamples = frameSamples;
+            this.sessionOriginUs = sessionOriginUs;
             this.cbs = cbs;
-            this.pendingSpectrum.set(null);
             running.set(true);
             spectrumWorker = new Thread(this::runSpectrumLoop, "MiPlay-Spectrum");
             spectrumWorker.setDaemon(true);
@@ -333,37 +492,29 @@ public class AudioCaptureEngine {
         }
     }
 
-    private void stopLocked() {
-        running.set(false);
-        synchronized (spectrumNotify) {
-            pendingSpectrum.set(null);
-            spectrumNotify.notifyAll();
-        }
-        // 主动停止并释放正在阻塞 read() 的 AudioRecord，确保 worker 立即被唤醒退出
-        releaseActiveRecorder();
-        Thread w = worker;
-        if (w != null) {
-            w.interrupt();
-            while (w.isAlive()) {
-                try {
-                    w.join(500);
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-                if (w.isAlive()) {
-                    releaseActiveRecorder();
-                    w.interrupt();
-                }
+    private static void joinWorker(Thread thread) {
+        if (thread == null) return;
+        thread.interrupt();
+        boolean interrupted = false;
+        while (thread.isAlive()) {
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                interrupted = true;
             }
-            worker = null;
         }
-        Thread sw = spectrumWorker;
-        if (sw != null) {
-            sw.interrupt();
-            try { sw.join(300); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
-            spectrumWorker = null;
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    private void stopLocked() {
+        synchronized (captureLock) {
+            running.set(false);
+            invalidateCapture();
         }
+        joinWorker(worker);
+        joinWorker(spectrumWorker);
+        worker = null;
+        spectrumWorker = null;
     }
 
     private void runSpectrumLoop() {
@@ -386,170 +537,225 @@ public class AudioCaptureEngine {
         }
     }
 
-    private AudioRecord createPlaybackRecorder() {
-        MediaProjection mp = mediaProjection;
-        if (mp == null || !running.get()) return null;
-        try {
-            AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(mp)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .build();
-            AudioFormat fmt = new AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                    .build();
-            int minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-            if (minBuf <= 0) minBuf = frameSamples * 4 * 8;
-            AudioRecord rec = new AudioRecord.Builder()
-                    .setAudioFormat(fmt)
-                    .setBufferSizeInBytes(Math.max(minBuf * 2, frameSamples * 4 * 8))
-                    .setAudioPlaybackCaptureConfig(cfg)
-                    .build();
-            if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
-                rec.release();
-                return null;
+    private static Recorder buildPlaybackRecorder(MediaProjection mp, int rate, int frameSamples) {
+        AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(mp)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build();
+        AudioFormat fmt = new AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(rate)
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build();
+        int minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+        if (minBuf <= 0) minBuf = frameSamples * 4 * 8;
+        AudioRecord audio = new AudioRecord.Builder()
+                .setAudioFormat(fmt)
+                .setBufferSizeInBytes(Math.max(minBuf * 2, frameSamples * 4 * 8))
+                .setAudioPlaybackCaptureConfig(cfg)
+                .build();
+        return new Recorder() {
+            @Override public void start() {
+                if (audio.getState() != AudioRecord.STATE_INITIALIZED) throw new IllegalStateException("AudioRecord 初始化失败");
+                audio.startRecording();
             }
-            rec.startRecording();
-            activeRecorder = rec;
-            return rec;
-        } catch (Throwable e) {
+            @Override public int read(byte[] pcm, int offset, int length) {
+                return audio.read(pcm, offset, length, AudioRecord.READ_BLOCKING);
+            }
+            @Override public void stop() { audio.stop(); }
+            @Override public void release() { audio.release(); }
+        };
+    }
+
+    private Recorder createPlaybackRecorder(RecorderSource source, long generation) {
+        Recorder rec = null;
+        boolean published = false;
+        try {
+            rec = source.create(sampleRate, frameSamples);
+            rec.start();
+            synchronized (captureLock) {
+                if (!running.get() || generation != captureGeneration) return null;
+                activeRecorder = rec;
+                published = true;
+                return rec;
+            }
+        } catch (RuntimeException e) {
             return null;
+        } finally {
+            if (!published && rec != null) {
+                try { rec.stop(); } catch (RuntimeException ignored) {}
+                rec.release();
+            }
         }
     }
 
     private void runLoop() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
+        audioPriority.run();
         final int frameBytes = frameSamples * 4;
         final byte[] pcm = new byte[frameBytes];
-        long tickOriginUs = TimerService.monotonicNowUs();
+        final long tickOriginUs = sessionOriginUs;
         long tickSamples = 0L;
         long sampleIdx = 0;
         long lastSpecUs = 0;
         int consecutiveReadErrors = 0;
         short tailL = 0, tailR = 0;
 
-        while (running.get()) {
-            int m = mode.get();
-            if (m != MODE_SYSTEM_LOOPBACK && activeRecorder != null) {
-                releaseActiveRecorder();
-                consecutiveReadErrors = 0;
-            }
-
-            boolean usedBlockingCapture = false;
-            if (m == MODE_SYSTEM_LOOPBACK) {
-                AudioRecord recorder = activeRecorder;
-                if (recorder == null && mediaProjection != null) {
-                    recorder = createPlaybackRecorder();
-                    tickOriginUs = TimerService.monotonicNowUs();
-                    tickSamples = 0L;
-                }
-                if (recorder != null) {
-                    int read = 0;
-                    boolean err = false;
-                    while (read < frameBytes && running.get()) {
-                        int r;
-                        try {
-                            r = recorder.read(pcm, read, frameBytes - read, AudioRecord.READ_BLOCKING);
-                        } catch (Exception ex) {
-                            err = true;
-                            break;
-                        }
-                        if (r <= 0) {
-                            err = true;
-                            break;
-                        }
-                        read += r;
+        Recorder recorder = null;
+        long previousGeneration = -1;
+        try {
+            while (running.get()) {
+                int m;
+                long generation;
+                RecorderSource source;
+                byte[] waveData;
+                int waveCursor;
+                synchronized (captureLock) {
+                    m = mode.get();
+                    generation = captureGeneration;
+                    source = recorderSource;
+                    waveData = wavData;
+                    waveCursor = wavCursor;
+                    if (recorder != null && recorder != activeRecorder) {
+                        recorder.release();
+                        recorder = null;
                     }
-                    if (err) {
-                        int alignedSampleOff = (read / 4) * 4;
-                        if (alignedSampleOff >= 4) {
-                            tailL = (short) ((pcm[alignedSampleOff - 4] & 0xFF) | (pcm[alignedSampleOff - 3] << 8));
-                            tailR = (short) ((pcm[alignedSampleOff - 2] & 0xFF) | (pcm[alignedSampleOff - 1] << 8));
+                }
+                if (generation != previousGeneration) {
+                    consecutiveReadErrors = 0;
+                    tailL = tailR = 0;
+                    previousGeneration = generation;
+                }
+                if (m != MODE_SYSTEM_LOOPBACK || recorder == null) {
+                    long nowSamples = Math.max(0, clock.getAsLong() - tickOriginUs) * sampleRate / 1_000_000L;
+                    long dueSamples = (nowSamples / frameSamples) * frameSamples;
+                    if (dueSamples > tickSamples) {
+                        sampleIdx += dueSamples - tickSamples;
+                        tickSamples = dueSamples;
+                    }
+                }
+                boolean usedBlockingCapture = false;
+                if (m == MODE_SYSTEM_LOOPBACK) {
+                    if (recorder == null && source != null) {
+                        recorder = createPlaybackRecorder(source, generation);
+                    }
+                    if (recorder != null) {
+                        int read = 0;
+                        boolean err = false;
+                        while (read < frameBytes && running.get()) {
+                            int r;
+                            try {
+                                r = recorder.read(pcm, read, frameBytes - read);
+                            } catch (Exception ex) {
+                                err = true;
+                                break;
+                            }
+                            if (r <= 0) {
+                                err = true;
+                                break;
+                            }
+                            read += r;
                         }
-                        for (int off = alignedSampleOff; off < frameBytes; off += 4) {
-                            tailL = (short) ((tailL * 240) / 256);
-                            tailR = (short) ((tailR * 240) / 256);
-                            pcm[off] = (byte) (tailL & 0xFF);
-                            pcm[off + 1] = (byte) ((tailL >>> 8) & 0xFF);
-                            pcm[off + 2] = (byte) (tailR & 0xFF);
-                            pcm[off + 3] = (byte) ((tailR >>> 8) & 0xFF);
-                        }
-                        consecutiveReadErrors++;
-                        if (consecutiveReadErrors >= 5) {
-                            releaseActiveRecorder();
+                        if (err) {
+                            int alignedSampleOff = (read / 4) * 4;
+                            if (alignedSampleOff >= 4) {
+                                tailL = (short) ((pcm[alignedSampleOff - 4] & 0xFF) | (pcm[alignedSampleOff - 3] << 8));
+                                tailR = (short) ((pcm[alignedSampleOff - 2] & 0xFF) | (pcm[alignedSampleOff - 1] << 8));
+                            }
+                            for (int off = alignedSampleOff; off < frameBytes; off += 4) {
+                                tailL = (short) ((tailL * 240) / 256);
+                                tailR = (short) ((tailR * 240) / 256);
+                                pcm[off] = (byte) (tailL & 0xFF);
+                                pcm[off + 1] = (byte) ((tailL >>> 8) & 0xFF);
+                                pcm[off + 2] = (byte) (tailR & 0xFF);
+                                pcm[off + 3] = (byte) ((tailR >>> 8) & 0xFF);
+                            }
+                            consecutiveReadErrors++;
+                            if (consecutiveReadErrors >= 5) {
+                                synchronized (captureLock) {
+                                    if (activeRecorder == recorder) {
+                                        try { activeRecorder.stop(); } catch (RuntimeException ignored) {}
+                                        activeRecorder = null;
+                                    }
+                                }
+                                consecutiveReadErrors = 0;
+                            }
+                        } else {
+                            tailL = (short) ((pcm[frameBytes - 4] & 0xFF) | (pcm[frameBytes - 3] << 8));
+                            tailR = (short) ((pcm[frameBytes - 2] & 0xFF) | (pcm[frameBytes - 1] << 8));
                             consecutiveReadErrors = 0;
+                            usedBlockingCapture = true;
                         }
                     } else {
-                        tailL = (short) ((pcm[frameBytes - 4] & 0xFF) | (pcm[frameBytes - 3] << 8));
-                        tailR = (short) ((pcm[frameBytes - 2] & 0xFF) | (pcm[frameBytes - 1] << 8));
-                        consecutiveReadErrors = 0;
-                        usedBlockingCapture = true;
+                        Arrays.fill(pcm, (byte) 0);
+                    }
+                } else if (m == MODE_WAV_FILE && waveData != null && waveData.length > 0) {
+                    if (wavPaused.get()) {
+                        Arrays.fill(pcm, (byte) 0);
+                    } else {
+                        byte[] wd = waveData;
+                        int cur = waveCursor;
+                        for (int i = 0; i < frameBytes; i++) {
+                            pcm[i] = wd[cur];
+                            cur++;
+                            if (cur >= wd.length) cur = 0;
+                        }
+                        long posMs = ((cur / 4L) * 1000L) / Math.max(1, sampleRate);
+                        String line = lrcLineAt(wavLrcLines, posMs);
+                        synchronized (captureLock) {
+                            if (generation == captureGeneration) {
+                                wavCursor = cur;
+                                wavPositionMs = posMs;
+                                wavLyricLine = line;
+                            }
+                        }
                     }
                 } else {
-                    Arrays.fill(pcm, (byte) 0);
+                    ByteBuffer bb = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN);
+                    for (int i = 0; i < frameSamples; i++) {
+                        double t = (double) (sampleIdx++) / sampleRate;
+                        double env = 0.18 + 0.10 * Math.sin(2.0 * Math.PI * t);
+                        double sig = 0.5 * Math.sin(2.0 * Math.PI * 440.0 * t)
+                                   + 0.3 * Math.sin(2.0 * Math.PI * 554.37 * t)
+                                   + 0.2 * Math.sin(2.0 * Math.PI * 659.25 * t);
+                        short s = (short) (sig * env * 32767.0);
+                        bb.putShort(s);
+                        bb.putShort(s);
+                    }
                 }
-            } else if (m == MODE_WAV_FILE && wavData != null && wavData.length > 0) {
-                byte[] wd = wavData;
-                int cur = wavCursor;
-                for (int i = 0; i < frameBytes; i++) {
-                    pcm[i] = wd[cur];
-                    cur++;
-                    if (cur >= wd.length) cur = 0;
-                }
-                wavCursor = cur;
-            } else {
-                ByteBuffer bb = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN);
-                for (int i = 0; i < frameSamples; i++) {
-                    double t = (double) (sampleIdx++) / sampleRate;
-                    double env = 0.18 + 0.10 * Math.sin(2.0 * Math.PI * t);
-                    double sig = 0.5 * Math.sin(2.0 * Math.PI * 440.0 * t)
-                               + 0.3 * Math.sin(2.0 * Math.PI * 554.37 * t)
-                               + 0.2 * Math.sin(2.0 * Math.PI * 659.25 * t);
-                    short s = (short) (sig * env * 32767.0);
-                    bb.putShort(s);
-                    bb.putShort(s);
-                }
-            }
 
-            if (!running.get()) break;
-            if (mode.get() != m) {
-                tickOriginUs = TimerService.monotonicNowUs();
-                tickSamples = 0L;
-                continue;
-            }
-            if (cbs != null) {
-                cbs.onPcmFrame(pcm, frameSamples);
-                long nowSpec = TimerService.monotonicNowUs();
-                if (nowSpec - lastSpecUs >= 120_000L) {
-                    lastSpecUs = nowSpec;
-                    pendingSpectrum.set(computeSpectrum(pcm, frameSamples));
-                    synchronized (spectrumNotify) {
-                        spectrumNotify.notify();
+                synchronized (captureLock) {
+                    if (!running.get()) break;
+                    if (generation != captureGeneration) continue;
+                    if (cbs != null) {
+                        cbs.onPcmFrame(pcm, frameSamples, tickSamples);
+                        long nowSpec = clock.getAsLong();
+                        if (nowSpec - lastSpecUs >= 120_000L) {
+                            lastSpecUs = nowSpec;
+                            pendingSpectrum.set(computeSpectrum(pcm, frameSamples));
+                            synchronized (spectrumNotify) {
+                                spectrumNotify.notify();
+                            }
+                        }
+                    }
+                }
+
+                tickSamples += frameSamples;
+                if (!usedBlockingCapture) {
+                    long nextTickUs = tickOriginUs + (tickSamples * 1_000_000L) / sampleRate;
+                    long waitUs = nextTickUs - clock.getAsLong();
+                    if (waitUs > 500L) {
+                        try { Thread.sleep(waitUs / 1000L, (int) ((waitUs % 1000L) * 1000L)); }
+                        catch (InterruptedException ignored) { break; }
                     }
                 }
             }
-
-            if (!usedBlockingCapture) {
-                tickSamples += frameSamples;
-                long nextTickUs = tickOriginUs + (tickSamples * 1_000_000L) / sampleRate;
-                long now = TimerService.monotonicNowUs();
-                long waitUs = nextTickUs - now;
-                if (waitUs > 500L) {
-                    try { Thread.sleep(waitUs / 1000L, (int) ((waitUs % 1000L) * 1000L)); }
-                    catch (InterruptedException ignored) { break; }
-                } else if (now - nextTickUs > 80_000L) {
-                    tickOriginUs = now;
-                    tickSamples = 0L;
-                }
-            } else {
-                tickOriginUs = TimerService.monotonicNowUs();
-                tickSamples = 0L;
+        } finally {
+            synchronized (captureLock) {
+                if (recorder != null && activeRecorder == recorder) invalidateCapture();
             }
+            if (recorder != null) recorder.release();
         }
-
-        releaseActiveRecorder();
     }
 
     private static float[] computeSpectrum(byte[] pcm, int frames) {

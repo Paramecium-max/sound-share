@@ -1,4 +1,5 @@
 import React, { memo, useEffect, useRef, useState } from 'react';
+import { allowAutomaticRefresh } from './discovery-refresh.mjs';
 import { attachButtonHighlights, attachLiquidDock } from './liquid-glass/liquid-dock.mjs';
 
 interface DeviceState {
@@ -10,6 +11,7 @@ interface DeviceState {
   deviceType: number;
   roomName: string;
   isManual: boolean;
+  online?: boolean;
   inGroup: boolean;
   cmdConnected: boolean;
   rtspStreaming: boolean;
@@ -25,6 +27,7 @@ interface DeviceState {
 
 interface EngineState {
   bindIp: string;
+  autoBind?: boolean;
   discoveryRunning: boolean;
   multiroomRunning: boolean;
   loopbackSupported?: boolean;
@@ -37,14 +40,28 @@ interface EngineState {
   sourceMode: number;
   sourceParam?: string;
   lastError?: string;
+  notificationAccessGranted?: boolean;
   track: {
     title: string;
     artist: string;
     album: string;
     durationMs: number;
     positionMs: number;
+    lyricLine?: string;
+    hasLyrics?: boolean;
+    paused?: boolean;
   };
   devices: DeviceState[];
+}
+
+interface SystemTrackInfo {
+  available: boolean;
+  title?: string;
+  artist?: string;
+  album?: string;
+  durationMs?: number;
+  positionMs?: number;
+  paused?: boolean;
 }
 
 interface NetIface {
@@ -74,11 +91,16 @@ declare global {
       restartSidecar?: () => Promise<{ ok: boolean; error?: string; status: SidecarStatus }>;
       onSidecarStatus?: (cb: (status: SidecarStatus) => void) => () => void;
       openWavFile: () => Promise<string | null>;
+      openLrcFile?: () => Promise<string | null>;
+      dispatchMediaControl?: (action: string, positionMs?: number) => Promise<boolean>;
+      onSystemTrack?: (cb: (track: SystemTrackInfo) => void) => () => void;
       platform: string;
     };
     _androidMiPlayBridge?: {
       getSidecarConfigJson: () => string;
       openWavPicker: () => void;
+      openLrcPicker?: () => void;
+      openNotificationAccessSettings?: () => void;
     };
     LiquidGlassRefraction?: {
       refresh: () => void;
@@ -148,6 +170,7 @@ function friendlyDeviceStatus(
   dev: DeviceState,
   multiroomRunning: boolean
 ): { text: string; tone: 'idle' | 'live' | 'error' } {
+  if (dev.online === false) return { text: '设备离线', tone: 'idle' };
   if (dev.rtspStreaming) return { text: '正在同步播放', tone: 'live' };
   if (!dev.inGroup) return { text: '未连接 · 点击即可投送', tone: 'idle' };
   if (!multiroomRunning) return { text: '已选中 · 点击顶栏开始播放', tone: 'idle' };
@@ -255,6 +278,9 @@ export default function App() {
   });
 
   const wsRef = useRef<WebSocket | null>(null);
+  const lastAutoDiscovery = useRef<{ socket: WebSocket; at: number } | null>(null);
+  const smtcAvailableRef = useRef(false);
+  const lastSystemTrackKeyRef = useRef('');
   const dockRef = useRef<HTMLElement | null>(null);
   const rpcIdRef = useRef(1);
   const lastSpecTsRef = useRef(0);
@@ -279,7 +305,42 @@ export default function App() {
       setSidecarStatus(st);
       if (st.error) setToast({ text: st.error, warn: true });
     });
-    return () => unsub?.();
+    const unsubTrack = window.miplayBridge?.onSystemTrack?.((track) => {
+      const avail = Boolean(track && track.available);
+      if (avail !== smtcAvailableRef.current) {
+        smtcAvailableRef.current = avail;
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          callRpc('media.setRemoteControlHandledByHost', { handled: avail }, { silentError: true }).catch(() => {});
+        }
+      }
+      if (!avail || wsRef.current?.readyState !== WebSocket.OPEN) return;
+      const key = `${track.title || ''}|${track.artist || ''}|${track.album || ''}|${track.durationMs || 0}`;
+      if (key !== lastSystemTrackKeyRef.current) {
+        lastSystemTrackKeyRef.current = key;
+        callRpc(
+          'media.setMetadata',
+          {
+            title: track.title || '',
+            artist: track.artist || '',
+            album: track.album || '',
+            durationMs: Math.max(0, Math.floor(track.durationMs || 0)),
+            positionMs: Math.max(0, Math.floor(track.positionMs || 0)),
+            sourceName: 'Windows PC',
+          },
+          { silentError: true }
+        ).catch(() => {});
+      } else if (typeof track.positionMs === 'number' && track.positionMs > 0) {
+        callRpc(
+          'media.setPosition',
+          { positionMs: Math.max(0, Math.floor(track.positionMs)) },
+          { silentError: true }
+        ).catch(() => {});
+      }
+    });
+    return () => {
+      unsub?.();
+      unsubTrack?.();
+    };
   }, []);
 
   // Sync theme attribute
@@ -409,8 +470,9 @@ export default function App() {
             if (Array.isArray(list)) setLoopbackSources(list);
           })
           .catch(() => {});
-        // 连接引擎就绪后立即触发一次无感极速探测，确保开屏秒现设备
-        callRpc('discovery.refresh', {}, { silentError: true }).catch(() => {});
+        if (smtcAvailableRef.current) {
+          callRpc('media.setRemoteControlHandledByHost', { handled: true }, { silentError: true }).catch(() => {});
+        }
       };
 
       ws.onmessage = (ev) => {
@@ -429,6 +491,20 @@ export default function App() {
             if (now - lastSpecTsRef.current >= 120) {
               lastSpecTsRef.current = now;
               setSpectrum(msg.levels);
+            }
+          } else if (msg.type === 'remoteControl' && msg.action) {
+            const labels: Record<string, string> = {
+              pause: '暂停播放',
+              resume: '恢复播放',
+              next: '下一首',
+              previous: '上一首',
+              seek: '调整进度',
+            };
+            const actText = labels[String(msg.action)] || String(msg.action);
+            const from = msg.deviceName || msg.deviceId || '接收端';
+            setToast({ text: `「${from}」反向控制：${actText}` });
+            if (!msg.handledLocally && smtcAvailableRef.current) {
+              window.miplayBridge?.dispatchMediaControl?.(String(msg.action), Number(msg.positionMs || 0));
             }
           } else if (msg.type === 'rpc' && msg.id != null) {
             const key = String(msg.id);
@@ -480,25 +556,26 @@ export default function App() {
       setRefreshingDiscovery(true);
       setToast({ text: '正在极速扫描局域网内的妙播设备…' });
       setTimeout(() => setRefreshingDiscovery(false), 900);
+    } else {
+      const socket = wsRef.current;
+      if (document.visibilityState === 'hidden' || socket?.readyState !== WebSocket.OPEN) return;
+      const now = performance.now();
+      if (!allowAutomaticRefresh(lastAutoDiscovery.current, socket, now)) return;
+      lastAutoDiscovery.current = { socket, at: now };
     }
-    callRpc('discovery.refresh', {}, { silentError: !interactive }).catch(() => {});
+    callRpc('discovery.refresh', { automatic: !interactive }, { silentError: !interactive }).catch(() => {});
   };
 
-  // 窗口重新获得焦点、切回前台或切回“设备”标签时自动无感刷新，随时发现新上线设备
   useEffect(() => {
-    if (!wsConnected) return;
-    if (activeTab === 'devices') {
-      callRpc('discovery.refresh', {}, { silentError: true }).catch(() => {});
-    }
-  }, [activeTab, wsConnected]);
+    if (wsConnected) triggerDiscoveryRefresh();
+  }, [wsConnected]);
 
   useEffect(() => {
-    const onWake = () => {
-      if (document.visibilityState === 'hidden') return;
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        callRpc('discovery.refresh', {}, { silentError: true }).catch(() => {});
-      }
-    };
+    if (activeTab === 'devices') triggerDiscoveryRefresh();
+  }, [activeTab]);
+
+  useEffect(() => {
+    const onWake = () => triggerDiscoveryRefresh();
     window.addEventListener('focus', onWake);
     document.addEventListener('visibilitychange', onWake);
     return () => {
@@ -573,6 +650,21 @@ export default function App() {
     const file = await window.miplayBridge?.openWavFile();
     if (file) {
       await handleSelectSourceMode(1, file);
+    }
+  };
+
+  const handlePickLrc = async () => {
+    if (window._androidMiPlayBridge?.openLrcPicker) {
+      window._androidMiPlayBridge.openLrcPicker();
+      return;
+    }
+    const file = await window.miplayBridge?.openLrcFile?.();
+    if (!file) return;
+    try {
+      await callRpc('media.loadLrcFile', { path: file }, { expectTrue: true });
+      setToast({ text: '已导入 LRC 歌词，正在向全屋设备实时同步' });
+    } catch {
+      // error toast shown by callRpc
     }
   };
 
@@ -692,15 +784,22 @@ export default function App() {
                 <div className="now-strip-left">
                   <MiniWave levels={spectrum} live={state.multiroomRunning} />
                   <div className="now-info">
-                    <div className="now-title">{state.track.title}</div>
+                    <div className="now-title">
+                      {state.track.title}
+                      {state.track.artist && state.sourceMode === 2 && state.track.artist !== 'Native WASAPI Loopback'
+                        ? ` · ${state.track.artist}`
+                        : ''}
+                    </div>
                     <div className="now-sub">
-                      {state.multiroomRunning
-                        ? streamingCount > 0
-                          ? `正在向 ${streamingCount} 台设备同步推流`
-                          : '正在等待设备响应…'
-                        : selectedDevices.length > 0
-                          ? `已选中 ${selectedDevices.length} 台设备，点击顶栏开始播放`
-                          : '点选下方设备即可加入同步组'}
+                      {state.track.lyricLine
+                        ? `♪ ${state.track.lyricLine}`
+                        : state.multiroomRunning
+                          ? streamingCount > 0
+                            ? `正在向 ${streamingCount} 台设备同步推流${state.track.paused ? '（已暂停）' : ''}`
+                            : '正在等待设备响应…'
+                          : selectedDevices.length > 0
+                            ? `已选中 ${selectedDevices.length} 台设备，点击顶栏开始播放`
+                            : '点选下方设备即可加入同步组'}
                     </div>
                   </div>
                 </div>
@@ -909,13 +1008,32 @@ export default function App() {
                 <span>
                   {state.loopbackSupported === false && state.sourceMode === 2
                     ? '当前平台暂不支持系统全局环回抓音，请使用本地 WAV 或测试音'
-                    : sourceHint}
+                    : state.track.lyricLine
+                      ? `当前同步歌词：${state.track.lyricLine}`
+                      : sourceHint}
                 </span>
-                {state.sourceMode === 1 && (
-                  <button type="button" className="lg-btn sm" onClick={handlePickWav}>
-                    更换 WAV 文件
-                  </button>
-                )}
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {window._androidMiPlayBridge?.openNotificationAccessSettings &&
+                    state.notificationAccessGranted === false && (
+                      <button
+                        type="button"
+                        className="lg-btn sm"
+                        onClick={() => window._androidMiPlayBridge?.openNotificationAccessSettings?.()}
+                      >
+                        开启歌名/歌词同步权限
+                      </button>
+                    )}
+                  {(window.miplayBridge?.openLrcFile || window._androidMiPlayBridge?.openLrcPicker) && (
+                    <button type="button" className="lg-btn sm" onClick={handlePickLrc}>
+                      {state.track.hasLyrics ? '更换 LRC 歌词' : '导入 LRC 歌词'}
+                    </button>
+                  )}
+                  {state.sourceMode === 1 && (
+                    <button type="button" className="lg-btn sm" onClick={handlePickWav}>
+                      更换 WAV 文件
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="spectrum-stage" aria-hidden="true">
                 {spectrum.map((v, idx) => (
@@ -1049,9 +1167,13 @@ export default function App() {
                     </div>
                     <select
                       className="sheet-select"
-                      value={state.bindIp}
-                      onChange={(e) => callRpc('net.setBindIp', { ip: e.target.value })}
+                      value={state.autoBind ? '' : state.bindIp}
+                      onChange={(e) => callRpc('net.setBindIp', { ip: e.target.value }).catch(() => {})}
                     >
+                      <option value="">自动选择</option>
+                      {state.bindIp && !state.autoBind && !interfaces.some((i) => i.ipv4 === state.bindIp) && (
+                        <option value={state.bindIp}>{state.bindIp}（不可用）</option>
+                      )}
                       {interfaces
                         .filter((i) => !i.isLoopback)
                         .map((i) => (

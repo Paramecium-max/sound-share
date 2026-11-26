@@ -48,11 +48,11 @@ void MasterMediaClock::set_base_play_delay_ms(uint32_t delay_ms) {
     base_play_delay_ms_ = delay_ms;
 }
 
-MasterMediaClock::FrameTimestamps MasterMediaClock::next_frame_timestamps(uint32_t frame_samples) {
+MasterMediaClock::FrameTimestamps MasterMediaClock::next_frame_timestamps(uint32_t frame_samples, bool include_delay) {
     std::lock_guard<std::mutex> lock(mu_);
     // 严格按采样数推进，确保 48kHz / 1024 samples 的 90kHz 增量精准等于 1920
     const uint64_t rel_us = (total_samples_ * 1000000ULL) / sample_rate_;
-    const uint64_t delay_us = static_cast<uint64_t>(base_play_delay_ms_) * 1000ULL;
+    const uint64_t delay_us = include_delay ? static_cast<uint64_t>(base_play_delay_ms_) * 1000 : 0;
     const uint64_t pts_us = rel_us + delay_us;
     const uint64_t pts_90k = ((total_samples_ * 90000ULL) / sample_rate_) +
                              ((delay_us * 90ULL) / 1000ULL);
@@ -65,6 +65,11 @@ MasterMediaClock::FrameTimestamps MasterMediaClock::next_frame_timestamps(uint32
 
     total_samples_ += frame_samples;
     return out;
+}
+
+void MasterMediaClock::skip_samples(uint64_t samples) {
+    std::lock_guard<std::mutex> lock(mu_);
+    total_samples_ += samples;
 }
 
 void MasterMediaClock::catch_up_to_now(uint32_t frame_samples, uint64_t now_us) {

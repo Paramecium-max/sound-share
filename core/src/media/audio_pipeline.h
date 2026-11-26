@@ -1,5 +1,7 @@
 #pragma once
 
+#include "media/media_control.h"
+
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -27,6 +29,9 @@ struct AudioTrackMeta {
     std::string album = "Lossless Stream";
     uint64_t duration_ms = 0;
     uint64_t position_ms = 0;
+    std::string lyrics;
+    std::string lyric_line;
+    bool paused = false;
 };
 
 struct LoopbackSourceInfo {
@@ -34,7 +39,7 @@ struct LoopbackSourceInfo {
     std::string label;
 };
 
-// 跨包连续相位线性重采样器（严格保留上一包末样本做跨包边界插值，杜绝分包边界平顶毛刺）
+// Continuous interpolation with a streaming low-pass filter before downsampling.
 class StreamLinearResampler {
 public:
     void reset(uint32_t src_rate, uint32_t dst_rate);
@@ -43,11 +48,28 @@ public:
 private:
     uint32_t src_rate_ = 48000;
     uint32_t dst_rate_ = 48000;
-    double step_ = 1.0;
-    double phase_ = 0.0;
+    uint64_t phase_ = 0;
     bool has_prev_ = false;
-    int16_t prev_l_ = 0;
-    int16_t prev_r_ = 0;
+    std::array<double, 2> previous_{};
+    static constexpr size_t kFilterTaps = 95;
+    std::array<double, kFilterTaps> filter_{};
+    std::array<std::array<double, 2>, kFilterTaps> history_{};
+    size_t history_pos_ = 0;
+    size_t warmup_ = 0;
+    std::array<double, 2> initial_{};
+};
+
+enum class CaptureSampleFormat { Float32, Pcm16, Pcm24, Pcm32 };
+
+class StereoDownmixer {
+public:
+    StereoDownmixer(CaptureSampleFormat format, size_t channels, uint32_t speaker_mask, size_t stride);
+    void convert(const uint8_t* input, size_t frames, int16_t* output) const;
+private:
+    CaptureSampleFormat format_;
+    size_t stride_;
+    size_t sample_bytes_;
+    std::vector<std::array<double, 2>> weights_;
 };
 
 // 环回采集平滑弹性抖动缓冲（Pre-roll 水位建立 + ±1 样本连续相位插值时钟漂移补偿 + 欠载尾样本衰减 + 溢出交叉淡入淡出）
@@ -69,6 +91,7 @@ private:
     size_t high_water_frames_ = 3120;
     size_t max_frames_ = 9600;
     bool primed_ = false;
+    bool splice_pending_ = false;
     int16_t last_l_ = 0;
     int16_t last_r_ = 0;
     std::deque<int16_t> ring_;
@@ -98,12 +121,21 @@ public:
 
     bool start(uint32_t sample_rate, uint32_t frame_samples,
                PcmFrameCallback pcm_cb, SpectrumCallback spec_cb = nullptr,
-               std::function<bool()> has_streaming_receiver = nullptr);
+               std::function<bool()> has_streaming_receiver = nullptr,
+               std::function<void(uint64_t)> skip_samples = nullptr,
+               uint64_t session_origin_us = 0);
+
+    static uint64_t skipped_capture_samples(uint64_t scheduled_samples, uint32_t sample_rate,
+                                            uint32_t frame_samples, uint64_t elapsed_us);
     void stop();
     bool is_running() const { return running_.load(); }
 
     void push_external_pcm(const int16_t* stereo_pcm, size_t frame_samples);
     AudioTrackMeta current_meta() const;
+    void set_wav_paused(bool paused);
+    bool is_wav_paused() const { return wav_paused_.load(); }
+    void seek_wav_ms(uint64_t position_ms);
+    void set_wav_lrc_text(const std::string& lrc_text);
 
     // 严格 RIFF/WAV 解析与转换（支持 16/24-bit PCM、32-bit Float、单/双声道、任意常见采样率重采样到 target_rate）
     static bool decode_wav_file(const std::string& path,
@@ -124,6 +156,7 @@ private:
     uint32_t sample_rate_ = 48000;
     uint32_t frame_samples_ = 480;
 
+    std::recursive_mutex publication_mu_;
     mutable std::mutex param_mu_;
     std::string source_param_;
     std::string last_error_;
@@ -132,13 +165,15 @@ private:
     std::string wav_path_;
     uint32_t wav_decoded_rate_ = 48000;
     size_t wav_cursor_ = 0;
+    std::atomic<bool> wav_paused_{false};
+    LrcDocument wav_lrc_;
     std::vector<std::string> test_loopback_argv_;
 
     std::mutex ext_mu_;
     std::vector<int16_t> ext_ring_;
 
 #if defined(__linux__)
-    std::mutex proc_mu_;
+    // Exclusively owned by the audio worker.
     int loopback_fd_ = -1;
     int loopback_pid_ = -1;
 #endif
@@ -146,6 +181,8 @@ private:
     PcmFrameCallback pcm_cb_;
     SpectrumCallback spec_cb_;
     std::function<bool()> has_streaming_receiver_;
+    std::function<void(uint64_t)> skip_samples_;
+    uint64_t session_origin_us_ = 0;
     std::thread worker_;
     std::thread spectrum_worker_;
     std::mutex spectrum_mu_;
