@@ -45,7 +45,8 @@ public:
                bool prefer_lpcm,
                RtspServerCallbacks cbs,
                uint32_t sample_rate = 48000,
-               uint16_t bind_port = 0);
+               uint16_t bind_port = 0,
+               uint64_t trace_session_id = 0);
 
     void stop();
     uint16_t listen_port() const { return port_.load(); }
@@ -70,6 +71,7 @@ private:
     std::string sender_ip_;
     uint16_t timer_port_ = 0;
     uint64_t time_offset_us_ = 0;
+    uint64_t trace_session_id_ = 0;
     bool prefer_lpcm_ = false;
     uint32_t sample_rate_ = 48000;
     RtspServerCallbacks cbs_;

@@ -484,7 +484,8 @@ bool MultiRoomEngine::attach_device_stream_locked(
         cfg.lpcm,
         std::move(rcbs),
         cfg.sample_rate,
-        test_rtsp_bind_port_.load());
+        test_rtsp_bind_port_.load(),
+        sid);
     const uint16_t rtsp_port = rtsp_ok ? handle->rtsp_server->listen_port() : 0;
 
     // SS-06：RTSP 监听失败或端口无效时绝不继续建连或发送 Open

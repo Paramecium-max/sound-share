@@ -2,6 +2,7 @@
 #include "sync/master_clock.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace miplay::media {
@@ -21,6 +22,7 @@ void MultiAudioSender::ActiveTarget::start_writer() {
         int64_t last_pts_90k = -1;
         const int64_t min_frame_step_90k = (stream_type == TsAudioStreamType::WfdLpcm) ? 900 : 1920;
         int consecutive_timeouts = 0;
+        const char* failure_reason = "writer_unavailable";
         std::vector<uint8_t> wire_batch;
         wire_batch.reserve(3072);
 
@@ -76,16 +78,22 @@ void MultiAudioSender::ActiveTarget::start_writer() {
                 force_pat_pmt.store(true);
                 dropped_frames.fetch_add(1);
                 if (++consecutive_timeouts >= 5) {
+                    failure_reason = "send_deadline_repeated";
                     healthy.store(false);
                     break;
                 }
             } else {
                 // 连接已断，或发生半包写出后持续超时（TCP 帧边界已损坏），立即隔离该目标绝不继续发脏包
+                failure_reason = send_res == net::SendAllStatus::Partial ? "partial_write" : "send_failed";
                 healthy.store(false);
                 break;
             }
         }
         if (!healthy.load() && !stop_requested.load()) {
+            std::fprintf(stderr, "MiShare RTP closed session=%llu at_us=%llu reason=%s bytes_sent=%llu\n",
+                         static_cast<unsigned long long>(session_id),
+                         static_cast<unsigned long long>(sync::monotonic_now_us()),
+                         failure_reason, static_cast<unsigned long long>(bytes_sent.load()));
             connection->abort();
             if (on_failure) on_failure();
         }

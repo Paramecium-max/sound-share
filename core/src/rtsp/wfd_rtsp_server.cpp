@@ -1,8 +1,10 @@
 #include "rtsp/wfd_rtsp_server.h"
+#include "sync/master_clock.h"
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <optional>
 #include <sstream>
 
@@ -161,7 +163,8 @@ bool WfdRtspServer::start(const std::string& device_id,
                           bool prefer_lpcm,
                           RtspServerCallbacks cbs,
                           uint32_t sample_rate,
-                          uint16_t bind_port) {
+                          uint16_t bind_port,
+                          uint64_t trace_session_id) {
     stop();
     net::init_network();
 
@@ -169,6 +172,7 @@ bool WfdRtspServer::start(const std::string& device_id,
     sender_ip_ = sender_ip;
     timer_port_ = timer_service_port;
     time_offset_us_ = session_time_offset_us;
+    trace_session_id_ = trace_session_id;
     prefer_lpcm_ = prefer_lpcm;
     sample_rate_ = (sample_rate == 44100 || sample_rate == 48000) ? sample_rate : 48000;
     cbs_ = std::move(cbs);
@@ -308,9 +312,18 @@ void WfdRtspServer::accept_loop() {
 void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::string& peer_ip, uint16_t peer_port) {
     auto ctrl_writer = std::make_shared<net::ConnectionWriter>(ctrl_sock, true);
     std::shared_ptr<net::ConnectionWriter> data_writer;
+    const char* close_reason = nullptr;
+    uint64_t closed_at_us = 0;
+    auto note_close = [&](const char* reason) {
+        if (!close_reason) {
+            close_reason = reason;
+            closed_at_us = sync::monotonic_now_us();
+        }
+    };
     auto send_str = [&](const std::string& message) {
         if (ctrl_writer->write(reinterpret_cast<const uint8_t*>(message.data()), message.size(), 120)
                 == net::SendAllStatus::Ok) return true;
+        note_close("control_write_failed");
         ctrl_writer->abort();
         return false;
     };
@@ -339,9 +352,14 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
     while (running_.load() && !peer_closed) {
         if (!net::wait_readable(ctrl_sock, 50) || !running_.load()) continue;
         auto n = recv(ctrl_sock, buf, sizeof(buf), 0);
-        if (n == 0) { peer_closed = true; break; }
+        if (n == 0) {
+            note_close("control_eof");
+            peer_closed = true;
+            break;
+        }
         if (n < 0) {
             if (net::last_socket_error_is_timeout()) continue;
+            note_close("control_read_failed");
             peer_closed = true;
             break;
         }
@@ -439,6 +457,7 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                     }
                     if (!running_.load() || stopping_.load()) break;
                     if (claimed_data_sock == kInvalidSocket) {
+                        note_close("media_connect_timeout");
                         if (!send_str("RTSP/1.0 503 Service Unavailable\r\nCSeq: " + cseq + "\r\n\r\n")) { peer_closed = true; break; }
                         report("RTSP MultiPort 音频反连超时，接收端端口 " + std::to_string(media_port));
                         peer_closed = true;
@@ -490,6 +509,7 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
                 } catch (...) {}
                 if (cbs_.on_latency_report) cbs_.on_latency_report(rep);
             } else if (msg.rfind("TEARDOWN ", 0) == 0) {
+                note_close("peer_teardown");
                 if (streaming && cbs_.on_stop_media) cbs_.on_stop_media(device_id_);
                 std::ostringstream resp;
                 resp << "RTSP/1.0 200 OK\r\nCSeq: " << cseq << "\r\n\r\n";
@@ -500,6 +520,12 @@ void WfdRtspServer::handle_rtsp_control(SocketHandle ctrl_sock, const std::strin
         }
     }
 
+    note_close("local_stop");
+    std::fprintf(stderr,
+                 "MiShare RTSP closing session=%llu at_us=%llu reason=%s peer=%s control_port=%u media_port=%u\n",
+                 static_cast<unsigned long long>(trace_session_id_),
+                 static_cast<unsigned long long>(closed_at_us), close_reason, peer_ip.c_str(),
+                 static_cast<unsigned>(peer_port), static_cast<unsigned>(media_port));
     if (streaming && cbs_.on_stop_media) cbs_.on_stop_media(device_id_);
     running_.store(false);
     pending_cv_.notify_all();
