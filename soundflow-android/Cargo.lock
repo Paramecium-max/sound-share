@@ -1740,6 +1740,7 @@ version = "1.0.0"
 dependencies = [
  "cc",
  "fusionplay-miplay-sdk",
+ "if-addrs",
  "jni",
  "libloading",
  "rodio",

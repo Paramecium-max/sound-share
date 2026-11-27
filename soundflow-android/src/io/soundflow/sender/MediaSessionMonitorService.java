@@ -35,7 +35,7 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
     public static void setPreferredPackage(String pkg) {
         preferredPackage = pkg == null ? "" : pkg.trim();
         MediaSessionMonitorService svc = activeInstance;
-        if (svc != null) svc.emitActiveControllerSnapshot(true);
+        if (svc != null) new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> svc.emitActiveControllerSnapshot(true));
     }
 
     private MediaSessionManager sessionManager;
@@ -89,6 +89,7 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
                         for (MediaController c : list) {
                             if (c != null && pref.equals(c.getPackageName())) return c;
                         }
+                        return null;
                     }
                     MediaController fallback = null;
                     for (MediaController c : list) {
@@ -111,7 +112,7 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
         if (c != null && dispatchToController(c, norm, positionMs)) {
             return true;
         }
-        if (ctx == null) return false;
+        if (ctx == null || !preferredPackage.isEmpty()) return false;
         AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
         if (am == null) return false;
         int keyCode;
@@ -189,7 +190,7 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
         if (!pref.isEmpty() && !pref.equals(pkg)) return;
         String lyricLine = extractStatusBarLyric(sbn.getNotification());
         if (lyricLine != null && !lyricLine.isEmpty()) {
-            MultiRoomManager.getInstance().onExternalLyricLine(lyricLine);
+            MultiRoomManager.getInstance().onExternalLyricLine(pkg, lyricLine);
         }
     }
 
@@ -254,6 +255,7 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
             for (TrackedController tc : tracked) {
                 if (pref.equals(tc.controller.getPackageName())) return tc.controller;
             }
+            return null;
         }
         MediaController fallback = null;
         for (TrackedController tc : tracked) {
@@ -293,11 +295,19 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
 
     private void emitActiveControllerSnapshot(boolean forceMetadata) {
         MediaController c = pickPrimaryController();
-        if (c != null) emitSnapshotFromController(c, forceMetadata);
+        if (c != null) {
+            emitSnapshotFromController(c, forceMetadata);
+        } else {
+            String selected = preferredPackage;
+            if (!selected.isEmpty()) {
+                MultiRoomManager.getInstance().onSystemMediaUpdate(selected, "", "", "", 0L, 0L, true, false);
+            }
+        }
     }
 
     private static void emitSnapshotFromController(MediaController c, boolean forceMetadata) {
-        if (c == null) return;
+        String selected = preferredPackage;
+        if (c == null || !selected.isEmpty() && !selected.equals(c.getPackageName())) return;
         MediaMetadata meta = c.getMetadata();
         PlaybackState state = c.getPlaybackState();
         if (meta == null && state == null) return;
@@ -322,7 +332,7 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
         }
 
         MultiRoomManager.getInstance().onSystemMediaUpdate(
-                title, artist, album, durationMs, posMs, paused, forceMetadata);
+                c.getPackageName(), title, artist, album, durationMs, posMs, paused, forceMetadata);
     }
 
     private static String safeStr(String s) {

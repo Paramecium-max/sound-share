@@ -70,20 +70,32 @@ struct Host {
     dlna: Option<dlna::DlnaRenderer>,
     playing: bool,
     receiver_blocked: bool,
+    receiver_started: bool,
     capture_onsets: bool,
     onset_sequence: u64,
 }
 
 impl Host {
-    fn set_receiver_blocked(&mut self, blocked: bool) {
-        self.receiver_blocked = blocked;
-        if blocked && self.playing {
-            let _ = soundflow::receiver_action("pause", 0);
+    fn set_receiver_blocked(&mut self, blocked: bool) -> Result<(), String> {
+        if blocked {
+            self.receiver_blocked = true;
+            if self.receiver_started {
+                if self.playing {
+                    let _ = soundflow::receiver_action("pause", 0);
+                }
+                soundflow::receiver_action("suspend", 0)?;
+            }
         }
-        let _ = soundflow::receiver_action(if blocked { "suspend" } else { "output_resume" }, 0);
         if let Some(dlna) = &self.dlna {
-            dlna.set_blocked(blocked);
+            dlna.set_blocked(blocked)?;
         }
+        if !blocked {
+            if self.receiver_started {
+                soundflow::receiver_action("output_resume", 0)?;
+            }
+            self.receiver_blocked = false;
+        }
+        Ok(())
     }
 
     fn request(&mut self, command: &Value) -> Result<Value, String> {
@@ -92,19 +104,30 @@ impl Host {
         match command["method"].as_str().unwrap_or_default() {
             "sender" => {
                 let start = args["method"] == "multiroom.start";
-                if start && !self.receiver_blocked {
-                    self.set_receiver_blocked(true);
+                let stop = args["method"] == "multiroom.stop";
+                let was_blocked = self.receiver_blocked;
+                if start {
+                    if let Err(error) = self.set_receiver_blocked(true) {
+                        if !was_blocked {
+                            let _ = self.set_receiver_blocked(false);
+                        }
+                        return Err(error);
+                    }
                 }
-                let response = self.sender.request(Some(args));
-                if (start && response.as_ref().map_or(true, |r| r.get("error").is_some()))
-                    || args["method"] == "multiroom.stop"
+                let response = self.sender.request(Some(args))?;
+                if (stop && response.get("error").is_none())
+                    || (start && !was_blocked && response.get("error").is_some())
                 {
-                    self.set_receiver_blocked(false);
+                    self.set_receiver_blocked(false)?;
                 }
-                response
+                Ok(response)
             }
             "receiver.start" => {
+                if self.receiver_blocked {
+                    return Err("全屋发送期间，本机接收播放已暂停".into());
+                }
                 soundflow::start_receiver(&args.to_string())?;
+                self.receiver_started = true;
                 self.playing = false;
                 let dlna_error = if args["enable_dlna"] == true {
                     match dlna::DlnaRenderer::start(args) {
@@ -117,7 +140,6 @@ impl Host {
                 } else {
                     None
                 };
-                self.set_receiver_blocked(self.receiver_blocked);
                 Ok(
                     json!({"miplay_ready": true, "dlna_ready": self.dlna.is_some(),
                     "last_error": dlna_error, "endpoint": args["ip"]}),
@@ -125,6 +147,7 @@ impl Host {
             }
             "receiver.stop" => {
                 self.dlna = None;
+                self.receiver_started = false;
                 self.playing = false;
                 soundflow::stop_receiver();
                 Ok(Value::Null)
@@ -198,6 +221,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         dlna: None,
         playing: false,
         receiver_blocked: false,
+        receiver_started: false,
         capture_onsets: false,
         onset_sequence: 0,
     };

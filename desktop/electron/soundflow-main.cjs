@@ -280,14 +280,11 @@ async function poll() {
             for (let i = 0; i < n; i++) {
               const v = Math.max(0, Math.min(1, Number(lv[i]) || 0));
               if (v > level) level = v;
-              if (i < bEnd) bass += v;
-              else if (i < mEnd) mid += v;
-              else high += v;
+              if (i < bEnd) bass = Math.max(bass, v);
+              else if (i < mEnd) mid = Math.max(mid, v);
+              else high = Math.max(high, v);
             }
-            bass /= bEnd;
-            mid /= Math.max(1, mEnd - bEnd);
-            high /= Math.max(1, n - mEnd);
-            send('audio', { level, bands: [bass, mid, high], onsets: [] });
+            send('audio', { level, bands: [bass, mid, high], preview: true });
           }
           if (!senderTab) continue;
         }

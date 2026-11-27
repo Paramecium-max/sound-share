@@ -148,7 +148,7 @@ public:
 private:
     void worker_loop();
     void stop_loopback_process();
-    void compute_spectrum(const int16_t* stereo_pcm, size_t frames);
+    void queue_spectrum(const int16_t* stereo_pcm, size_t frames);
     void spectrum_loop();
 
     std::atomic<AudioSourceMode> mode_{AudioSourceMode::TestTone};
@@ -189,7 +189,12 @@ private:
     std::thread spectrum_worker_;
     std::mutex spectrum_mu_;
     std::condition_variable spectrum_cv_;
-    std::optional<std::array<float, 16>> pending_spectrum_;
+    static constexpr size_t kSpectrumSamples = 1024;
+    struct SpectrumFrame {
+        std::array<int16_t, kSpectrumSamples * 2> pcm{};
+        size_t frames = 0;
+    };
+    std::optional<SpectrumFrame> pending_spectrum_;
 };
 
 } // namespace miplay::media

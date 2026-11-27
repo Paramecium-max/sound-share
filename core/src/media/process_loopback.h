@@ -23,7 +23,8 @@ std::vector<AudioApp> list_audio_apps();
 std::optional<uint32_t> process_loopback_pid(std::string_view param);
 
 #ifdef _WIN32
-IAudioClient* activate_process_loopback(uint32_t pid);
+bool is_legacy_process_loopback_windows();
+HRESULT activate_process_loopback(uint32_t pid, IAudioClient** client);
 #endif
 
 } // namespace miplay::media

@@ -6,6 +6,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -58,6 +59,25 @@ uint32_t read_u32_le(const uint8_t* p) {
     }
     return true;
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+std::vector<std::string> linux_sink_monitors() {
+    std::vector<std::string> names;
+    FILE* stream = popen("LC_ALL=C pactl list sinks 2>/dev/null", "r");
+    if (!stream) return names;
+    char line[1024];
+    while (std::fgets(line, sizeof(line), stream)) {
+        std::istringstream fields(line);
+        std::string kind, property, name;
+        if (fields >> kind >> property >> name && kind == "Monitor" && property == "Source:" &&
+            is_safe_linux_source_name(name)) {
+            names.push_back(name);
+        }
+    }
+    if (pclose(stream) != 0) names.clear();
+    return names;
+}
+#endif
 
 #ifdef _WIN32
 constexpr CLSID kDeviceEnumeratorClass = {0xBCDE0395,0xE52F,0x467C,{0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E}};
@@ -412,6 +432,7 @@ public:
         stop_req_.store(false);
         active_.store(false);
         fallback_default_loopback_.store(false);
+        process_status_.store(E_FAIL);
 
         struct Startup {
             std::mutex mutex;
@@ -466,32 +487,37 @@ public:
 
             do {
                 if (!com_init) break;
-                if (process_pid) {
+                if (process_pid && !is_legacy_process_loopback_windows()) {
                     following_default = false;
-                    audio_client = activate_process_loopback(*process_pid);
+                    HRESULT result = activate_process_loopback(*process_pid, &audio_client);
                     WAVEFORMATEX format{WAVE_FORMAT_PCM, 2, target_rate_, target_rate_ * 4, 4, 16, 0};
-                    sample_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
                     const DWORD flags = AUDCLNT_STREAMFLAGS_LOOPBACK |
                                         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
                                         AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY |
                                         AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-                    const bool proc_ok = audio_client && sample_event &&
-                        SUCCEEDED(audio_client->Initialize(
-                            AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, &format, nullptr)) &&
-                        SUCCEEDED(audio_client->SetEventHandle(sample_event)) &&
-                        SUCCEEDED(audio_client->GetService(iid_acc, reinterpret_cast<void**>(&capture_client))) &&
-                        capture_client && !stop_req_.load() && source_running.load() &&
-                        SUCCEEDED(audio_client->Start());
-                    if (proc_ok) {
-                        ok = true;
-                        break;
+                    if (SUCCEEDED(result) && !audio_client) result = E_NOINTERFACE;
+                    if (SUCCEEDED(result)) {
+                        sample_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                        if (!sample_event) result = HRESULT_FROM_WIN32(GetLastError());
                     }
-                    // Release partial process-loopback resources.
-                    if (capture_client) { capture_client->Release(); capture_client = nullptr; }
-                    if (audio_client) { audio_client->Release(); audio_client = nullptr; }
-                    if (sample_event) { CloseHandle(sample_event); sample_event = nullptr; }
-                    // For explicit single-app capture (pid > 0), fail explicitly;
-                    // for process:0 (global exclude-self on < Win10 Build 20348), fall back to default eRender loopback.
+                    if (SUCCEEDED(result)) {
+                        result = audio_client->Initialize(
+                            AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, &format, nullptr);
+                    }
+                    if (SUCCEEDED(result)) result = audio_client->SetEventHandle(sample_event);
+                    if (SUCCEEDED(result)) {
+                        result = audio_client->GetService(iid_acc, reinterpret_cast<void**>(&capture_client));
+                        if (SUCCEEDED(result) && !capture_client) result = E_NOINTERFACE;
+                    }
+                    if (SUCCEEDED(result)) {
+                        result = stop_req_.load() || !source_running.load() ? E_ABORT : audio_client->Start();
+                    }
+                    process_status_.store(result);
+                    ok = SUCCEEDED(result);
+                    break;
+                }
+                if (process_pid) {
+                    process_status_.store(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
                     if (*process_pid != 0) break;
                     fallback_default_loopback_.store(true);
                 }
@@ -508,12 +534,12 @@ public:
                 }
                 active_ep_id = endpoint_id(device);
 
-                EDataFlow flow = eRender;
-                IMMEndpoint* ep = nullptr;
-                if (SUCCEEDED(device->QueryInterface(iid_ep, reinterpret_cast<void**>(&ep))) && ep) {
-                    ep->GetDataFlow(&flow);
-                    ep->Release();
-                }
+                EDataFlow flow = eAll;
+                IMMEndpoint* endpoint = nullptr;
+                if (FAILED(device->QueryInterface(iid_ep, reinterpret_cast<void**>(&endpoint))) || !endpoint) break;
+                const auto flow_result = endpoint->GetDataFlow(&flow);
+                endpoint->Release();
+                if (FAILED(flow_result) || flow != eRender) break;
 
                 if (FAILED(device->Activate(iid_ac, CLSCTX_ALL, nullptr,
                                             reinterpret_cast<void**>(&audio_client))) || !audio_client) {
@@ -521,7 +547,7 @@ public:
                 }
 
                 // 优先读取声卡混音器原生格式，200ms (2,000,000 * 100ns) 充足环形缓冲彻底杜绝溢出
-                const DWORD loopback_flag = (flow == eRender) ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
+                const DWORD loopback_flag = AUDCLNT_STREAMFLAGS_LOOPBACK;
                 bool use_native_mix = false;
                 if (SUCCEEDED(audio_client->GetMixFormat(&mix_fmt)) && mix_fmt && mix_fmt->nChannels >= 1 &&
                     mix_fmt->nSamplesPerSec >= 8000) {
@@ -724,6 +750,7 @@ public:
     }
 
     bool is_active() const { return active_.load(); }
+    HRESULT process_status() const { return process_status_.load(); }
     bool used_default_loopback_fallback() const { return fallback_default_loopback_.load(); }
 
     void read_stereo_frame(int16_t* dst, size_t out_frames) {
@@ -739,6 +766,7 @@ private:
     std::atomic<bool> stop_req_{false};
     std::atomic<bool> active_{false};
     std::atomic<bool> fallback_default_loopback_{false};
+    std::atomic<HRESULT> process_status_{E_FAIL};
     uint32_t target_rate_ = 48000;
     size_t frame_samples_ = 480;
     std::wstring requested_endpoint_;
@@ -1087,19 +1115,8 @@ std::vector<LoopbackSourceInfo> AudioPipeline::list_loopback_sources() {
     std::vector<LoopbackSourceInfo> out;
 #if defined(__linux__) && !defined(__ANDROID__)
     out.push_back({"@DEFAULT_MONITOR@", "系统默认输出环回 (@DEFAULT_MONITOR@)"});
-    FILE* fp = popen("pactl list short sources 2>/dev/null", "r");
-    if (fp) {
-        char line[512];
-        while (std::fgets(line, sizeof(line), fp)) {
-            std::istringstream iss(line);
-            std::string idx, name;
-            if (iss >> idx >> name) {
-                if (name.find(".monitor") != std::string::npos && is_safe_linux_source_name(name)) {
-                    out.push_back({name, name});
-                }
-            }
-        }
-        pclose(fp);
+    for (const auto& name : linux_sink_monitors()) {
+        out.push_back({name, name});
     }
 #elif defined(_WIN32)
     out.push_back({"default", "系统默认输出直抓（原生 WASAPI 零延迟，免虚拟声卡）"});
@@ -1349,14 +1366,17 @@ bool AudioPipeline::set_source_mode(AudioSourceMode mode, const std::string& par
             return false;
         }
 #if defined(__linux__) && !defined(__ANDROID__)
-        if (!param.empty() && !is_safe_linux_source_name(param)) {
-            std::string err = "无效的 Linux 环回音源名称";
-            {
-                std::lock_guard<std::mutex> lock(param_mu_);
-                last_error_ = err;
+        if (!param.empty() && param != "@DEFAULT_MONITOR@") {
+            const auto monitors = linux_sink_monitors();
+            if (std::find(monitors.begin(), monitors.end(), param) == monitors.end()) {
+                const std::string err = "Linux 抓音源必须是播放输出的监视器";
+                {
+                    std::lock_guard<std::mutex> lock(param_mu_);
+                    last_error_ = err;
+                }
+                if (err_out) *err_out = err;
+                return false;
             }
-            if (err_out) *err_out = err;
-            return false;
         }
 #endif
     }
@@ -1601,40 +1621,69 @@ void AudioPipeline::push_external_pcm(const int16_t* stereo_pcm, size_t frame_sa
     ext_fifo_.push_interleaved_stereo(stereo_pcm, frame_samples);
 }
 
-void AudioPipeline::compute_spectrum(const int16_t* stereo_pcm, size_t frames) {
+void AudioPipeline::queue_spectrum(const int16_t* stereo_pcm, size_t frames) {
     if (!spec_cb_ || frames == 0) return;
-    std::array<float, 16> bands{};
-    const size_t step = std::max<size_t>(1, frames / 16);
-    for (size_t b = 0; b < 16; ++b) {
-        double sum_sq = 0.0;
-        size_t cnt = 0;
-        for (size_t i = b * step; i < std::min(frames, (b + 1) * step); ++i) {
-            double s = (static_cast<double>(stereo_pcm[i * 2]) +
-                        static_cast<double>(stereo_pcm[i * 2 + 1])) * 0.5 / 32768.0;
-            sum_sq += s * s;
-            ++cnt;
-        }
-        float rms = cnt > 0 ? static_cast<float>(std::sqrt(sum_sq / cnt)) : 0.0f;
-        bands[b] = std::min(1.0f, rms * 3.5f);
-    }
     {
-        // Spectrum is replaceable UI data. The audio worker must never wait for publication.
-        std::unique_lock<std::mutex> lock(spectrum_mu_, std::try_to_lock);
+        std::unique_lock lock(spectrum_mu_, std::try_to_lock);
         if (!lock.owns_lock() || !running_.load()) return;
-        pending_spectrum_ = bands;
+        auto& sample = pending_spectrum_.emplace();
+        sample.frames = std::min(frames, kSpectrumSamples);
+        std::copy_n(stereo_pcm, sample.frames * 2, sample.pcm.begin());
     }
     spectrum_cv_.notify_one();
 }
 
 void AudioPipeline::spectrum_loop() {
+    constexpr std::array<float, 15> edges{
+        70, 100, 150, 240, 330, 460, 640, 880, 1200, 1650, 2250, 3100, 4700, 7000, 10500,
+    };
+    static_assert(std::has_single_bit(kSpectrumSamples));
     for (;;) {
-        std::unique_lock<std::mutex> lock(spectrum_mu_);
+        std::unique_lock lock(spectrum_mu_);
         spectrum_cv_.wait(lock, [this] { return pending_spectrum_ || !running_.load(); });
         if (!running_.load()) return;
-        auto bands = *pending_spectrum_;
+        const auto sample = *pending_spectrum_;
         pending_spectrum_.reset();
         lock.unlock();
-        spec_cb_(bands);
+
+        std::array<float, 16> power{};
+        for (size_t channel = 0; channel < 2; ++channel) {
+            std::array<std::complex<float>, kSpectrumSamples> fft{};
+            for (size_t i = 0, reversed = 0; i < kSpectrumSamples; ++i) {
+                if (i < sample.frames) {
+                    const double window = 0.5 - 0.5 * std::cos(kTwoPi * i / std::max<size_t>(1, sample.frames - 1));
+                    fft[reversed] = static_cast<float>(sample.pcm[i * 2 + channel] * window / 32768.0);
+                }
+                size_t bit = kSpectrumSamples >> 1;
+                while (bit && (reversed & bit)) {
+                    reversed ^= bit;
+                    bit >>= 1;
+                }
+                reversed ^= bit;
+            }
+            for (size_t span = 2; span <= kSpectrumSamples; span *= 2) {
+                const auto rotation = std::polar(1.0f, static_cast<float>(-kTwoPi / span));
+                for (size_t i = 0; i < kSpectrumSamples; i += span) {
+                    std::complex<float> phase{1, 0};
+                    for (size_t j = i; j < i + span / 2; ++j) {
+                        const auto even = fft[j];
+                        const auto odd = phase * fft[j + span / 2];
+                        fft[j] = even + odd;
+                        fft[j + span / 2] = even - odd;
+                        phase *= rotation;
+                    }
+                }
+            }
+            size_t band = 0;
+            for (size_t i = 1; i <= kSpectrumSamples / 2; ++i) {
+                const float hz = static_cast<float>(i * sample_rate_) / kSpectrumSamples;
+                while (band < edges.size() && hz >= edges[band]) ++band;
+                power[band] += std::norm(fft[i]);
+            }
+        }
+        const float gain = 4.0f / std::sqrt(static_cast<float>(sample.frames * kSpectrumSamples));
+        for (auto& band : power) band = std::min(1.0f, gain * std::sqrt(band));
+        spec_cb_(power);
     }
 }
 
@@ -1838,9 +1887,10 @@ void AudioPipeline::worker_loop() {
                     } else if (process_pid) {
                         std::lock_guard lock(param_mu_);
                         if (source_gen_.load() == cur_gen) {
-                            last_error_ = (*process_pid > 0)
-                                ? "单应用音频捕获启动失败（目标应用可能已退出，或系统低于 Windows 10 Build 20348）"
-                                : "系统音频环回采集启动失败";
+                            std::ostringstream message;
+                            message << (*process_pid > 0 ? "单应用音频捕获启动失败" : "系统音频环回采集启动失败")
+                                    << " (HRESULT 0x" << std::hex << static_cast<uint32_t>(wasapi.process_status()) << ')';
+                            last_error_ = message.str();
                         }
                     } else if (!target_ep.empty()) {
                         playback_route.stop();
@@ -1881,7 +1931,7 @@ void AudioPipeline::worker_loop() {
             std::lock_guard publication(publication_mu_);
             if (cur_gen == source_gen_.load()) {
                 if (pcm_cb_) pcm_cb_(frame.data(), frame_samples_);
-                if (++spec_div % 3 == 0) compute_spectrum(frame.data(), frame_samples_);
+                if (++spec_div % 3 == 0) queue_spectrum(frame.data(), frame_samples_);
             } else if (skip_samples_) {
                 skip_samples_(frame_samples_);
             }

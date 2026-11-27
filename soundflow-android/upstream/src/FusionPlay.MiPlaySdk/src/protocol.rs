@@ -1287,8 +1287,6 @@ fn run_session(
                     "stage": "safety_challenge_sent",
                     "local_endpoint": local.to_string(),
                     "remote_endpoint": remote.to_string(),
-                    "auth_key": auth_key,
-                    "own_auth_message": own_auth_message,
                 }));
             }
             SAFETY_AUTH => {
@@ -1303,10 +1301,6 @@ fn run_session(
                     "stage": "safety_auth_received",
                     "local_endpoint": local.to_string(),
                     "remote_endpoint": remote.to_string(),
-                    "auth_key": auth_key,
-                    "peer_auth_message": peer_auth,
-                    "own_auth_message": own_auth_message,
-                    "peer_auth_ack": ack,
                 }));
                 // Defensive compatibility for senders that omit SafetyInfo.
                 // The normal MiPCAudio-compatible path already sent this
@@ -1339,8 +1333,6 @@ fn run_session(
                     events(json!({
                         "event": "authentication_diagnostic",
                         "stage": "safety_auth_ack_received",
-                        "received_auth_ack": received,
-                        "expected_auth_ack": expected,
                         "matches": received == expected,
                     }));
                     if received != expected {

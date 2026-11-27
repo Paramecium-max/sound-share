@@ -810,7 +810,7 @@ void MultiRoomEngine::broadcast_media_info(const cmd::MediaInfoPayload& info) {
         }
     }
     for (auto& s : sessions) {
-        s->send_set_media_info(info);
+        s->queue_media_info(info);
     }
 }
 
@@ -825,7 +825,7 @@ void MultiRoomEngine::broadcast_position_ms(uint64_t position_ms) {
         }
     }
     for (auto& s : sessions) {
-        s->send_set_position_ms(position_ms);
+        s->queue_position_ms(position_ms);
     }
 }
 

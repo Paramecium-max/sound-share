@@ -571,16 +571,13 @@ public class AudioCaptureEngine {
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN);
-        try {
-            int myUid = android.os.Process.myUid();
-            if (targetUid > 0 && targetUid != myUid) {
-                // Single-app isolation: capture ONLY the chosen app's UID (implicitly excludes our own UID and system alerts).
-                cfgBuilder.addMatchingUid(targetUid);
-            } else {
-                // Global loopback: exclude our own UID (covers both main process and :receiver process) to prevent feedback loops.
-                cfgBuilder.excludeUid(myUid);
-            }
-        } catch (Throwable ignored) {}
+        int myUid = android.os.Process.myUid();
+        if (targetUid > 0) {
+            if (targetUid == myUid) throw new IllegalArgumentException("不能抓取本应用音频");
+            cfgBuilder.addMatchingUid(targetUid);
+        } else {
+            cfgBuilder.excludeUid(myUid);
+        }
         AudioPlaybackCaptureConfiguration cfg = cfgBuilder.build();
         AudioFormat fmt = new AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)

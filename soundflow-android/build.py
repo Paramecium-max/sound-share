@@ -359,7 +359,11 @@ def main():
         "magisk_zip_bytes": magisk_zip.stat().st_size,
         "magisk_zip_sha256": hashlib.sha256(magisk_zip.read_bytes()).hexdigest(),
     }
-    (DEBUG_DIR / "build-manifest.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest = json.dumps(meta, ensure_ascii=False, indent=2) + "\n"
+    for directory in dict.fromkeys((OUT_ROOT.resolve(), DEBUG_DIR.resolve())):
+        temporary = directory / "build-manifest.json.tmp"
+        temporary.write_text(manifest, encoding="utf-8")
+        temporary.replace(directory / "build-manifest.json")
     print(json.dumps(meta, ensure_ascii=False, indent=2))
 
 

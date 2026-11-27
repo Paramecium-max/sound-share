@@ -42,6 +42,7 @@ class Activation final : public IActivateAudioInterfaceCompletionHandler {
 public:
     // ABI layout of AUDIOCLIENT_ACTIVATION_PARAMS (process loopback).
     struct Parameters { DWORD type; DWORD process; DWORD mode; };
+    static_assert(sizeof(Parameters) == 12 && alignof(Parameters) == alignof(DWORD));
     explicit Activation(DWORD pid) : params{1, pid ? pid : GetCurrentProcessId(), pid ? 0U : 1U} {
         property.vt = VT_BLOB;
         property.blob = {sizeof(params), reinterpret_cast<BYTE*>(&params)};
@@ -62,23 +63,29 @@ public:
         return n;
     }
     HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation* operation) override {
-        HRESULT result = E_FAIL;
+        HRESULT activated = E_FAIL;
         IUnknown* object = nullptr;
         std::lock_guard lock(mutex);
-        if (SUCCEEDED(operation->GetActivateResult(&result, &object)) && SUCCEEDED(result) && object) {
-            object->QueryInterface(kAudioClient, reinterpret_cast<void**>(&client));
+        status = operation->GetActivateResult(&activated, &object);
+        if (SUCCEEDED(status)) {
+            status = FAILED(activated) ? activated : E_NOINTERFACE;
+            if (SUCCEEDED(activated) && object) {
+                status = object->QueryInterface(kAudioClient, reinterpret_cast<void**>(&client));
+            }
         }
         if (object) object->Release();
         done = true;
         cv.notify_one();
         return S_OK;
     }
-    IAudioClient* wait() {
+    HRESULT wait(IAudioClient** out) {
         std::unique_lock lock(mutex);
-        cv.wait_for(lock, std::chrono::milliseconds(2500), [this] { return done; });
-        auto* result = client;
+        if (!cv.wait_for(lock, std::chrono::milliseconds(2500), [this] { return done; })) {
+            return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        }
+        *out = client;
         client = nullptr;
-        return result;
+        return status;
     }
 
     Parameters params;
@@ -91,6 +98,7 @@ private:
     std::condition_variable cv;
     IAudioClient* client = nullptr;
     bool done = false;
+    HRESULT status = E_FAIL;
 };
 
 std::wstring process_path(uint32_t pid) {
@@ -177,23 +185,35 @@ std::string process_friendly_label(const std::wstring& full_path, const std::str
 
 } // namespace
 
-IAudioClient* activate_process_loopback(uint32_t pid) {
+bool is_legacy_process_loopback_windows() {
+    using GetVersion = LONG(WINAPI*)(OSVERSIONINFOW*);
+    static const auto get_version = reinterpret_cast<GetVersion>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+    OSVERSIONINFOW version{};
+    version.dwOSVersionInfoSize = sizeof(version);
+    return get_version && get_version(&version) == 0 &&
+           (version.dwMajorVersion < 10 ||
+            (version.dwMajorVersion == 10 && version.dwBuildNumber < 20348));
+}
+
+HRESULT activate_process_loopback(uint32_t pid, IAudioClient** client) {
     using Activate = HRESULT(WINAPI*)(LPCWSTR, REFIID, PROPVARIANT*,
         IActivateAudioInterfaceCompletionHandler*, IActivateAudioInterfaceAsyncOperation**);
     // Keep the system DLL loaded while Windows owns asynchronous operations.
     static const auto module = LoadLibraryExW(L"Mmdevapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     static const auto activate = module ? reinterpret_cast<Activate>(
         GetProcAddress(module, "ActivateAudioInterfaceAsync")) : nullptr;
-    if (!activate || pid == GetCurrentProcessId()) return nullptr;
+    if (!client) return E_POINTER;
+    *client = nullptr;
+    if (pid == GetCurrentProcessId()) return E_INVALIDARG;
+    if (!activate) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     auto* handler = new Activation(pid);
     IActivateAudioInterfaceAsyncOperation* operation = nullptr;
-    IAudioClient* client = nullptr;
-    if (SUCCEEDED(activate(L"VAD\\Process_Loopback", kAudioClient, &handler->property, handler, &operation))) {
-        client = handler->wait();
-    }
+    HRESULT status = activate(L"VAD\\Process_Loopback", kAudioClient, &handler->property, handler, &operation);
+    if (SUCCEEDED(status)) status = handler->wait(client);
     if (operation) operation->Release();
     handler->Release();
-    return client;
+    return status;
 }
 #endif
 

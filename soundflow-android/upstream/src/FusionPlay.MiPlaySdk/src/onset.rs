@@ -82,12 +82,38 @@ pub fn monotonic_bias() -> f64 {
     f64::from_bits(MONOTONIC_BIAS.load(Ordering::Acquire))
 }
 
-pub(crate) fn begin_output_stream() -> u64 {
+pub fn begin_output_stream() -> u64 {
     STREAM.fetch_add(1, Ordering::AcqRel) + 1
 }
 
+pub fn current_output_stream() -> u64 {
+    STREAM.load(Ordering::Acquire)
+}
+
 pub fn tap_output(frames: &[(f32, f32)], rate: u32, latency_ms: f64) {
-    tap_output_at(frames, rate, now_ms() + latency_ms.max(0.0), 0, false);
+    tap_output_at(
+        frames,
+        rate,
+        now_ms() + latency_ms.max(0.0),
+        STREAM.load(Ordering::Acquire),
+        false,
+    );
+}
+
+pub fn tap_stream_output(
+    frames: &[(f32, f32)],
+    rate: u32,
+    latency_ms: f64,
+    stream: u64,
+    discontinuity: bool,
+) {
+    tap_output_at(
+        frames,
+        rate,
+        now_ms() + latency_ms.max(0.0),
+        stream,
+        discontinuity,
+    );
 }
 
 pub(crate) fn tap_output_at(

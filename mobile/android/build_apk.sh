@@ -32,7 +32,8 @@ WEB_DIST="$REPO/desktop/dist"
 BUILD_DIR="$ROOT/build_tmp"
 KEYSTORE="${KEYSTORE_PATH:-$ROOT/miplay_sender_release.jks}"
 KEY_ALIAS="${KEYSTORE_ALIAS:-miplay}"
-KEY_PASS="${KEYSTORE_PASS:-miplay123456}"
+: "${MIPLAY_KEYSTORE_PASSWORD:?Set MIPLAY_KEYSTORE_PASSWORD for Android signing}"
+export MIPLAY_KEYSTORE_PASSWORD
 OUT_APK="${1:-$ROOT/build/sound-share-v0.2.0.apk}"
 
 trap 'rm -rf "$BUILD_DIR"' EXIT
@@ -78,7 +79,7 @@ if [ ! -f "$KEYSTORE" ]; then
         -keystore "$KEYSTORE" \
         -alias "$KEY_ALIAS" \
         -keyalg RSA -keysize 2048 -validity 10000 \
-        -storepass "$KEY_PASS" -keypass "$KEY_PASS" \
+        -storepass:env MIPLAY_KEYSTORE_PASSWORD -keypass:env MIPLAY_KEYSTORE_PASSWORD \
         -dname "CN=MiPlay MultiRoom, OU=SoundShare, O=Local, C=CN"
 fi
 
@@ -86,8 +87,8 @@ mkdir -p "$(dirname "$OUT_APK")"
 "$APKSIGNER" sign \
     --ks "$KEYSTORE" \
     --ks-key-alias "$KEY_ALIAS" \
-    --ks-pass "pass:$KEY_PASS" \
-    --key-pass "pass:$KEY_PASS" \
+    --ks-pass env:MIPLAY_KEYSTORE_PASSWORD \
+    --key-pass env:MIPLAY_KEYSTORE_PASSWORD \
     --out "$OUT_APK" \
     "$BUILD_DIR/aligned.apk"
 

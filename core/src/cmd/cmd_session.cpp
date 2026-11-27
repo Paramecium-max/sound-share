@@ -62,6 +62,7 @@ void CmdSession::mark_disconnected(const std::string& reason) {
         }
     }
     auth_cv_.notify_all();
+    wake_update_worker();
     if (was_conn) {
         if (!reason.empty()) emit_status(reason);
         if (cbs_.on_state_changed) cbs_.on_state_changed(false);
@@ -98,7 +99,7 @@ bool CmdSession::connect(CmdSessionCallbacks cbs, const std::atomic<bool>* cance
 
     net::set_tcp_nodelay(s, true);
 
-    if (!net::set_nonblocking(s, true) || !net::set_socket_timeout(s, SO_SNDTIMEO, 100)) {
+    if (!net::set_nonblocking(s, true)) {
         net::close_socket(s);
         emit_status("8899 Socket 配置失败");
         return false;
@@ -137,7 +138,7 @@ bool CmdSession::connect(CmdSessionCallbacks cbs, const std::atomic<bool>* cance
             break;
         }
     }
-    if (!tcp_connected || is_cancelled() || !net::set_nonblocking(s, false)) {
+    if (!tcp_connected || is_cancelled()) {
         {
             std::lock_guard<std::mutex> lk(sock_mu_);
             if (sock_ != kInvalidSocket) { net::close_socket(sock_); sock_ = kInvalidSocket; }
@@ -171,12 +172,13 @@ bool CmdSession::connect(CmdSessionCallbacks cbs, const std::atomic<bool>* cance
     }
 
     {
-        std::lock_guard<std::mutex> lk(sock_mu_);
+        std::scoped_lock lock(send_mu_, sock_mu_);
         if (is_cancelled()) {
             net::close_socket(sock_);
             sock_ = kInvalidSocket;
             return false;
         }
+        writer_ = std::make_unique<net::ConnectionWriter>(sock_);
         running_.store(true);
         connected_.store(true);
     }
@@ -343,6 +345,7 @@ void CmdSession::abort() {
     running_.store(false);
     connected_.store(false);
     auth_cv_.notify_all();
+    wake_update_worker();
     std::lock_guard<std::mutex> lk(sock_mu_);
     if (sock_ != kInvalidSocket) {
 #ifdef _WIN32
@@ -363,6 +366,7 @@ void CmdSession::disconnect() {
     running_.store(false);
     bool was_conn = connected_.exchange(false);
     auth_cv_.notify_all();
+    wake_update_worker();
     {
         std::lock_guard<std::mutex> lk(sock_mu_);
         if (sock_ != kInvalidSocket) {
@@ -377,22 +381,32 @@ void CmdSession::disconnect() {
     if (hb_th_.joinable() && hb_th_.get_id() != std::this_thread::get_id()) hb_th_.join();
     {
         std::scoped_lock lock(send_mu_, sock_mu_);
+        writer_.reset();
         if (sock_ != kInvalidSocket) {
             net::close_socket(sock_);
             sock_ = kInvalidSocket;
         }
     }
+    {
+        std::lock_guard lock(updates_mu_);
+        pending_media_.reset();
+        pending_position_.reset();
+    }
     if (was_conn && cbs_.on_state_changed) cbs_.on_state_changed(false);
 }
 
 bool CmdSession::send_raw_locked(uint16_t cmd_type, uint16_t seq, const std::vector<uint8_t>& payload) {
-    if (!connected_.load() || sock_ == kInvalidSocket) return false;
+    if (!connected_.load() || !writer_) return false;
     CmdFrame f;
     f.cmd_type = cmd_type;
     f.seq = seq;
     f.payload = payload;
     auto wire = encode_frame(f);
-    return net::send_all(sock_, wire.data(), wire.size());
+    if (writer_->write(wire.data(), wire.size(), 100, &aborted_) == net::SendAllStatus::Ok) {
+        return true;
+    }
+    writer_->abort();
+    return false;
 }
 
 bool CmdSession::send_cmd(CmdType type, const std::vector<uint8_t>& raw_payload, bool allow_encrypt) {
@@ -738,15 +752,64 @@ void CmdSession::recv_loop() {
     }
 }
 
+void CmdSession::queue_media_info(const MediaInfoPayload& info) {
+    {
+        std::lock_guard lock(updates_mu_);
+        if (!connected_.load()) return;
+        pending_media_ = info;
+    }
+    updates_cv_.notify_one();
+}
+
+void CmdSession::queue_position_ms(uint64_t position_ms) {
+    {
+        std::lock_guard lock(updates_mu_);
+        if (!connected_.load()) return;
+        pending_position_ = position_ms;
+    }
+    updates_cv_.notify_one();
+}
+
+void CmdSession::wake_update_worker() {
+    // Serialize a state notification with the worker entering its condition wait.
+    std::lock_guard lock(updates_mu_);
+    updates_cv_.notify_one();
+}
+
 void CmdSession::heartbeat_loop() {
-    for (int tick = 0; running_.load() && connected_.load(); ++tick) {
-        if (tick > 0 && tick % 50 == 0) {
+    using Clock = std::chrono::steady_clock;
+    constexpr auto heartbeat_interval = std::chrono::seconds(5);
+    auto next_heartbeat = Clock::now() + heartbeat_interval;
+    while (running_.load() && connected_.load()) {
+        std::optional<MediaInfoPayload> media;
+        std::optional<uint64_t> position;
+        {
+            std::unique_lock lock(updates_mu_);
+            updates_cv_.wait_until(lock, next_heartbeat, [this] {
+                return pending_media_ || pending_position_ || !running_.load() || !connected_.load();
+            });
+            if (!running_.load() || !connected_.load()) break;
+            media.swap(pending_media_);
+            position.swap(pending_position_);
+        }
+        if (Clock::now() >= next_heartbeat) {
             if (!send_heartbeat()) {
-                mark_disconnected("8899 心跳发送失败，连接已断开");
+                mark_disconnected("8899 心跳发送失败/超时");
+                abort();
                 break;
             }
+            next_heartbeat = Clock::now() + heartbeat_interval;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (media && !send_set_media_info(*media)) {
+            mark_disconnected("8899 媒体信息发送失败/超时");
+            abort();
+            break;
+        }
+        if (position && !send_set_position_ms(*position)) {
+            mark_disconnected("8899 播放进度发送失败/超时");
+            abort();
+            break;
+        }
     }
 }
 

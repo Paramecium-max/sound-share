@@ -373,15 +373,16 @@ function spawnCenterRipple(kind, strength) {
   }
 }
 
-function processSpectrumOnset(peak, bass, mid, high) {
+function processSpectrumOnset(peak, bass, mid, high, preview) {
   if (!centerRippleEnabled || !isPlaying || reduceMotion) return;
-  if (rippleTriggerMode !== "classic") return;
+  const percussionPreview = preview && rippleTriggerMode === "percussion";
+  if (rippleTriggerMode !== "classic" && !percussionPreview) return;
   const now = performance.now();
   // Whenever native PCM or DLNA Visualizer onset feed is active, beat-locked
   // RippleOnsetQueue drives "classic" directly with exact latency alignment.
-  if (now - lastNativeOnsetFeedTs < 1500) return;
+  if (!preview && now - lastNativeOnsetFeedTs < 1500) return;
 
-  // Fallback only when an unpermissioned DLNA stream provides coarse meter ticks
+  // Coarse DLNA meter and sender preview can provide local spectrum ticks.
   const rawMax = Math.max(bass, mid, high);
   let b = bass;
   let m = mid;
@@ -417,13 +418,13 @@ function processSpectrumOnset(peak, bass, mid, high) {
     lastBassSpawnTs = now;
     lastAnySpawnTs = now;
     const hitStrength = Math.min(1.0, normB * 0.68 + (fluxBass / envPeakRef) * 0.72);
-    spawnCenterRipple("bass", Math.max(0.28, hitStrength));
-  } else if (m > 0.020 * strict && (m > avgMid * (1.16 * strict) + 0.014 * strict || fluxMid > envPeakRef * 0.16 * strict) && now - lastMidSpawnTs >= minGap && now - lastAnySpawnTs >= 150) {
+    spawnCenterRipple(percussionPreview ? "drum" : "bass", Math.max(0.28, hitStrength));
+  } else if (!percussionPreview && m > 0.020 * strict && (m > avgMid * (1.16 * strict) + 0.014 * strict || fluxMid > envPeakRef * 0.16 * strict) && now - lastMidSpawnTs >= minGap && now - lastAnySpawnTs >= 150) {
     lastMidSpawnTs = now;
     lastAnySpawnTs = now;
     const hitStrength = Math.min(1.0, normM * 0.64 + (fluxMid / envPeakRef) * 0.65);
     spawnCenterRipple("mid", Math.max(0.24, hitStrength));
-  } else if (h > 0.018 * strict && (h > avgHigh * (1.18 * strict) + 0.012 * strict || fluxHigh > envPeakRef * 0.17 * strict) && now - lastHighSpawnTs >= minGap && now - lastAnySpawnTs >= 150) {
+  } else if (!percussionPreview && h > 0.018 * strict && (h > avgHigh * (1.18 * strict) + 0.012 * strict || fluxHigh > envPeakRef * 0.17 * strict) && now - lastHighSpawnTs >= minGap && now - lastAnySpawnTs >= 150) {
     lastHighSpawnTs = now;
     lastAnySpawnTs = now;
     const hitStrength = Math.min(0.84, normH * 0.56 + (fluxHigh / envPeakRef) * 0.52);
@@ -825,14 +826,14 @@ window.SoundFlowStage = {
     audioEnergy = Number.isFinite(v) ? Math.max(0, Math.min(1, v * 1.45)) : 0;
   },
 
-  onTick(level, posMs, bass = 0, mid = 0, high = 0) {
+  onTick(level, posMs, bass = 0, mid = 0, high = 0, preview = false) {
     const v = Number(level);
     audioEnergy = Number.isFinite(v) ? Math.max(0, Math.min(1, v * 1.45)) : 0;
     const p = Number(posMs);
     if (Number.isFinite(p) && p >= 0) {
       currentTimeMs = p;
     }
-    processSpectrumOnset(audioEnergy, Number(bass) || 0, Number(mid) || 0, Number(high) || 0);
+    processSpectrumOnset(audioEnergy, Number(bass) || 0, Number(mid) || 0, Number(high) || 0, preview);
   },
 
   onViewportChanged() {

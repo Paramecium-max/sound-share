@@ -556,9 +556,12 @@ static void test_slow_spectrum_consumer_keeps_capture_running() {
 
     CHECK(pipeline.start(48000, 1024,
         [&](const int16_t*, size_t) { ++frames; },
-        [&](const std::array<float, 16>&) {
+        [&](const std::array<float, 16>& bands) {
             ++spectra;
             if (spectrum_entered.exchange(true)) return;
+            // The built-in 440/554/659 Hz tones must peak in the corresponding bands.
+            const float tone = std::max({bands[4], bands[5], bands[6]});
+            CHECK(tone > 0.10f && bands[0] < tone * 0.2f && bands[15] < tone * 0.2f);
             while (!release_spectrum.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }

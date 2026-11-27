@@ -811,20 +811,21 @@ public final class MainActivity extends Activity {
                             for (int i = 0; i < n; i++) {
                                 float v = Math.max(0f, Math.min(1f, (float) lv.optDouble(i, 0.0)));
                                 if (v > peak) peak = v;
-                                if (i < bEnd) bass += v;
-                                else if (i < mEnd) mid += v;
-                                else high += v;
+                                if (i < bEnd) bass = Math.max(bass, v);
+                                else if (i < mEnd) mid = Math.max(mid, v);
+                                else high = Math.max(high, v);
                             }
-                            bass /= bEnd;
-                            mid /= Math.max(1, mEnd - bEnd);
-                            high /= Math.max(1, n - mEnd);
                             int packed = (Math.min(255, Math.round(peak * 255f)) << 24)
                                     | (Math.min(255, Math.round(bass * 255f)) << 16)
                                     | (Math.min(255, Math.round(mid * 255f)) << 8)
                                     | Math.min(255, Math.round(high * 255f));
                             final float finalPeak = peak;
                             final int finalPacked = packed;
-                            main.post(() -> lyricOrchestrator.updateAudioEnergy(finalPeak, -1L, finalPacked));
+                            main.post(() -> {
+                                if (senderStagePreviewActive && !latestSnapshot.getBoolean("session_active", false)) {
+                                    lyricOrchestrator.updateSenderPreviewEnergy(finalPeak, finalPacked);
+                                }
+                            });
                         }
                     } catch (Throwable ignored) {}
                 }

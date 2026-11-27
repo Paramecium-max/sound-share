@@ -2,6 +2,7 @@
 #include "sync/master_clock.h"
 
 #include <cstring>
+#include <limits>
 
 namespace miplay::sync {
 
@@ -108,7 +109,9 @@ void TimerService::run_loop() {
         item.client_port = ntohs(peer.sin_port);
         item.last_seq = q4;
         item.last_seen_us = t_recv;
-        item.residual_error_us = (q0 > 0) ? (static_cast<int64_t>(t_recv) - static_cast<int64_t>(q0)) : 0;
+        constexpr auto max_signed = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+        item.residual_error_us = q0 != 0 && q0 <= max_signed && t_recv <= max_signed
+            ? static_cast<int64_t>(t_recv) - static_cast<int64_t>(q0) : 0;
         item.packet_count++;
     }
 }

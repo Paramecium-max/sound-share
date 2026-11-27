@@ -1,20 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-use fusionplay_miplay_sdk::{report_external_output_pcm, reset_live_output_peak};
-use rodio::{ChannelCount, Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, SampleRate, Source};
+use fusionplay_miplay_sdk::{
+    begin_external_output_stream, report_external_output_pcm_stream, reset_live_output_peak,
+};
+use rodio::{
+    ChannelCount, Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, SampleRate, Source,
+};
 use serde_json::{Value, json};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io::{self, Read, Seek, SeekFrom, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     num::NonZero,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
+};
+use ureq::unversioned::{
+    resolver::{ResolvedSocketAddrs, Resolver},
+    transport::{DefaultConnector, NextTimeout},
 };
 
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
@@ -22,7 +30,9 @@ const DEVICE: &str = "urn:schemas-upnp-org:device:MediaRenderer:1";
 const MAX_MEDIA_BYTES: usize = 128 * 1024 * 1024;
 const PREBUFFER_BYTES: usize = 128 * 1024;
 const MAX_HTTP_CLIENTS: usize = 8;
+const MAX_MEDIA_DOWNLOADS: usize = 2;
 const MAX_REDIRECTS: usize = 3;
+static ACTIVE_DNS: AtomicUsize = AtomicUsize::new(0);
 
 const SERVICES: &[(&str, &[&str])] = &[
     (
@@ -59,7 +69,8 @@ struct Status {
     events: VecDeque<Value>,
     active: bool,
     blocked: bool,
-    local_action: Option<(String, i32)>,
+    block_generation: u64,
+    playback_stream: Option<Weak<SharedStream>>,
 }
 
 impl Status {
@@ -71,6 +82,20 @@ impl Status {
     }
 }
 
+enum WorkerCmd {
+    Shutdown,
+    SetBlocked {
+        blocked: bool,
+        generation: u64,
+        ack: mpsc::SyncSender<()>,
+    },
+    LocalAction {
+        action: String,
+        value: i32,
+    },
+    Soap(SoapJob),
+}
+
 struct SoapJob {
     service: String,
     actions: &'static [&'static str],
@@ -80,7 +105,7 @@ struct SoapJob {
 
 pub struct DlnaRenderer {
     status: Arc<Mutex<Status>>,
-    stop: mpsc::Sender<()>,
+    cmd_tx: mpsc::SyncSender<WorkerCmd>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -112,12 +137,13 @@ impl DlnaRenderer {
         let identity = format!("uuid:{}", config["uuid"].as_str().unwrap_or_default());
         let name = config["name"].as_str().unwrap_or("SoundFlow").to_owned();
         let initial_volume = config["volume"].as_u64().unwrap_or(45).min(100) as u8;
-        let (stop, shutdown) = mpsc::channel();
-        let (soap_tx, soap_rx) = mpsc::sync_channel::<SoapJob>(16);
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<WorkerCmd>(32);
         let status = Arc::new(Mutex::new(Status::default()));
         let shared = Arc::clone(&status);
         let active_http = Arc::new(AtomicUsize::new(0));
+        let active_downloads = Arc::new(AtomicUsize::new(0));
         let xml = Arc::new(description(&identity, &name));
+        let http_cmd_tx = cmd_tx.clone();
 
         let worker = thread::Builder::new()
             .name("soundflow-dlna".into())
@@ -130,11 +156,13 @@ impl DlnaRenderer {
                 let mut media = Media {
                     volume: initial_volume,
                     local_ip: ip,
+                    active_downloads,
                     ..Media::default()
                 };
                 let mut buffer = [0_u8; 4096];
                 let mut next_alive = Instant::now();
-                while shutdown.try_recv().is_err() {
+                let mut running = true;
+                while running {
                     if Instant::now() >= next_alive {
                         announce(&udp, &targets, &identity, &location, "ssdp:alive");
                         next_alive = Instant::now() + Duration::from_secs(120);
@@ -172,12 +200,12 @@ impl DlnaRenderer {
                             continue;
                         }
                         let xml_ref = Arc::clone(&xml);
-                        let tx_ref = soap_tx.clone();
+                        let tx_ref = http_cmd_tx.clone();
                         let counter = Arc::clone(&active_http);
                         if thread::Builder::new()
                             .name("soundflow-dlna-http".into())
                             .spawn(move || {
-                                let _guard = HttpCounterGuard(counter);
+                                let _guard = CounterGuard(counter);
                                 handle_http_worker(stream, &xml_ref, &tx_ref);
                             })
                             .is_err()
@@ -186,40 +214,71 @@ impl DlnaRenderer {
                         }
                     }
 
-                    let (blocked, action) = {
-                        let mut state = shared.lock().unwrap();
-                        (state.blocked, state.local_action.take())
+                    let process_cmd = |cmd: WorkerCmd, media: &mut Media| {
+                        match cmd {
+                            WorkerCmd::Shutdown => return false,
+                            WorkerCmd::SetBlocked { blocked, generation, ack } => {
+                                {
+                                    let mut st = shared.lock().unwrap();
+                                    if st.block_generation != generation {
+                                        return true;
+                                    }
+                                    st.blocked = blocked;
+                                }
+                                if blocked {
+                                    media.silence_for_block(&shared);
+                                }
+                                let _ = ack.send(());
+                            }
+                            WorkerCmd::LocalAction { action, value } => {
+                                let blocked = shared.lock().unwrap().blocked;
+                                match action.as_str() {
+                                    "pause" => media.pause(&shared),
+                                    "resume" if !blocked => {
+                                        let _ = media.play(&shared, blocked);
+                                    }
+                                    "volume" => {
+                                        media.volume = value.clamp(0, 100) as u8;
+                                        media.apply_volume(blocked);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            WorkerCmd::Soap(job) => {
+                                let blocked_now = shared.lock().unwrap().blocked;
+                                let res = soap(
+                                    &job.service,
+                                    job.actions,
+                                    &job.body,
+                                    media,
+                                    &shared,
+                                    blocked_now,
+                                );
+                                let _ = job.reply.send(res);
+                            }
+                        }
+                        true
                     };
-                    if blocked {
-                        media.pause(&shared);
-                    }
-                    if let Some((action, value)) = action {
-                        match action.as_str() {
-                            "pause" => media.pause(&shared),
-                            "resume" if !blocked => {
-                                let _ = media.play(&shared);
-                            }
-                            "volume" => {
-                                media.volume = value.clamp(0, 100) as u8;
-                                media.apply_volume();
-                            }
-                            _ => {}
+
+                    while running {
+                        match cmd_rx.try_recv() {
+                            Ok(cmd) => running = process_cmd(cmd, &mut media),
+                            Err(_) => break,
                         }
                     }
-                    while let Ok(job) = soap_rx.try_recv() {
-                        let blocked_now = shared.lock().unwrap().blocked;
-                        let res = soap(
-                            &job.service,
-                            job.actions,
-                            &job.body,
-                            &mut media,
-                            &shared,
-                            blocked_now,
-                        );
-                        let _ = job.reply.send(res);
+                    if !running {
+                        break;
                     }
                     media.tick(&shared);
-                    thread::sleep(Duration::from_millis(12));
+                    if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(12)) {
+                        running = process_cmd(cmd, &mut media);
+                        while running {
+                            match cmd_rx.try_recv() {
+                                Ok(next) => running = process_cmd(next, &mut media),
+                                Err(_) => break,
+                            }
+                        }
+                    }
                 }
                 media.stop(&shared);
                 announce(&udp, &targets, &identity, &location, "ssdp:byebye");
@@ -228,7 +287,7 @@ impl DlnaRenderer {
 
         Ok(Self {
             status,
-            stop,
+            cmd_tx,
             worker: Some(worker),
         })
     }
@@ -237,12 +296,41 @@ impl DlnaRenderer {
         self.status.lock().unwrap().active
     }
 
-    pub fn set_blocked(&self, blocked: bool) {
-        self.status.lock().unwrap().blocked = blocked;
+    /// Synchronously updates the receiver block gate and waits until the DLNA worker
+    /// has paused and muted any active or pending audio output before returning.
+    pub fn set_blocked(&self, blocked: bool) -> Result<(), String> {
+        let generation = self.request_block_state(blocked);
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.cmd_tx
+            .try_send(WorkerCmd::SetBlocked { blocked, generation, ack: ack_tx })
+            .map_err(|_| "DLNA 控制队列不可用".to_owned())?;
+        ack_rx.recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "无法确认 DLNA 输出已切换".to_owned())
+    }
+
+    fn request_block_state(&self, blocked: bool) -> u64 {
+        let (generation, stream) = {
+            let mut state = self.status.lock().unwrap();
+            state.block_generation = state.block_generation.wrapping_add(1);
+            let stream = if blocked {
+                state.blocked = true;
+                state.playback_stream.as_ref().and_then(Weak::upgrade)
+            } else {
+                None
+            };
+            (state.block_generation, stream)
+        };
+        if let Some(stream) = stream {
+            stream.cancel();
+        }
+        generation
     }
 
     pub fn control(&self, action: &str, value: i32) {
-        self.status.lock().unwrap().local_action = Some((action.to_owned(), value));
+        let _ = self.cmd_tx.try_send(WorkerCmd::LocalAction {
+            action: action.to_owned(),
+            value,
+        });
     }
 
     pub fn poll(&self) -> Vec<Value> {
@@ -252,15 +340,16 @@ impl DlnaRenderer {
 
 impl Drop for DlnaRenderer {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        self.request_block_state(true);
+        let _ = self.cmd_tx.send(WorkerCmd::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
 }
 
-struct HttpCounterGuard(Arc<AtomicUsize>);
-impl Drop for HttpCounterGuard {
+struct CounterGuard(Arc<AtomicUsize>);
+impl Drop for CounterGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -278,6 +367,7 @@ struct SharedStream {
     state: Mutex<StreamState>,
     cv: Condvar,
     cancelled: AtomicBool,
+    active_agent: Mutex<Option<ureq::Agent>>,
 }
 
 impl SharedStream {
@@ -286,12 +376,36 @@ impl SharedStream {
             state: Mutex::new(StreamState::default()),
             cv: Condvar::new(),
             cancelled: AtomicBool::new(false),
+            active_agent: Mutex::new(None),
         })
     }
 
+    fn set_agent(&self, agent: Option<ureq::Agent>) {
+        if self.cancelled.load(Ordering::Acquire) {
+            if let Some(a) = agent {
+                a.shutdown();
+            }
+            return;
+        }
+        let mut guard = self.active_agent.lock().unwrap();
+        if self.cancelled.load(Ordering::Acquire) {
+            if let Some(a) = agent {
+                a.shutdown();
+            }
+            return;
+        }
+        *guard = agent;
+    }
+
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.cv.notify_all();
+        {
+            let _state = self.state.lock().unwrap();
+            self.cancelled.store(true, Ordering::Release);
+            self.cv.notify_all();
+        }
+        if let Some(agent) = self.active_agent.lock().unwrap().take() {
+            agent.shutdown();
+        }
     }
 }
 
@@ -306,11 +420,11 @@ impl Read for StreamReader {
         if out.is_empty() {
             return Ok(0);
         }
-        let deadline = Instant::now() + Duration::from_secs(12);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut guard = self.shared.state.lock().unwrap();
         loop {
             if self.shared.cancelled.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "DLNA stream cancelled"));
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "DLNA stream cancelled"));
             }
             if self.pos < guard.bytes.len() {
                 let avail = (guard.bytes.len() - self.pos).min(out.len());
@@ -338,7 +452,7 @@ impl Read for StreamReader {
 
 impl Seek for StreamReader {
     fn seek(&mut self, style: SeekFrom) -> io::Result<u64> {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(6);
         let mut guard = self.shared.state.lock().unwrap();
         let target: i128 = match style {
             SeekFrom::Start(off) => i128::from(off),
@@ -364,7 +478,7 @@ impl Seek for StreamReader {
         let target_usize = target as usize;
         while target_usize > guard.bytes.len() && !guard.eof && guard.error.is_none() {
             if self.shared.cancelled.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "DLNA stream cancelled"));
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "DLNA stream cancelled"));
             }
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "DLNA seek timed out"));
@@ -392,6 +506,8 @@ struct MeteredSource<S> {
     block: [(f32, f32); 256],
     block_len: usize,
     lp_state: (f32, f32),
+    stream_id: u64,
+    discontinuity: bool,
 }
 
 impl<S: Source<Item = f32>> MeteredSource<S> {
@@ -407,16 +523,20 @@ impl<S: Source<Item = f32>> MeteredSource<S> {
             block: [(0.0, 0.0); 256],
             block_len: 0,
             lp_state: (0.0, 0.0),
+            stream_id: begin_external_output_stream(),
+            discontinuity: true,
         }
     }
 
     fn flush_meter(&mut self) {
         if self.block_len > 0 {
-            report_external_output_pcm(
+            report_external_output_pcm_stream(
                 &self.block[..self.block_len],
                 self.sample_rate,
                 35.0,
                 &mut self.lp_state,
+                self.stream_id,
+                std::mem::replace(&mut self.discontinuity, false),
             );
             self.block_len = 0;
         }
@@ -478,6 +598,7 @@ impl<S: Source<Item = f32>> Source for MeteredSource<S> {
     fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
         self.ch_cursor = 0;
         self.block_len = 0;
+        self.discontinuity = true;
         self.inner.try_seek(pos)
     }
 }
@@ -487,6 +608,7 @@ struct Media {
     output: Option<MixerDeviceSink>,
     active_stream: Option<Arc<SharedStream>>,
     pending_ready: Option<mpsc::Receiver<Result<StreamReader, String>>>,
+    active_downloads: Arc<AtomicUsize>,
     local_ip: Ipv4Addr,
     uri: String,
     title: String,
@@ -506,6 +628,7 @@ impl Default for Media {
             output: None,
             active_stream: None,
             pending_ready: None,
+            active_downloads: Arc::new(AtomicUsize::new(0)),
             local_ip: Ipv4Addr::UNSPECIFIED,
             uri: String::new(),
             title: String::new(),
@@ -521,26 +644,50 @@ impl Default for Media {
 }
 
 impl Media {
-    fn play(&mut self, status: &Mutex<Status>) -> Result<(), u16> {
-        if self.uri.is_empty() {
+    fn play(&mut self, status: &Mutex<Status>, blocked: bool) -> Result<(), u16> {
+        if blocked || status.lock().unwrap().blocked || self.uri.is_empty() {
             return Err(701);
         }
         self.want_play = true;
         if let Some(player) = &self.player {
+            self.apply_volume(false);
             player.play();
             self.set_playing(status, true);
         } else if self.pending_ready.is_none() {
+            if let Some(prev) = self.active_stream.take() {
+                prev.cancel();
+            }
+            if !acquire_download_slot(&self.active_downloads, Duration::from_millis(200)) {
+                self.want_play = false;
+                return Err(701);
+            }
             let uri = self.uri.clone();
             let self_ip = self.local_ip;
             let shared_stream = SharedStream::new();
+            {
+                let mut state = status.lock().unwrap();
+                if state.blocked {
+                    self.active_downloads.fetch_sub(1, Ordering::AcqRel);
+                    self.want_play = false;
+                    return Err(701);
+                }
+                state.playback_stream = Some(Arc::downgrade(&shared_stream));
+            }
             let stream_for_worker = Arc::clone(&shared_stream);
+            let counter = Arc::clone(&self.active_downloads);
             let (tx, rx) = mpsc::sync_channel(1);
-            thread::Builder::new()
+            if thread::Builder::new()
                 .name("soundflow-dlna-stream".into())
                 .spawn(move || {
+                    let _guard = CounterGuard(counter);
                     stream_download(&uri, self_ip, stream_for_worker, tx);
                 })
-                .map_err(|_| 501_u16)?;
+                .is_err()
+            {
+                self.active_downloads.fetch_sub(1, Ordering::AcqRel);
+                self.want_play = false;
+                return Err(501);
+            }
             self.active_stream = Some(shared_stream);
             self.pending_ready = Some(rx);
         }
@@ -552,6 +699,22 @@ impl Media {
         if let Some(player) = &self.player {
             player.pause();
         }
+        reset_live_output_peak();
+        self.set_playing(status, false);
+    }
+
+    fn silence_for_block(&mut self, status: &Mutex<Status>) {
+        self.want_play = false;
+        if let Some(s) = self.active_stream.take() {
+            s.cancel();
+        }
+        self.pending_ready = None;
+        if let Some(player) = &self.player {
+            player.set_volume(0.0);
+            player.pause();
+        }
+        self.player = None;
+        self.output = None;
         reset_live_output_peak();
         self.set_playing(status, false);
     }
@@ -583,9 +746,9 @@ impl Media {
         state.emit(json!({"event":"playback_state","protocol":"dlna","playing":playing,"session_active":active}));
     }
 
-    fn apply_volume(&self) {
+    fn apply_volume(&self, blocked: bool) {
         if let Some(player) = &self.player {
-            player.set_volume(if self.mute {
+            player.set_volume(if self.mute || blocked {
                 0.0
             } else {
                 f32::from(self.volume) / 100.0
@@ -594,10 +757,17 @@ impl Media {
     }
 
     fn tick(&mut self, state: &Mutex<Status>) {
+        let blocked_now = state.lock().unwrap().blocked;
+        if blocked_now {
+            if self.playing || self.want_play || self.pending_ready.is_some() || self.player.is_some() {
+                self.silence_for_block(state);
+            }
+            return;
+        }
         if let Some(result) = self.pending_ready.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.pending_ready = None;
-            if self.want_play {
-                match result.and_then(|reader| self.install(reader)) {
+            if self.want_play && !state.lock().unwrap().blocked {
+                match result.and_then(|reader| self.install(reader, state)) {
                     Ok(()) => {
                         let mut status = state.lock().unwrap();
                         status.emit(json!({
@@ -622,6 +792,8 @@ impl Media {
                             .emit(json!({"event":"error","protocol":"dlna","message":message}));
                     }
                 }
+            } else if let Some(s) = self.active_stream.take() {
+                s.cancel();
             }
         }
         if self.player.as_ref().is_some_and(Player::empty) {
@@ -636,15 +808,22 @@ impl Media {
         }
     }
 
-    fn install(&mut self, reader: StreamReader) -> Result<(), String> {
+    fn install(&mut self, reader: StreamReader, state: &Mutex<Status>) -> Result<(), String> {
         let decoded = Decoder::new(reader).map_err(|e| format!("DLNA 音频解码失败: {e}"))?;
+        if state.lock().unwrap().blocked {
+            return Err("全屋发送运行中，已阻止本机 DLNA 音频输出".into());
+        }
         let output = DeviceSinkBuilder::open_default_sink().map_err(|e| e.to_string())?;
         let player = Player::connect_new(output.mixer());
         self.duration = decoded.total_duration().unwrap_or_default();
         player.append(MeteredSource::new(decoded));
+        if state.lock().unwrap().blocked {
+            player.pause();
+            return Err("全屋发送运行中，已中止本机 DLNA 音频输出".into());
+        }
         self.player = Some(player);
         self.output = Some(output);
-        self.apply_volume();
+        self.apply_volume(false);
         Ok(())
     }
 
@@ -667,6 +846,26 @@ impl Media {
     }
 }
 
+fn acquire_download_slot(counter: &AtomicUsize, wait_budget: Duration) -> bool {
+    let deadline = Instant::now() + wait_budget;
+    loop {
+        let cur = counter.load(Ordering::Acquire);
+        if cur < MAX_MEDIA_DOWNLOADS {
+            if counter
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(8));
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedHttpUrl {
     scheme: String,
@@ -674,31 +873,71 @@ struct ParsedHttpUrl {
     port: u16,
 }
 
-fn is_allowed_media_ip(ip: IpAddr, self_ip: Ipv4Addr) -> bool {
+fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+fn collect_local_ips(extra: Ipv4Addr) -> HashSet<IpAddr> {
+    let mut set = HashSet::new();
+    if !extra.is_unspecified() {
+        set.insert(IpAddr::V4(extra));
+    }
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            set.insert(normalize_ip(iface.ip()));
+        }
+    }
+    set
+}
+
+fn is_private_lan_ip(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
         IpAddr::V4(v4) => {
-            !v4.is_loopback()
+            let oct = v4.octets();
+            v4.is_private() || (oct[0] == 100 && (oct[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+fn is_allowed_media_ip_with_locals(ip: IpAddr, local_ips: &HashSet<IpAddr>) -> bool {
+    let norm = normalize_ip(ip);
+    if local_ips.contains(&norm) {
+        return false;
+    }
+    match norm {
+        IpAddr::V4(v4) => {
+            let b0 = v4.octets()[0];
+            b0 != 0
+                && !v4.is_loopback()
                 && !v4.is_unspecified()
                 && !v4.is_link_local()
                 && !v4.is_multicast()
                 && !v4.is_broadcast()
-                && (self_ip.is_unspecified() || v4 != self_ip)
         }
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_allowed_media_ip(IpAddr::V4(mapped), self_ip);
-            }
             let seg0 = v6.segments()[0];
             let is_link_local_v6 = (seg0 & 0xffc0) == 0xfe80;
+            let is_doc_v6 = seg0 == 0x2001 && v6.segments()[1] == 0x0db8;
             !v6.is_loopback()
                 && !v6.is_unspecified()
                 && !v6.is_multicast()
                 && !is_link_local_v6
+                && !is_doc_v6
         }
     }
 }
 
-fn parse_and_validate_url_syntax(uri: &str, self_ip: Ipv4Addr) -> Result<ParsedHttpUrl, String> {
+fn parse_and_validate_url_syntax(
+    uri: &str,
+    local_ips: &HashSet<IpAddr>,
+) -> Result<ParsedHttpUrl, String> {
     if uri.is_empty() || uri.len() > 4096 {
         return Err("无效的媒体 URL 长度".into());
     }
@@ -750,9 +989,9 @@ fn parse_and_validate_url_syntax(uri: &str, self_ip: Ipv4Addr) -> Result<ParsedH
         return Err("禁止访问本机回环主机".into());
     }
     if let Ok(ip) = host_raw.parse::<IpAddr>()
-        && !is_allowed_media_ip(ip, self_ip)
+        && !is_allowed_media_ip_with_locals(ip, local_ips)
     {
-        return Err("禁止访问本机回环、链路本地或多播地址".into());
+        return Err("禁止访问本机接口、回环、链路本地或多播地址".into());
     }
     Ok(ParsedHttpUrl {
         scheme: scheme.to_owned(),
@@ -761,25 +1000,98 @@ fn parse_and_validate_url_syntax(uri: &str, self_ip: Ipv4Addr) -> Result<ParsedH
     })
 }
 
-fn validate_and_resolve_media_uri(uri: &str, self_ip: Ipv4Addr) -> Result<(), String> {
-    let parsed = parse_and_validate_url_syntax(uri, self_ip)?;
+fn resolve_and_pin_socket_addrs(
+    uri: &str,
+    local_ips: &HashSet<IpAddr>,
+) -> Result<(ParsedHttpUrl, Vec<SocketAddr>), String> {
+    let parsed = parse_and_validate_url_syntax(uri, local_ips)?;
     if let Ok(ip) = parsed.host.parse::<IpAddr>() {
-        if !is_allowed_media_ip(ip, self_ip) {
+        if !is_allowed_media_ip_with_locals(ip, local_ips) {
             return Err("禁止访问受限 IP 地址".into());
         }
-        return Ok(());
+        let addr = SocketAddr::new(normalize_ip(ip), parsed.port);
+        return Ok((parsed, vec![addr]));
     }
-    let addrs = (parsed.host.as_str(), parsed.port)
-        .to_socket_addrs()
-        .map_err(|_| "无法解析媒体服务器主机名".to_string())?
-        .collect::<Vec<_>>();
+
+    let host = parsed.host.clone();
+    let port = parsed.port;
+    let (tx, rx) = mpsc::sync_channel(1);
+    struct DnsSlot;
+    impl Drop for DnsSlot {
+        fn drop(&mut self) {
+            ACTIVE_DNS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    if !acquire_download_slot(&ACTIVE_DNS, Duration::ZERO) {
+        return Err("DLNA 媒体主机解析繁忙".into());
+    }
+    let slot = DnsSlot;
+    thread::Builder::new()
+        .name("soundflow-dlna-dns".into())
+        .spawn(move || {
+            let _slot = slot;
+            let res = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>());
+            let _ = tx.send(res);
+        })
+        .map_err(|_| "无法启动媒体主机解析".to_string())?;
+
+    let addrs = rx
+        .recv_timeout(Duration::from_secs(4))
+        .map_err(|_| "解析媒体服务器主机名超时".to_string())?
+        .map_err(|_| "无法解析媒体服务器主机名".to_string())?;
     if addrs.is_empty() {
         return Err("媒体服务器主机无可用地址".into());
     }
-    if addrs.iter().any(|sa| !is_allowed_media_ip(sa.ip(), self_ip)) {
-        return Err("媒体主机解析到了受限的回环或链路本地地址".into());
+    let mut verified = Vec::with_capacity(addrs.len());
+    for sa in addrs {
+        let norm = normalize_ip(sa.ip());
+        if !is_allowed_media_ip_with_locals(norm, local_ips) {
+            return Err("媒体主机解析到了受限的本机、回环或链路本地地址".into());
+        }
+        verified.push(SocketAddr::new(norm, sa.port()));
     }
-    Ok(())
+    Ok((parsed, verified))
+}
+
+#[derive(Debug)]
+struct PinnedResolver {
+    expected_host: String,
+    expected_port: u16,
+    addrs: Vec<SocketAddr>,
+}
+
+impl Resolver for PinnedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let req_host = uri
+            .host()
+            .unwrap_or_default()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let default_port = if uri.scheme_str() == Some("https") { 443 } else { 80 };
+        let req_port = uri.port_u16().unwrap_or(default_port);
+        if !req_host.eq_ignore_ascii_case(&self.expected_host)
+            || req_port != self.expected_port
+            || self.addrs.is_empty()
+        {
+            return Err(ureq::Error::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unverified redirect or host mismatch",
+            )));
+        }
+        let mut out = self.empty();
+        for &sa in &self.addrs {
+            out.push(sa);
+        }
+        Ok(out)
+    }
 }
 
 fn resolve_redirect_url(base_uri: &str, location: &str) -> Result<String, String> {
@@ -787,7 +1099,8 @@ fn resolve_redirect_url(base_uri: &str, location: &str) -> Result<String, String
     if loc.starts_with("http://") || loc.starts_with("https://") {
         return Ok(loc.to_owned());
     }
-    let parsed = parse_and_validate_url_syntax(base_uri, Ipv4Addr::UNSPECIFIED)?;
+    let empty_locals = HashSet::new();
+    let parsed = parse_and_validate_url_syntax(base_uri, &empty_locals)?;
     let default_port = if parsed.scheme == "https" { 443 } else { 80 };
     let host_fmt = if parsed.host.contains(':') {
         format!("[{}]", parsed.host)
@@ -806,18 +1119,58 @@ fn resolve_redirect_url(base_uri: &str, location: &str) -> Result<String, String
     }
 }
 
-fn open_validated_response(initial_uri: &str, self_ip: Ipv4Addr) -> Result<ureq::http::Response<ureq::Body>, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(6)))
-        .timeout_recv_response(Some(Duration::from_secs(10)))
+fn build_pinned_agent(parsed: &ParsedHttpUrl, pinned_addrs: Vec<SocketAddr>) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .proxy(None)
         .max_redirects(0)
         .http_status_as_error(false)
-        .build()
-        .into();
+        .timeout_resolve(Some(Duration::from_secs(4)))
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_send_request(Some(Duration::from_secs(5)))
+        .timeout_recv_response(Some(Duration::from_secs(8)))
+        .timeout_per_read(Some(Duration::from_secs(5)))
+        .timeout_per_write(Some(Duration::from_secs(5)))
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::default(),
+        PinnedResolver {
+            expected_host: parsed.host.clone(),
+            expected_port: parsed.port,
+            addrs: pinned_addrs,
+        },
+    )
+}
 
+fn open_validated_response_with_locals(
+    initial_uri: &str,
+    local_ips: &HashSet<IpAddr>,
+    shared: &SharedStream,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
     let mut current = initial_uri.to_owned();
+    let mut previous: Vec<IpAddr> = Vec::new();
+
     for hop in 0..=MAX_REDIRECTS {
-        validate_and_resolve_media_uri(&current, self_ip)?;
+        if shared.cancelled.load(Ordering::Acquire) {
+            return Err("DLNA 媒体流已取消".into());
+        }
+        let (parsed, pinned_addrs) = resolve_and_pin_socket_addrs(&current, local_ips)?;
+        let addresses: Vec<_> = pinned_addrs.iter().map(SocketAddr::ip).collect();
+        let private = is_private_lan_ip(addresses[0]);
+        if addresses.iter().any(|&ip| is_private_lan_ip(ip) != private) {
+            return Err("媒体主机同时解析到公网和局域网地址".into());
+        }
+        if hop > 0
+            && (private != is_private_lan_ip(previous[0])
+                || (private && addresses.iter().any(|ip| !previous.contains(ip))))
+        {
+            return Err("禁止媒体重定向跨越网络边界或更换局域网主机".into());
+        }
+        previous = addresses;
+
+        let agent = build_pinned_agent(&parsed, pinned_addrs);
+        shared.set_agent(Some(agent.clone()));
+
         let response = agent
             .get(&current)
             .call()
@@ -825,17 +1178,21 @@ fn open_validated_response(initial_uri: &str, self_ip: Ipv4Addr) -> Result<ureq:
         let status = response.status().as_u16();
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if hop == MAX_REDIRECTS {
+                agent.shutdown();
                 return Err("DLNA 媒体重定向次数过多".into());
             }
             let loc = response
                 .headers()
                 .get("location")
                 .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| "DLNA 重定向缺少 Location".to_string())?;
-            current = resolve_redirect_url(&current, loc)?;
+                .ok_or_else(|| "DLNA 重定向缺少 Location".to_string())?
+                .to_owned();
+            agent.shutdown();
+            current = resolve_redirect_url(&current, &loc)?;
             continue;
         }
         if !(200..300).contains(&status) {
+            agent.shutdown();
             return Err(format!("DLNA 媒体服务器返回 HTTP {status}"));
         }
         return Ok(response);
@@ -849,9 +1206,20 @@ fn stream_download(
     shared: Arc<SharedStream>,
     ready_tx: mpsc::SyncSender<Result<StreamReader, String>>,
 ) {
-    let mut response = match open_validated_response(uri, self_ip) {
+    let local_ips = collect_local_ips(self_ip);
+    stream_download_with_locals(uri, &local_ips, shared, ready_tx);
+}
+
+fn stream_download_with_locals(
+    uri: &str,
+    local_ips: &HashSet<IpAddr>,
+    shared: Arc<SharedStream>,
+    ready_tx: mpsc::SyncSender<Result<StreamReader, String>>,
+) {
+    let mut response = match open_validated_response_with_locals(uri, local_ips, &shared) {
         Ok(r) => r,
         Err(err) => {
+            shared.set_agent(None);
             let _ = ready_tx.send(Err(err));
             return;
         }
@@ -865,6 +1233,7 @@ fn stream_download(
 
     if let Some(len) = content_len {
         if len > MAX_MEDIA_BYTES {
+            shared.cancel();
             let _ = ready_tx.send(Err("DLNA 音频超过 128 MiB 限制".into()));
             return;
         }
@@ -876,14 +1245,22 @@ fn stream_download(
     let mut reader = response.body_mut().as_reader();
     let mut chunk = [0u8; 16 * 1024];
     let mut ready_sent = false;
+    let prebuffer_deadline = Instant::now() + Duration::from_secs(30);
     let prebuffer_goal = content_len.map_or(PREBUFFER_BYTES, |len| len.min(PREBUFFER_BYTES));
 
     loop {
         if shared.cancelled.load(Ordering::Acquire) {
+            shared.set_agent(None);
+            return;
+        }
+        if !ready_sent && Instant::now() >= prebuffer_deadline {
+            shared.cancel();
+            let _ = ready_tx.send(Err("DLNA 媒体预缓冲超时".into()));
             return;
         }
         match reader.read(&mut chunk) {
             Ok(0) => {
+                shared.set_agent(None);
                 let mut st = shared.state.lock().unwrap();
                 st.eof = true;
                 let has_data = !st.bytes.is_empty();
@@ -908,7 +1285,7 @@ fn stream_download(
                     if st.bytes.len() + n > MAX_MEDIA_BYTES {
                         st.error = Some("DLNA 音频流超过 128 MiB 上限".into());
                         drop(st);
-                        shared.cv.notify_all();
+                        shared.cancel();
                         if !ready_sent {
                             let _ = ready_tx.send(Err("DLNA 音频流超过 128 MiB 上限".into()));
                         }
@@ -927,6 +1304,7 @@ fn stream_download(
                 }
             }
             Err(err) => {
+                shared.set_agent(None);
                 let msg = format!("DLNA 媒体流读取中断: {err}");
                 let mut st = shared.state.lock().unwrap();
                 st.error = Some(msg.clone());
@@ -1065,7 +1443,8 @@ fn soap(
     let values = match name {
         "SetAVTransportURI" => {
             let uri = field("CurrentURI").trim();
-            if parse_and_validate_url_syntax(uri, media.local_ip).is_err() {
+            let locals = collect_local_ips(media.local_ip);
+            if parse_and_validate_url_syntax(uri, &locals).is_err() {
                 return Err(714);
             }
             media.stop(state);
@@ -1090,7 +1469,7 @@ fn soap(
             String::new()
         }
         "Play" if !blocked => {
-            media.play(state)?;
+            media.play(state, false)?;
             String::new()
         }
         "Play" => return Err(701),
@@ -1102,7 +1481,7 @@ fn soap(
             media.stop(state);
             String::new()
         }
-        "Seek" => {
+        "Seek" if !blocked => {
             if !matches!(field("Unit"), "REL_TIME" | "ABS_TIME") {
                 return Err(710);
             }
@@ -1115,6 +1494,7 @@ fn soap(
                 .map_err(|_| 711_u16)?;
             String::new()
         }
+        "Seek" => return Err(701),
         "GetTransportInfo" => format!(
             "<CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>",
             media.transport_state()
@@ -1139,13 +1519,13 @@ fn soap(
                 .ok()
                 .filter(|v| *v <= 100)
                 .ok_or(402_u16)?;
-            media.apply_volume();
+            media.apply_volume(blocked);
             String::new()
         }
         "GetMute" => format!("<CurrentMute>{}</CurrentMute>", u8::from(media.mute)),
         "SetMute" => {
             media.mute = matches!(field("DesiredMute"), "1" | "true");
-            media.apply_volume();
+            media.apply_volume(blocked);
             String::new()
         }
         "GetProtocolInfo" => format!("<Source></Source><Sink>{PROTOCOLS}</Sink>"),
@@ -1223,7 +1603,7 @@ fn request(stream: &mut TcpStream) -> Option<(String, String, String)> {
     Some((method, path, body))
 }
 
-fn handle_http_worker(mut stream: TcpStream, xml: &str, soap_tx: &mpsc::SyncSender<SoapJob>) {
+fn handle_http_worker(mut stream: TcpStream, xml: &str, cmd_tx: &mpsc::SyncSender<WorkerCmd>) {
     let (status, body) = match request(&mut stream) {
         Some((method, url, content)) if method == "POST" => {
             let Some((service, actions)) =
@@ -1233,13 +1613,13 @@ fn handle_http_worker(mut stream: TcpStream, xml: &str, soap_tx: &mpsc::SyncSend
                 return;
             };
             let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-            if soap_tx
-                .try_send(SoapJob {
+            if cmd_tx
+                .try_send(WorkerCmd::Soap(SoapJob {
                     service: (*service).to_owned(),
                     actions,
                     body: content,
                     reply: reply_tx,
-                })
+                }))
                 .is_err()
             {
                 respond(&mut stream, "503 Service Unavailable", "");
@@ -1301,26 +1681,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dlna_ssrf_guard_rejects_loopback_link_local_multicast_and_self_ip() {
-        let self_ip = Ipv4Addr::new(192, 168, 5, 10);
+    fn dlna_ssrf_guard_rejects_all_local_loopback_zero_net_and_cross_tier_redirects() {
+        let mut locals = collect_local_ips(Ipv4Addr::new(192, 168, 5, 10));
+        locals.insert(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)));
+        locals.insert("fd12:3456::1".parse().unwrap());
+
         for blocked in [
             "http://127.0.0.1:8080/a.mp3",
             "http://127.1.2.3/a.mp3",
             "http://localhost:8000/a.flac",
             "https://sub.localhost/a.wav",
             "http://0.0.0.0:80/a.mp3",
+            "http://0.1.2.3:80/a.mp3",
             "http://169.254.169.254/latest/meta-data/",
             "http://224.0.0.251:5353/a.mp3",
             "http://255.255.255.255/a.mp3",
             "http://[::1]:8080/a.mp3",
             "http://[::ffff:127.0.0.1]:8080/a.mp3",
+            "http://[::ffff:10.20.30.40]:8080/a.mp3",
             "http://[fe80::1]:8080/a.mp3",
+            "http://[fd12:3456::1]:8080/a.mp3",
             "http://user:pass@192.168.5.20/a.mp3",
             "file:///etc/passwd",
             "http://192.168.5.10:8901/device.xml",
+            "http://10.20.30.40:8901/device.xml",
         ] {
             assert!(
-                parse_and_validate_url_syntax(blocked, self_ip).is_err(),
+                parse_and_validate_url_syntax(blocked, &locals).is_err(),
                 "expected {blocked} to be rejected"
             );
         }
@@ -1331,21 +1718,112 @@ mod tests {
             "http://[2001:4860:4860::8888]:8080/live.mp3",
         ] {
             assert!(
-                parse_and_validate_url_syntax(allowed, self_ip).is_ok(),
+                parse_and_validate_url_syntax(allowed, &locals).is_ok(),
                 "expected {allowed} to be accepted"
             );
         }
     }
 
     #[test]
-    fn dlna_redirect_to_loopback_is_blocked() {
+    fn pinned_agent_connects_to_verified_socket_and_cancel_interrupts_stalled_read() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        // Even if an allowed LAN URL redirected to 127.0.0.1, resolve_redirect_url + syntax check rejects it.
-        let redirected =
-            resolve_redirect_url("http://192.168.5.99:8080/play", &format!("http://127.0.0.1:{port}/secret"))
+        let addr = listener.local_addr().unwrap();
+
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 512];
+            let n = sock.read(&mut req_buf).unwrap();
+            let req_txt = String::from_utf8_lossy(&req_buf[..n]).into_owned();
+            // Send partial body and hold socket open forever until client cancels.
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\nabcd")
                 .unwrap();
-        assert!(parse_and_validate_url_syntax(&redirected, Ipv4Addr::new(192, 168, 5, 10)).is_err());
+            accepted_tx.send((req_txt, sock)).unwrap();
+        });
+
+        // Verify PinnedResolver connects exclusively to `addr` while preserving original Host header.
+        let parsed = ParsedHttpUrl {
+            scheme: "http".into(),
+            host: "media-nas.lan".into(),
+            port: addr.port(),
+        };
+        let shared = SharedStream::new();
+        let agent = build_pinned_agent(&parsed, vec![addr]);
+        shared.set_agent(Some(agent.clone()));
+
+        let url = format!("http://media-nas.lan:{}/song.flac", addr.port());
+        let shared_dl = Arc::clone(&shared);
+        let (done_tx, done_rx) = mpsc::channel();
+        let dl_worker = thread::spawn(move || {
+            let mut resp = agent.get(&url).call().unwrap();
+            let mut body = resp.body_mut().as_reader();
+            let mut buf = [0u8; 64];
+            let _ = body.read(&mut buf);
+            // Next read blocks on silent socket until shared.cancel() shuts down underlying TCP stream.
+            let res = body.read(&mut buf);
+            shared_dl.set_agent(None);
+            done_tx.send(res.is_err()).unwrap();
+        });
+
+        let (req_txt, _held_sock) = accepted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(req_txt.to_ascii_lowercase().contains(&format!("host: media-nas.lan:{}", addr.port())));
+
+        shared.cancel();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(800)).unwrap(),
+            "cancel() must immediately interrupt blocked body read"
+        );
+        dl_worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_reader_stops_read_exact_without_retrying() {
+        let stream = SharedStream::new();
+        stream.cancel();
+        let mut reader = StreamReader { shared: stream, pos: 0 };
+        let error = reader.read_exact(&mut [0; 4]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[test]
+    fn download_slot_limiter_caps_in_flight_media_tasks() {
+        let counter = AtomicUsize::new(0);
+        assert!(acquire_download_slot(&counter, Duration::from_millis(20)));
+        assert!(acquire_download_slot(&counter, Duration::from_millis(20)));
+        assert!(!acquire_download_slot(&counter, Duration::from_millis(30)));
+        counter.fetch_sub(1, Ordering::AcqRel);
+        assert!(acquire_download_slot(&counter, Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn dlna_external_onset_stream_survives_prior_miplay_stream_generations() {
+        use fusionplay_miplay_sdk::onset;
+        onset::set_capture(true);
+        // Simulate two prior MiPlay output sessions incrementing STREAM > 0.
+        let _ = begin_external_output_stream();
+        let _ = begin_external_output_stream();
+
+        let dlna_stream = begin_external_output_stream();
+        let mut lp = (0.0_f32, 0.0_f32);
+        let silence = [(0.0_f32, 0.0_f32); 256];
+        for i in 0..16 {
+            report_external_output_pcm_stream(&silence, 48_000, 0.0, &mut lp, dlna_stream, i == 0);
+        }
+        // Feed sharp transient drum/bass burst so onset detector triggers.
+        let mut burst = [(0.0_f32, 0.0_f32); 256];
+        for (idx, frame) in burst.iter_mut().enumerate() {
+            let s = ((idx as f32 * 0.22).sin() * 0.92).clamp(-1.0, 1.0);
+            *frame = (s, s);
+        }
+        for _ in 0..12 {
+            report_external_output_pcm_stream(&burst, 48_000, 0.0, &mut lp, dlna_stream, false);
+        }
+        let events = onset::poll(true);
+        assert!(
+            !events.is_empty(),
+            "DLNA external stream must produce onset events even after prior MiPlay sessions"
+        );
     }
 
     #[test]

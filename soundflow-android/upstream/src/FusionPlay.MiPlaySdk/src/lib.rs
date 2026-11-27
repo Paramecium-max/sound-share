@@ -14,7 +14,8 @@ pub mod onset;
 pub mod protocol;
 
 pub use media::{
-    live_output_peak, live_output_spectrum_take, report_external_output_pcm, reset_live_output_peak,
+    begin_external_output_stream, live_output_peak, live_output_spectrum_take,
+    report_external_output_pcm, report_external_output_pcm_stream, reset_live_output_peak,
 };
 pub use media::set_audio_sync_offset_ms;
 

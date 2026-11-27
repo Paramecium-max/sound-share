@@ -63,17 +63,21 @@ echo "[6/7] 合并 DEX、zipalign 对齐并 apksigner 签名..."
 (cd "${BUILD_DIR}/dex" && zip -q -u "${BUILD_DIR}/unsigned_unaligned.apk" classes.dex)
 "${BT}/zipalign" -f -p 4 "${BUILD_DIR}/unsigned_unaligned.apk" "${BUILD_DIR}/aligned.apk"
 
+export MIPLAY_DEBUG_KEYSTORE_PASSWORD="${MIPLAY_DEBUG_KEYSTORE_PASSWORD:-android}"
+
 if [[ ! -f "${KEYSTORE}" ]]; then
-  keytool -genkeypair -v -keystore "${KEYSTORE}" -storepass android -keypass android \
+  keytool -genkeypair -v -keystore "${KEYSTORE}" \
+    -storepass:env MIPLAY_DEBUG_KEYSTORE_PASSWORD \
+    -keypass:env MIPLAY_DEBUG_KEYSTORE_PASSWORD \
     -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
     -dname "CN=MiPlayDebug,O=MiShare,C=CN" >/dev/null 2>&1
 fi
 
 "${BT}/apksigner" sign \
   --ks "${KEYSTORE}" \
-  --ks-pass pass:android \
+  --ks-pass env:MIPLAY_DEBUG_KEYSTORE_PASSWORD \
   --ks-key-alias androiddebugkey \
-  --key-pass pass:android \
+  --key-pass env:MIPLAY_DEBUG_KEYSTORE_PASSWORD \
   --out "${APK_OUT}" \
   "${BUILD_DIR}/aligned.apk"
 

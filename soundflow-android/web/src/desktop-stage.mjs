@@ -70,7 +70,10 @@ export function attachDesktopStage(bridge, stage, app) {
         stage.syncPosition(data.positionMs || 0, false);
         break;
       }
-      case "audio": stage.onTick(data.level, -1, ...data.bands); stage.onAudioOnsets(data.onsets); break;
+      case "audio":
+        if (!data.preview) stage.onAudioOnsets(data.onsets);
+        stage.onTick(data.level, -1, ...data.bands, data.preview === true);
+        break;
       case "fullscreen": stage.expandFullscreen(); break;
       case "logSheet": app.showLogSheet(data); break;
       case "toast": app.showToast(data); break;

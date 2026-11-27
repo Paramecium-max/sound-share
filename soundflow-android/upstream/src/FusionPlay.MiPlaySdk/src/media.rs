@@ -73,6 +73,10 @@ pub fn reset_live_output_peak() {
     LIVE_OUTPUT_SPECTRUM_PACKED.store(0, Ordering::Relaxed);
 }
 
+pub fn begin_external_output_stream() -> u64 {
+    crate::onset::begin_output_stream()
+}
+
 /// Feeds decoded stereo PCM frames from an auxiliary renderer (such as desktop DLNA)
 /// into the shared lock-free output peak/3-band meter and beat-onset detector.
 pub fn report_external_output_pcm(
@@ -80,6 +84,24 @@ pub fn report_external_output_pcm(
     sample_rate: u32,
     latency_ms: f64,
     lp_state: &mut (f32, f32),
+) {
+    report_external_output_pcm_stream(
+        frames,
+        sample_rate,
+        latency_ms,
+        lp_state,
+        crate::onset::current_output_stream(),
+        false,
+    );
+}
+
+pub fn report_external_output_pcm_stream(
+    frames: &[(f32, f32)],
+    sample_rate: u32,
+    latency_ms: f64,
+    lp_state: &mut (f32, f32),
+    stream_id: u64,
+    discontinuity: bool,
 ) {
     if frames.is_empty() {
         return;
@@ -134,7 +156,13 @@ pub fn report_external_output_pcm(
             Err(cur) => prev = cur,
         }
     }
-    crate::onset::tap_output(frames, sample_rate.max(8_000), latency_ms);
+    crate::onset::tap_stream_output(
+        frames,
+        sample_rate.max(8_000),
+        latency_ms,
+        stream_id,
+        discontinuity,
+    );
 }
 
 const POSITION_RESUME_SETTLING_WINDOW: StdDuration = StdDuration::from_millis(1_500);

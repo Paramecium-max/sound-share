@@ -54,7 +54,7 @@ public final class SenderService extends Service {
         String action = intent != null ? intent.getAction() : ACTION_START;
         if (ACTION_STOP.equals(action)) {
             releaseProjection(false);
-            MultiRoomManager.getInstance().stopMultiroom();
+            MultiRoomManager.getInstance().stopNativeStreaming();
             releaseLocks();
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
@@ -136,6 +136,7 @@ public final class SenderService extends Service {
         activeProjection = null;
         projectionCallback = null;
         if (mp != null) {
+            MultiRoomManager.getInstance().onProjectionReleased();
             if (cb != null) {
                 try { mp.unregisterCallback(cb); } catch (Throwable ignored) {}
             }
@@ -149,7 +150,7 @@ public final class SenderService extends Service {
     @Override
     public void onDestroy() {
         releaseProjection(false);
-        MultiRoomManager.getInstance().stopMultiroom();
+        MultiRoomManager.getInstance().stopNativeStreaming();
         releaseLocks();
         super.onDestroy();
     }

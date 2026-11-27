@@ -53,13 +53,23 @@ impl PendingEvents {
 }
 
 fn is_sensitive_key(key: &str) -> bool {
+    let lower_full = key.to_ascii_lowercase();
+    if lower_full.contains("auth_message")
+        || lower_full.contains("auth_ack")
+        || lower_full.contains("auth_msg")
+        || lower_full.contains("authmessage")
+        || lower_full.contains("authack")
+        || lower_full.contains("authmsg")
+    {
+        return true;
+    }
     // Split on non-alphanumeric separators and camelCase boundaries so short tokens
     // like "iv" match "aes_iv" / "streamIv" without stripping "session_active",
     // "receiver_name", or "arrival_residual_ms".
     let check = |slice: &str| {
         matches!(
             slice.to_ascii_lowercase().as_str(),
-            "key" | "iv" | "hex" | "payload" | "packet" | "challenge" | "token" | "secret"
+            "key" | "iv" | "hex" | "payload" | "packet" | "challenge" | "token" | "secret" | "digest" | "hmac"
         )
     };
     for part in key.split(|c: char| !c.is_ascii_alphanumeric()) {

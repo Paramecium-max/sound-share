@@ -974,10 +974,33 @@ public final class ReceiverService extends Service {
         }
     }
 
+    private static final String[] SAFE_NATIVE_LOG_FIELDS = {
+            "event", "stage", "protocol", "playing", "session_active",
+            "reason", "message", "error", "code", "status",
+            "title", "artist", "album", "duration_ms", "position_ms",
+            "volume", "device_name", "source_name", "format",
+            "sample_rate", "channels", "codec", "media_generation"
+    };
+
+    private static String sanitizeNativeLogEvent(JSONObject e) {
+        JSONObject safe = new JSONObject();
+        for (String key : SAFE_NATIVE_LOG_FIELDS) {
+            if (e.has(key) && !e.isNull(key)) {
+                try {
+                    safe.put(key, e.opt(key));
+                } catch (Exception ignored) {}
+            }
+        }
+        return safe.toString();
+    }
+
     private void handleNativeEvent(JSONObject e) {
         String event = optCleanString(e, "event");
         if (!"progress".equals(event) && !"protocol_trace".equals(event) && !"discovery_packet_received".equals(event)) {
-            if (!event.startsWith("discovery_query")) logWriter.execute(() -> writeLog("native", e.toString()));
+            if (!event.startsWith("discovery_query")) {
+                final String safeLine = sanitizeNativeLogEvent(e);
+                logWriter.execute(() -> writeLog("native", safeLine));
+            }
         }
         String stage = "interconnect_stage".equals(event) ? e.optString("stage") : "";
         switch (event) {

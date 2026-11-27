@@ -225,6 +225,12 @@ public final class LyricOrchestrator {
         if (meter != null) eval("window.SoundFlowStage && window.SoundFlowStage.onTick(" + meter + ")");
     }
 
+    public void updateSenderPreviewEnergy(float peak, int spectrumPacked) {
+        if (!playing || !uiVisible || !pageReady || webView == null) return;
+        String meter = audioMeterArguments(peak, -1L, spectrumPacked);
+        if (meter != null) eval("window.SoundFlowStage && window.SoundFlowStage.onTick(" + meter + ",true)");
+    }
+
     private String audioMeterArguments(float peak, long positionMs, int spectrumPacked) {
         long posArg = -1L;
         if (hasFullLrcForCurrentSong && positionMs > 0

@@ -1,4 +1,6 @@
 Unicode true
+!include "LogicLib.nsh"
+!include "${OWNED_FILES}"
 Name "SoundFlow"
 OutFile "${OUTPUT}"
 InstallDir "$LOCALAPPDATA\Programs\SoundFlow"
@@ -16,39 +18,66 @@ SectionEnd
 UninstPage uninstConfirm
 UninstPage instfiles
 
+Function un.onInit
+  ReadRegStr $1 HKCU "Software\SoundFlow" "InstallDir"
+  ${If} $1 == ""
+  ${OrIf} $1 != $INSTDIR
+    Abort
+  ${EndIf}
+  !insertmacro SoundFlowVerifyOwnedDirs invalid
+  Return
+invalid:
+  Abort
+FunctionEnd
+
 Section Uninstall
+  !insertmacro SoundFlowVerifyOwnedDirs invalid
   Delete "$SMPROGRAMS\SoundFlow\SoundFlow.lnk"
   RMDir "$SMPROGRAMS\SoundFlow"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow"
   DeleteRegKey HKCU "Software\SoundFlow"
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "SoundFlow"
-  Delete "$INSTDIR\SoundFlow.exe"
+  !insertmacro SoundFlowDeleteOwnedFiles
   Delete "$INSTDIR\Uninstall.exe"
-  Delete "$INSTDIR\chrome_100_percent.pak"
-  Delete "$INSTDIR\chrome_200_percent.pak"
-  Delete "$INSTDIR\resources.pak"
-  Delete "$INSTDIR\d3dcompiler_47.dll"
-  Delete "$INSTDIR\ffmpeg.dll"
-  Delete "$INSTDIR\libEGL.dll"
-  Delete "$INSTDIR\libGLESv2.dll"
-  Delete "$INSTDIR\vk_swiftshader.dll"
-  Delete "$INSTDIR\vulkan-1.dll"
-  Delete "$INSTDIR\snapshot_blob.bin"
-  Delete "$INSTDIR\v8_context_snapshot.bin"
-  Delete "$INSTDIR\icudtl.dat"
-  Delete "$INSTDIR\vk_swiftshader_icd.json"
-  Delete "$INSTDIR\version"
-  Delete "$INSTDIR\LICENSE"
-  Delete "$INSTDIR\LICENSES.chromium.html"
-  RMDir /r "$INSTDIR\locales"
-  RMDir /r "$INSTDIR\resources"
   RMDir "$INSTDIR"
+  Return
+invalid:
+  Abort
 SectionEnd
 !else
 Page directory
 Page instfiles
 
+Function .onVerifyInstDir
+  !insertmacro SoundFlowVerifyOwnedDirs invalid
+  ReadRegStr $1 HKCU "Software\SoundFlow" "InstallDir"
+  ${If} $1 == $INSTDIR
+  ${AndIf} ${FileExists} "$INSTDIR\SoundFlow.exe"
+  ${AndIf} ${FileExists} "$INSTDIR\Uninstall.exe"
+    Return
+  ${EndIf}
+  ClearErrors
+  FindFirst $2 $3 "$INSTDIR\*"
+  ${If} ${Errors}
+    Return
+  ${EndIf}
+  ${Do}
+    ${If} $3 != "."
+    ${AndIf} $3 != ".."
+      FindClose $2
+      Goto invalid
+    ${EndIf}
+    ClearErrors
+    FindNext $2 $3
+  ${LoopUntil} ${Errors}
+  FindClose $2
+  Return
+invalid:
+  Abort
+FunctionEnd
+
 Section
+  Call .onVerifyInstDir
   SetOutPath "$INSTDIR"
   File /r "${STAGE}\*"
   File "${UNINSTALLER_EXE}"

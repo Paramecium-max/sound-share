@@ -7,7 +7,9 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -72,6 +74,8 @@ public:
     bool send_set_media_info(const std::string& title, const std::string& artist,
                              const std::string& album, uint64_t duration_ms);
     bool send_set_media_info(const MediaInfoPayload& info);
+    void queue_media_info(const MediaInfoPayload& info);
+    void queue_position_ms(uint64_t position_ms);
 
 private:
     bool send_raw_locked(uint16_t cmd_type, uint16_t seq, const std::vector<uint8_t>& payload);
@@ -96,6 +100,14 @@ private:
     std::atomic<uint16_t> seq_{1};
 
     std::mutex send_mu_;
+    std::unique_ptr<net::ConnectionWriter> writer_;
+
+    std::mutex updates_mu_;
+    std::condition_variable updates_cv_;
+    std::optional<MediaInfoPayload> pending_media_;
+    std::optional<uint64_t> pending_position_;
+
+    void wake_update_worker();
     mutable std::mutex auth_mu_;
     std::condition_variable auth_cv_;
 

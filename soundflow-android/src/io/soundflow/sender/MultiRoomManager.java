@@ -33,6 +33,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -71,6 +73,11 @@ public final class MultiRoomManager {
     private final ArrayDeque<String> logBuffer = new ArrayDeque<>(160);
 
     private final AtomicBoolean initialized = new AtomicBoolean(false);
+    private final ExecutorService discoveryWorker = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "SoundFlow-SenderDiscovery");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final AtomicBoolean discoveryActive = new AtomicBoolean(false);
     private final AtomicBoolean multiroomRunning = new AtomicBoolean(false);
     private final AtomicLong lastBroadcastUs = new AtomicLong(0L);
@@ -196,23 +203,17 @@ public final class MultiRoomManager {
     }
 
     private void reconcileDiscoveryLifecycle() {
-        boolean shouldRun = multiroomRunning.get() || (uiVisible && senderTabActive);
-        if (shouldRun) {
-            if (discoveryActive.compareAndSet(false, true)) {
-                new Thread(() -> {
-                    callNative("discovery.start", null);
-                    logSender("原生 mDNS 局域网音箱扫描已开启");
-                    pollNativeOnce(true);
-                }, "SoundFlow-SenderMdnsStart").start();
+        discoveryWorker.execute(() -> {
+            boolean desired = multiroomRunning.get() || (uiVisible && senderTabActive);
+            if (desired == discoveryActive.get()) return;
+            JSONObject reply = callNative(desired ? "discovery.start" : "discovery.stop", null);
+            if (!reply.optBoolean("result", false)) {
+                logSender(desired ? "原生 mDNS 启动失败" : "原生 mDNS 停止失败");
+                return;
             }
-        } else if (!multiroomRunning.get()) {
-            if (discoveryActive.compareAndSet(true, false)) {
-                new Thread(() -> {
-                    callNative("discovery.stop", null);
-                    logSender("原生 mDNS 局域网扫描已按需休眠");
-                }, "SoundFlow-SenderMdnsStop").start();
-            }
-        }
+            discoveryActive.set(desired);
+            pollNativeOnce(true);
+        });
     }
 
     private void initOnBackground(Context context) {
@@ -330,7 +331,12 @@ public final class MultiRoomManager {
         callNative("media.setMetadata", params);
     }
 
-    public void onMediaProjectionGranted(MediaProjection mp) {
+    synchronized void onProjectionReleased() {
+        audioEngine.stop();
+        audioEngine.revokeMediaProjection(null);
+    }
+
+    public synchronized void onMediaProjectionGranted(MediaProjection mp) {
         audioEngine.setMediaProjection(mp);
         platformError = "";
         uiSourceMode = AudioCaptureEngine.MODE_SYSTEM_LOOPBACK;
@@ -347,7 +353,8 @@ public final class MultiRoomManager {
         broadcastStateThrottled(true);
     }
 
-    public void onMediaProjectionRevoked(String reason) {
+    public synchronized void onMediaProjectionRevoked(String reason) {
+        audioEngine.stop();
         audioEngine.revokeMediaProjection(reason);
         platformError = reason != null ? reason : "";
         if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
@@ -489,59 +496,53 @@ public final class MultiRoomManager {
         broadcastStateThrottled(true);
     }
 
-    public void onSystemMediaUpdate(String title, String artist, String album,
+    public synchronized void onSystemMediaUpdate(String packageName, String title, String artist, String album,
                                     long durationMs, long positionMs, boolean paused, boolean forceMetadata) {
-        boolean metaChanged;
-        long clampedPos;
-        synchronized (this) {
-            String safeTitle = title == null ? "" : title;
-            String safeArtist = artist == null ? "" : artist;
-            String safeAlbum = album == null ? "" : album;
-            boolean trackChanged = !extTitle.equals(safeTitle)
-                    || !extArtist.equals(safeArtist)
-                    || !extAlbum.equals(safeAlbum);
-            extTitle = safeTitle;
-            extArtist = safeArtist;
-            extAlbum = safeAlbum;
-            extDurationMs = Math.max(0L, durationMs);
-            extPositionMs = Math.max(0L, positionMs);
-            clampedPos = extPositionMs;
-            extPaused = paused;
-            if (trackChanged) {
-                extLyricsRaw = "";
-                extLrcLines = Collections.emptyList();
-                extLyricLine = "";
-            } else if (!extLrcLines.isEmpty()) {
-                extLyricLine = AudioCaptureEngine.lrcLineAt(extLrcLines, extPositionMs);
-            }
-            metaChanged = trackChanged || forceMetadata;
+        if (!targetAppPkg.isEmpty() && !targetAppPkg.equals(packageName)) return;
+        String safeTitle = title == null ? "" : title;
+        String safeArtist = artist == null ? "" : artist;
+        String safeAlbum = album == null ? "" : album;
+        boolean trackChanged = !extTitle.equals(safeTitle)
+                || !extArtist.equals(safeArtist)
+                || !extAlbum.equals(safeAlbum);
+        extTitle = safeTitle;
+        extArtist = safeArtist;
+        extAlbum = safeAlbum;
+        extDurationMs = Math.max(0L, durationMs);
+        extPositionMs = Math.max(0L, positionMs);
+        extPaused = paused;
+        if (trackChanged) {
+            extLyricsRaw = "";
+            extLrcLines = Collections.emptyList();
+            extLyricLine = "";
+        } else if (!extLrcLines.isEmpty()) {
+            extLyricLine = AudioCaptureEngine.lrcLineAt(extLrcLines, extPositionMs);
         }
         if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
-            if (metaChanged) {
+            if (trackChanged || forceMetadata) {
                 pushEffectiveSystemMetadata(multiroomRunning.get());
                 broadcastStateThrottled(false);
-            } else if (multiroomRunning.get() && (extDurationMs > 0L || clampedPos > 0L)) {
+            } else if (multiroomRunning.get() && (extDurationMs > 0L || extPositionMs > 0L)) {
                 callNativeQuiet("media.setPosition", new JSONObjectMap()
-                        .put("positionMs", (int) Math.min(86_400_000L, clampedPos))
+                        .put("positionMs", (int) Math.min(86_400_000L, extPositionMs))
                         .put("broadcast", true));
             }
         }
     }
 
-    public void onExternalLyricLine(String lyricLine) {
+    public synchronized void onExternalLyricLine(String packageName, String lyricLine) {
+        if (!targetAppPkg.isEmpty() && !targetAppPkg.equals(packageName)) return;
         if (lyricLine == null || lyricLine.trim().isEmpty()) return;
         String clean = lyricLine.trim();
-        synchronized (this) {
-            if (clean.equals(extLyricLine)) return;
-            extLyricLine = clean;
-        }
+        if (clean.equals(extLyricLine)) return;
+        extLyricLine = clean;
         if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
             pushEffectiveSystemMetadata(multiroomRunning.get());
             broadcastStateThrottled(false);
         }
     }
 
-    private void pollNativeOnce(boolean forceEmitState) {
+    private synchronized void pollNativeOnce(boolean forceEmitState) {
         String raw = nativeSender.poll();
         if (raw == null || raw.isEmpty()) return;
         try {
@@ -552,8 +553,10 @@ public final class MultiRoomManager {
                 cachedNativeState = data;
                 boolean nativeRunning = data.optBoolean("multiroomRunning", false);
                 multiroomRunning.set(nativeRunning);
-                preferLpcm = "LPCM".equals(data.optString("codec", preferLpcm ? "LPCM" : "AAC_LC"));
-                sampleRate = data.optInt("sampleRate", sampleRate);
+                if (nativeRunning) {
+                    preferLpcm = "LPCM".equals(data.optString("codec", preferLpcm ? "LPCM" : "AAC_LC"));
+                    sampleRate = data.optInt("sampleRate", sampleRate);
+                }
                 basePlayDelayMs = data.optInt("basePlayDelayMs", basePlayDelayMs);
                 if (forceEmitState || !prevStr.equals(data.toString())) {
                     broadcastStateThrottled(forceEmitState);
@@ -630,6 +633,11 @@ public final class MultiRoomManager {
     }
 
     public synchronized void stopMultiroom() {
+        stopNativeStreaming();
+        if (appContext != null) appContext.stopService(new Intent(appContext, SenderService.class));
+    }
+
+    synchronized void stopNativeStreaming() {
         boolean wasRunning = multiroomRunning.getAndSet(false);
         audioEngine.stop();
         callNative("multiroom.stop", null);
@@ -637,13 +645,52 @@ public final class MultiRoomManager {
             logSender("原生全屋同步推流已停止");
         }
         reconcileDiscoveryLifecycle();
-        if (appContext != null) {
-            try {
-                appContext.startService(new Intent(appContext, SenderService.class)
-                        .setAction(SenderService.ACTION_STOP));
-            } catch (Throwable ignored) {}
-        }
         pollNativeOnce(true);
+    }
+
+    private synchronized void changeTargetApp(int uid, String pkg, String label) throws Exception {
+        if (uid <= 0) {
+            uid = -1;
+            pkg = "";
+            label = "";
+        } else {
+            Context ctx = appContext;
+            if (ctx == null || pkg.isEmpty() || uid == android.os.Process.myUid()
+                    || ctx.getPackageManager().getApplicationInfo(pkg, 0).uid != uid) {
+                throw new IllegalArgumentException("音源应用已变化，请刷新列表");
+            }
+            if (label.isEmpty()) label = pkg;
+        }
+        if (targetAppUid == uid && targetAppPkg.equals(pkg)) return;
+
+        boolean restart = multiroomRunning.get() && uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK;
+        boolean lpcm = preferLpcm;
+        int rate = sampleRate;
+        int delay = basePlayDelayMs;
+        if (restart) {
+            // Joining both capture and native senders retires the PCM, AAC, RTP and TCP
+            // queues before any frame for the next UID can be accepted.
+            audioEngine.stop();
+            JSONObject stopped = callNative("multiroom.stop", null);
+            multiroomRunning.set(false);
+            if (!stopped.optBoolean("result", false)) {
+                throw new IllegalStateException(stopped.optString("error", "无法确认旧音源已停止"));
+            }
+        }
+        targetAppUid = uid;
+        targetAppPkg = pkg;
+        targetAppName = label;
+        extTitle = extArtist = extAlbum = extLyricsRaw = extLyricLine = "";
+        extLrcLines = Collections.emptyList();
+        extDurationMs = extPositionMs = 0L;
+        extPaused = true;
+        audioEngine.setTargetAppUid(uid, label);
+        MediaSessionMonitorService.setPreferredPackage(pkg);
+        if (restart && !startMultiroom(lpcm, rate, delay)) {
+            throw new IllegalStateException(platformError);
+        }
+        pushEffectiveSystemMetadata(multiroomRunning.get());
+        broadcastStateThrottled(true);
     }
 
     public String handleRpcRequest(String reqJson) {
@@ -757,31 +804,8 @@ public final class MultiRoomManager {
                     result = listInstalledAudioApps();
                     break;
                 case "source.setTargetApp": {
-                    int uid = req.optInt("uid", -1);
-                    String pkg = req.optString("packageName", "").trim();
-                    String lbl = req.optString("label", "").trim();
-                    if (uid <= 0 || pkg.isEmpty() || (appContext != null && pkg.equals(appContext.getPackageName()))) {
-                        this.targetAppUid = -1;
-                        this.targetAppPkg = "";
-                        this.targetAppName = "";
-                        audioEngine.setTargetAppUid(-1, "");
-                        MediaSessionMonitorService.setPreferredPackage("");
-                        logSender("已切换为全局媒体音频捕获");
-                    } else {
-                        Context ctx = appContext;
-                        if (ctx == null || uid == android.os.Process.myUid()
-                                || ctx.getPackageManager().getApplicationInfo(pkg, 0).uid != uid) {
-                            throw new IllegalArgumentException("音源应用已变化，请刷新列表");
-                        }
-                        this.targetAppUid = uid;
-                        this.targetAppPkg = pkg;
-                        this.targetAppName = lbl.isEmpty() ? pkg : lbl;
-                        audioEngine.setTargetAppUid(uid, this.targetAppName);
-                        MediaSessionMonitorService.setPreferredPackage(pkg);
-                        logSender("已锁定单应用独立抓音: " + this.targetAppName + " (uid=" + uid + ")");
-                    }
-                    pushEffectiveSystemMetadata(multiroomRunning.get());
-                    broadcastStateThrottled(true);
+                    changeTargetApp(req.optInt("uid", -1), req.optString("packageName", "").trim(),
+                            req.optString("label", "").trim());
                     break;
                 }
                 case "wav.pause":
