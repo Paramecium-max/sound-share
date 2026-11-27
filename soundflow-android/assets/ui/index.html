@@ -210,35 +210,24 @@
 
     <!-- Tab 2: Multi-Room Synchronous Audio Sender -->
     <section class="tab-pane" id="pane-sender" role="tabpanel" aria-labelledby="tab-sender">
-      <div class="page-heading">
-        <h1>发送台</h1>
-        <p>把手机或平板的声音，微秒级同步投送到全屋多台音箱。</p>
+      <div class="sender-overview">
+        <div>
+          <h1>发送台</h1>
+          <p id="sender-hero-status">选择音源和播放设备</p>
+        </div>
+        <div class="sender-overview-status">
+          <span class="tnum" id="sender-hero-sub"></span>
+          <div class="sender-spectrum" id="sender-spectrum" aria-hidden="true">
+            <span class="spec-bar"></span><span class="spec-bar"></span><span class="spec-bar"></span><span class="spec-bar"></span>
+            <span class="spec-bar"></span><span class="spec-bar"></span><span class="spec-bar"></span><span class="spec-bar"></span>
+          </div>
+        </div>
       </div>
+      <div class="error-banner" id="sender-error-banner" role="status"><div id="sender-error-text"></div></div>
 
-      <div class="translucent-card sender-hero-card">
-        <div class="sender-hero-grid">
-          <div class="sender-hero-copy">
-            <div class="connection-label">
-              <span class="status-dot" id="sender-status-dot"></span>
-              <span id="sender-status-label">本机发包待机 · 自动屏蔽自身回环</span>
-            </div>
-            <div class="hero-headline" id="sender-hero-status">勾选音箱，一键开启全屋同步立体声</div>
-            <div class="hero-sub tnum" id="sender-hero-sub" style="margin-top:10px;">支持同时连接多台小米音箱与另一台音流接收端，毫秒级声场对齐</div>
-          </div>
-          <div class="sender-hero-side">
-            <div class="sender-spectrum" id="sender-spectrum" aria-hidden="true">
-              <span class="spec-bar"></span><span class="spec-bar"></span><span class="spec-bar"></span><span class="spec-bar"></span>
-              <span class="spec-bar"></span><span class="spec-bar"></span><span class="spec-bar"></span><span class="spec-bar"></span>
-            </div>
-            <button type="button" class="pill-cta primary" id="sender-toggle-btn">开始全屋播放</button>
-          </div>
-        </div>
-
-        <div class="error-banner" id="sender-error-banner">
-          <div id="sender-error-text"></div>
-        </div>
-
-        <div class="sender-source-block">
+      <div class="sender-console">
+        <section class="sender-source-panel sender-panel" aria-labelledby="sender-source-title">
+          <h2 id="sender-source-title">音源</h2>
           <div class="segmented" id="sender-source-seg" role="tablist" aria-label="全屋发送音源模式">
             <button type="button" data-mode="2" aria-selected="true" aria-label="应用 / 系统内录"><span class="source-long">应用 / 系统内录</span><span class="source-short" aria-hidden="true">应用内录</span></button>
             <button type="button" data-mode="1" aria-selected="false" aria-label="本地无损 WAV"><span class="source-long">本地无损 WAV</span><span class="source-short" aria-hidden="true">本地 WAV</span></button>
@@ -274,6 +263,9 @@
             <button type="button" class="row-btn" id="sender-notif-btn">去开启</button>
           </div>
 
+        </section>
+        <section class="sender-playback-panel sender-panel" aria-labelledby="sender-playback-title">
+          <h2 id="sender-playback-title">播放控制</h2>
           <div class="sender-nowplaying">
             <div class="sender-np-meta">
               <div class="sender-np-title" id="sender-track-title">等待系统音乐播放</div>
@@ -293,56 +285,60 @@
             <span class="tnum" id="sender-wav-dur">00:00</span>
           </div>
 
-          <div class="transport-bar sender-transport">
-            <button type="button" class="transport-btn" id="sender-prev-btn">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><polygon points="19 20 9 12 19 4 19 20"></polygon><line x1="5" y1="19" x2="5" y2="5"></line></svg>
-              <span>上一首</span>
-            </button>
-            <button type="button" class="transport-btn" id="sender-playpause-btn">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-              <span>暂停</span>
-            </button>
-            <button type="button" class="transport-btn" id="sender-next-btn">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 4 15 12 5 20 5 4"></polygon><line x1="19" y1="5" x2="19" y2="19"></line></svg>
-              <span>下一首</span>
-            </button>
+          <div class="sender-mixer">
+            <div class="transport-bar sender-transport">
+              <button type="button" class="transport-btn" id="sender-prev-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><polygon points="19 20 9 12 19 4 19 20"></polygon><line x1="5" y1="19" x2="5" y2="5"></line></svg>
+                <span>上一首</span>
+              </button>
+              <button type="button" class="transport-btn" id="sender-playpause-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                <span>暂停</span>
+              </button>
+              <button type="button" class="transport-btn" id="sender-next-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 4 15 12 5 20 5 4"></polygon><line x1="19" y1="5" x2="19" y2="19"></line></svg>
+                <span>下一首</span>
+              </button>
+            </div>
+
+            <div class="volume-row">
+              <svg class="volume-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
+              <input type="range" min="0" max="100" value="70" class="lg-slider" id="sender-master-vol" aria-label="全屋总控音量" />
+              <span class="volume-val tnum" id="sender-master-vol-val">70%</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="sender-devices-panel sender-panel" aria-labelledby="sender-devices-title">
+          <div class="sender-devices-header">
+            <div>
+              <h2 id="sender-devices-title">播放设备</h2>
+              <div class="sender-dev-summary tnum" id="sender-dev-count">正在扫描局域网…</div>
+            </div>
+            <div class="sender-header-btns">
+              <button type="button" class="row-btn" id="sender-scan-btn">刷新扫描</button>
+              <button type="button" class="row-btn" id="sender-manual-toggle-btn">+ 手动 IP</button>
+            </div>
           </div>
 
-          <div class="volume-row">
-            <svg class="volume-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
-            <input type="range" min="0" max="100" value="70" class="lg-slider" id="sender-master-vol" aria-label="全屋总控音量" />
-            <span class="volume-val tnum" id="sender-master-vol-val">70%</span>
+          <div class="translucent-card sender-manual-drawer" id="sender-manual-drawer" style="display:none;">
+            <div class="row-title">手动添加妙播接收设备</div>
+            <div class="sender-manual-fields">
+              <input type="text" class="ios-input" id="sender-manual-name" maxlength="32" placeholder="备注名称（可选，如 书房音箱）" />
+              <input type="text" class="ios-input" id="sender-manual-ip" maxlength="40" placeholder="局域网 IPv4（如 192.168.31.88）" />
+              <input type="number" class="ios-input" id="sender-manual-port" min="1" max="65535" value="8899" placeholder="8899" />
+              <button type="button" class="pill-cta primary" id="sender-manual-submit-btn">添加并入组</button>
+            </div>
           </div>
-        </div>
-      </div>
 
-      <div class="sender-devices-header">
-        <div>
-          <div class="section-header" style="padding:0;">局域网妙播音箱与接收器</div>
-          <div class="sender-dev-summary tnum" id="sender-dev-count">正在局域网扫描小米音箱 / 接收器…</div>
-        </div>
-        <div class="sender-header-btns">
-          <button type="button" class="row-btn" id="sender-scan-btn">刷新扫描</button>
-          <button type="button" class="row-btn" id="sender-manual-toggle-btn">+ 手动 IP</button>
-        </div>
-      </div>
+          <div class="translucent-card sender-empty-card" id="sender-empty-devices">
+            <div class="row-title">暂未发现其他局域网妙播音箱</div>
+            <div class="row-desc">确认接收设备与本机处于同一局域网，或使用「手动 IP」添加。</div>
+          </div>
 
-      <div class="translucent-card sender-manual-drawer" id="sender-manual-drawer" style="display:none;">
-        <div class="row-title">手动添加妙播接收设备</div>
-        <div class="sender-manual-fields">
-          <input type="text" class="ios-input" id="sender-manual-name" maxlength="32" placeholder="备注名称（可选，如 书房音箱）" />
-          <input type="text" class="ios-input" id="sender-manual-ip" maxlength="40" placeholder="局域网 IPv4（如 192.168.31.88）" />
-          <input type="number" class="ios-input" id="sender-manual-port" min="1" max="65535" value="8899" placeholder="8899" />
-          <button type="button" class="pill-cta primary" id="sender-manual-submit-btn">添加并入组</button>
-        </div>
+          <div class="sender-device-list" id="sender-device-list"></div>
+        </section>
       </div>
-
-      <div class="translucent-card sender-empty-card" id="sender-empty-devices">
-        <div class="row-title">暂未发现其他局域网妙播音箱</div>
-        <div class="row-desc">请确认小米音箱或另一台运行「音流」的设备处于同一 Wi-Fi（本机自身 IP 已自动过滤以防回声）。跨子网设备可点击右上角「+ 手动 IP」直接填入。</div>
-      </div>
-
-      <div class="sender-device-list" id="sender-device-list"></div>
     </section>
 
     <!-- Tab 3: Preferences (Organized into 歌词 / 接收 / 全屋发送 / 外观) -->

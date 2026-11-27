@@ -422,18 +422,72 @@ body:not(.ios-lyrics) .ios-switch[aria-checked="true"]::after {
    Multi-Room Sender Tab & 4-Tab Liquid Dock Responsive Styles
    ============================================================================ */
 
-.sender-hero-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+.sender-overview {
+  display: flex;
   align-items: center;
-  gap: 24px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 0 2px 16px;
 }
 
-.sender-hero-side {
+.sender-overview h1 {
+  margin: 0;
+  font-size: clamp(23px, 3vw, 30px);
+  line-height: 1.18;
+  letter-spacing: -.025em;
+}
+
+.sender-overview p,
+.sender-overview-status {
+  margin: 4px 0 0;
+  color: var(--label-2);
+  font-size: 13px;
+}
+
+.sender-overview-status {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
+  align-items: center;
+  gap: 10px;
+}
+
+.sender-console {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "source" "playback" "devices";
   gap: 14px;
+  align-items: start;
+}
+
+.sender-panel {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 10px;
+  padding: clamp(12px, 2vw, 19px);
+  border-radius: 24px;
+  background: var(--surface);
+  box-shadow: var(--card-elevation);
+}
+
+.sender-panel h2 {
+  margin: 0;
+  color: var(--label);
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.sender-source-panel { grid-area: source; }
+.sender-playback-panel { grid-area: playback; }
+.sender-devices-panel { grid-area: devices; }
+
+@media (min-width: 840px) {
+  .sender-console {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.12fr);
+    grid-template-rows: auto 1fr;
+    grid-template-areas: "source devices" "playback devices";
+  }
 }
 
 .sender-spectrum {
@@ -455,15 +509,6 @@ body:not(.ios-lyrics) .ios-switch[aria-checked="true"]::after {
   transform: scaleY(0.14);
   opacity: 0.35;
   transition: transform 110ms linear, opacity 140ms ease;
-}
-
-.sender-source-block {
-  margin-top: 18px;
-  padding-top: 18px;
-  border-top: 0.5px solid var(--separator);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
 }
 
 .sender-app-filter-row {
@@ -587,11 +632,11 @@ body:not(.ios-lyrics) .ios-switch[aria-checked="true"]::after {
 
 .sender-devices-header {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 12px;
-  margin: 22px 4px 12px;
+  margin: 0;
 }
 
 .sender-dev-summary {
@@ -771,16 +816,6 @@ body:not(.ios-lyrics) .ios-switch[aria-checked="true"]::after {
 }
 
 @media (max-width: 720px) {
-  .sender-hero-grid {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 16px;
-  }
-  .sender-hero-side {
-    flex-direction: row;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-  }
   .sender-manual-fields {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -830,4 +865,70 @@ body:not(.ios-lyrics) .ios-switch[aria-checked="true"]::after {
   #sender-source-seg .source-short {
     display: inline;
   }
+}
+
+.sender-panel .row-btn { min-height: 40px; padding-inline: 11px; }
+.sender-panel .sender-nowplaying { padding: 11px 12px; gap: 8px; border-radius: 15px; }
+.sender-panel .sender-perm-banner { padding: 9px 11px; border-radius: 14px; }
+.sender-panel .sender-empty-card,
+.sender-panel .sender-manual-drawer,
+.sender-panel .sender-device-card {
+  background: var(--surface-2);
+  padding: 12px;
+  border-radius: 16px;
+  box-shadow: none;
+}
+.sender-devices-panel .sender-manual-fields {
+  grid-template-columns: minmax(0, 1fr) minmax(72px, .36fr);
+}
+.sender-devices-panel #sender-manual-name,
+.sender-devices-panel #sender-manual-submit-btn { grid-column: 1 / -1; }
+.sender-devices-panel .sender-manual-fields input { width: 100%; min-width: 0; }
+
+.sender-mixer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+.sender-mixer .sender-transport {
+  flex: 1 1 190px;
+  max-width: 330px;
+  margin: 0;
+  gap: 5px;
+}
+.sender-mixer .transport-btn { min-height: 40px; padding-inline: 5px; gap: 4px; }
+.sender-mixer .volume-row {
+  flex: 1 1 124px;
+  max-width: none;
+  min-height: 44px;
+  margin: 0;
+  gap: 8px;
+}
+.sender-mixer .lg-slider,
+.sender-dev-slider-row .lg-slider { min-width: 0; }
+
+.sender-dev-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 12px;
+  margin-top: 3px;
+  color: var(--label-2);
+  font-size: 12px;
+}
+.sender-dev-facts .sender-dev-sub { margin: 0; word-break: normal; overflow-wrap: anywhere; }
+.sender-dev-timing { color: var(--label); }
+.sender-dev-controls { margin-top: 8px; padding-top: 7px; }
+.sender-dev-slider-row .volume-val { flex: 0 0 3.4em; text-align: right; }
+.sender-panel button:focus-visible { outline: 2px solid var(--tint); outline-offset: 2px; }
+
+@media (max-width: 480px) {
+  .sender-panel .row-btn { min-height: 44px; }
+  .sender-mixer .transport-btn { min-height: 44px; }
+  .sender-mixer .sender-transport { max-width: none; }
+  .sender-device-list { grid-template-columns: minmax(0, 1fr); }
+  .sender-device-card { min-width: 0; }
+  .sender-device-card .sender-dev-slider-row { gap: 7px; }
+  .sender-header-btns { flex-wrap: wrap; }
 }

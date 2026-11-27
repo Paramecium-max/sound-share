@@ -37,6 +37,7 @@ import android.os.SystemClock;
 import android.util.Log;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -982,6 +983,12 @@ public final class ReceiverService extends Service {
             "sample_rate", "channels", "codec", "media_generation"
     };
 
+    private static final String[] SAFE_NATIVE_LOG_METRICS = {
+            "round_trip_us", "phase_error_us", "buffered_frames", "pcm_frames_per_second",
+            "latency_ms", "output_latency_ms", "arrival_residual_ms", "requested_ms",
+            "actual_frames", "count", "delta"
+    };
+
     private static String sanitizeNativeLogEvent(JSONObject e) {
         JSONObject safe = new JSONObject();
         for (String key : SAFE_NATIVE_LOG_FIELDS) {
@@ -989,6 +996,14 @@ public final class ReceiverService extends Service {
                 try {
                     safe.put(key, e.opt(key));
                 } catch (Exception ignored) {}
+            }
+        }
+        for (String key : SAFE_NATIVE_LOG_METRICS) {
+            Object value = e.opt(key);
+            if (value instanceof Number) {
+                try {
+                    safe.put(key, value);
+                } catch (JSONException ignored) {}
             }
         }
         return safe.toString();

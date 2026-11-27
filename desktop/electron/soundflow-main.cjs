@@ -23,6 +23,9 @@ let visualDemand = false;
 let senderTab = false;
 let senderStage = false;
 let lastSenderPoll = 0;
+let lastSenderRender = 0;
+let publishedSenderSnapshot = '';
+const SENDER_RENDER_INTERVAL_MS = 200;
 let target = null;
 let sender = {};
 let receiver = {};
@@ -272,9 +275,17 @@ async function poll() {
     for (const event of data.receiver) receiverEvent(event);
     if (data.sender) {
       lastSenderPoll = Date.now();
-      const changed = JSON.stringify(sender) !== JSON.stringify(data.sender.data);
       sender = data.sender.data;
-      if (changed) publishSenderState();
+      // Real-time audio and control events keep their existing polling cadence.
+      // Device counters can change each poll, so bound full renderer updates separately.
+      if (lastSenderPoll - lastSenderRender >= SENDER_RENDER_INTERVAL_MS) {
+        lastSenderRender = lastSenderPoll;
+        const snapshot = JSON.stringify(sender);
+        if (snapshot !== publishedSenderSnapshot) {
+          publishedSenderSnapshot = snapshot;
+          publishSenderState();
+        }
+      }
       for (const event of data.sender.events) {
         if (event.type === 'spectrum') {
           if (visualDemand && senderStage && sender.multiroomRunning && Array.isArray(event.levels) && event.levels.length >= 4) {

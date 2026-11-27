@@ -1005,6 +1005,7 @@ window.SoundFlowStage = {
 stageCard.appendChild(document.querySelector(".stage-glass-hud"));
 
 let activeTab = "receiver";
+const tabScrollPositions = new Map();
 let lastReceiverSnapshot = {};
 let senderController = null;
 let systemDark = true;
@@ -1180,8 +1181,11 @@ function refreshTopToolbar() {
 }
 
 function switchTab(tab) {
+  const changed = tab !== activeTab;
+  if (changed) tabScrollPositions.set(activeTab, window.scrollY);
   activeTab = tab;
   document.querySelectorAll(".tab-pane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + tab));
+  if (changed) window.scrollTo(0, tabScrollPositions.get(tab) ?? 0);
   window.SoundFlowBridge?.setSenderTabActive?.(tab === "sender");
   senderController?.onTabChanged?.(tab);
   refreshTopToolbar();

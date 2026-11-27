@@ -64,9 +64,6 @@ export function initSenderController({
   const spectrumBars = Array.from(document.querySelectorAll("#sender-spectrum .spec-bar"));
   const statusHeadline = document.getElementById("sender-hero-status");
   const statusSub = document.getElementById("sender-hero-sub");
-  const statusDot = document.getElementById("sender-status-dot");
-  const statusLabel = document.getElementById("sender-status-label");
-  const mainToggleBtn = document.getElementById("sender-toggle-btn");
   const errBanner = document.getElementById("sender-error-banner");
   const errText = document.getElementById("sender-error-text");
 
@@ -222,7 +219,10 @@ export function initSenderController({
             <span class="sender-dev-name"></span>
             <span class="sender-dev-badge tnum"></span>
           </div>
-          <div class="sender-dev-sub tnum"></div>
+          <div class="sender-dev-facts">
+            <span class="sender-dev-sub tnum"></span>
+            <span class="sender-dev-timing tnum" title="接收端上报的播放队列与音频输出延迟之和"></span>
+          </div>
         </div>
         <div class="sender-dev-actions">
           <button type="button" class="row-btn destructive dev-remove-btn" style="display:none">移除</button>
@@ -317,10 +317,7 @@ export function initSenderController({
 
     const badgeEl = card.querySelector(".sender-dev-badge");
     if (d.rtspStreaming) {
-      const residualMs = Math.abs((Number(d.syncResidualUs) || 0) / 1000);
-      badgeEl.textContent = d.syncPackets > 0 && Number.isFinite(residualMs) && residualMs <= 5000
-        ? `同步 ±${residualMs.toFixed(1)}ms`
-        : (d.syncPackets > 0 ? "时钟对齐中…" : "RTP 推流中");
+      badgeEl.textContent = d.syncPackets > 0 ? "推流中 · 有校时数据" : "推流中";
       badgeEl.className = "sender-dev-badge tnum streaming";
     } else if (d.inGroup && state.multiroomRunning) {
       badgeEl.textContent = d.cmdConnected ? "握手就绪" : "连接中…";
@@ -330,10 +327,14 @@ export function initSenderController({
       badgeEl.className = "sender-dev-badge tnum";
     }
 
-    const subParts = [`${d.ip}:${d.cmdPort}`];
-    if (d.statusText && d.statusText !== "待机") subParts.push(d.statusText);
-    if (d.reportedLatencyMs > 0) subParts.push(`设备缓冲 ${d.reportedLatencyMs}ms`);
-    card.querySelector(".sender-dev-sub").textContent = subParts.join(" · ");
+    const timing = card.querySelector(".sender-dev-timing");
+    const latency = d.rtspStreaming && Number(d.reportedLatencyMs) > 0;
+    timing.hidden = !latency;
+    timing.textContent = latency ? `接收播放延迟 ${d.reportedLatencyMs} ms` : "";
+    const sub = card.querySelector(".sender-dev-sub");
+    const endpoint = `${d.ip}:${d.cmdPort}`;
+    sub.textContent = endpoint;
+    sub.title = d.statusText && d.statusText !== "待机" ? d.statusText : endpoint;
 
     const removeBtn = card.querySelector(".dev-remove-btn");
     removeBtn.style.display = d.isManual ? "inline-flex" : "none";
@@ -421,29 +422,13 @@ export function initSenderController({
       : "AAC-LC 48kHz";
     const singleAppActive = state.sourceMode === MODE_SYSTEM_LOOPBACK && state.targetAppUid > 0;
 
-    if (statusDot) {
-      statusDot.className = "status-dot " + (running ? (streaming > 0 ? "playing" : "ready") : state.lastError ? "warn" : "");
-    }
-    if (statusLabel) {
-      statusLabel.textContent = running
-        ? `${singleAppActive ? `单应用「${state.targetAppName}」` : "全屋微秒级时钟同步"} · ${codecText}`
-        : `本机发包 ${state.bindIp || "未连接 Wi-Fi"} · 自动屏蔽自身回环`;
-    }
     if (statusHeadline) {
       statusHeadline.textContent = running
-        ? (streaming > 0 ? `正在向 ${streaming} 台音箱同步播放` : "全屋推流已开启，等待音箱连接")
-        : (inGroup > 0 ? `已选 ${inGroup} 台音箱，随时开始全屋播放` : "勾选音箱，一键开启全屋同步立体声");
+        ? (streaming ? `${streaming} 台设备播放中` : "等待设备连接")
+        : (inGroup ? `已选择 ${inGroup} 台设备` : "选择音源和播放设备");
     }
     if (statusSub) {
-      statusSub.textContent = running
-        ? `基准缓冲 ${state.basePlayDelayMs} ms · 校时 UDP :${state.timerServicePort || "--"}`
-        : (singleAppActive
-          ? `已锁定仅发送「${state.targetAppName}」的声音，其他应用通知音不会混入音箱`
-          : "支持指定单个 App 声音独立发送或全局内录，毫秒级多音箱声场对齐");
-    }
-    if (mainToggleBtn) {
-      mainToggleBtn.textContent = running ? "停止全屋发送" : "开始全屋播放";
-      mainToggleBtn.className = "pill-cta " + (running ? "stop" : "primary");
+      statusSub.textContent = running ? `${codecText} / 发送基准 ${state.basePlayDelayMs} ms` : "";
     }
     if (errBanner && errText) {
       errBanner.classList.toggle("show", !!state.lastError);
@@ -514,7 +499,8 @@ export function initSenderController({
     if (trackLyricEl) {
       trackLyricEl.textContent = tr.lyricLine
         ? `♪ ${tr.lyricLine}`
-        : (tr.hasLyrics ? "已就绪完整同步歌词，可展开全屏舞台" : "支持读取系统状态栏歌词或手动绑定本地 .lrc");
+        : "";
+      trackLyricEl.hidden = !tr.lyricLine;
     }
     if (btnPlayPause) {
       const span = btnPlayPause.querySelector("span");
@@ -601,7 +587,6 @@ export function initSenderController({
     }
   }
 
-  mainToggleBtn?.addEventListener("click", toggleMultiroom);
 
   sourceSegBtns.forEach((btn) => {
     btn.addEventListener("click", async () => {
