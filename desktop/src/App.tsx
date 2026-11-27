@@ -116,7 +116,7 @@ const DEFAULT_STATE: EngineState = {
   timerServicePort: 0,
   sessionTimeOffsetUs: 0,
   sampleRate: 48000,
-  basePlayDelayMs: 350,
+  basePlayDelayMs: 300,
   codec: 'AAC_LC',
   masterVolume: 70,
   sourceMode: 0,
@@ -1147,15 +1147,15 @@ export default function App() {
                   <input
                     className="vol-slider"
                     type="range"
-                    min={150}
+                    min={40}
                     max={800}
-                    step={10}
+                    step={5}
                     value={state.basePlayDelayMs}
                     aria-label="全屋同步缓冲"
                     onChange={(e) => callRpc('sync.setBaseDelay', { delayMs: Number(e.target.value) })}
                   />
                   <span className="setting-desc">
-                    数值越大抗 Wi-Fi 波动越稳，默认 350 ms 适合大多数家庭网络。
+                    数值越大抗 Wi-Fi 波动越稳，默认 300 ms 兼顾多设备同步稳定性。
                   </span>
                 </div>
 

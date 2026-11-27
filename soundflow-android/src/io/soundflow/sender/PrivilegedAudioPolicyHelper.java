@@ -88,11 +88,8 @@ public final class PrivilegedAudioPolicyHelper {
         Class<?> ruleBuilderCls = Class.forName("android.media.audiopolicy.AudioMixingRule$Builder");
         Object ruleBuilder = ruleBuilderCls.getConstructor().newInstance();
 
-        // Allow capturing even apps with allowAudioPlaybackCapture="false" when privileged.
-        try {
-            Method allowPriv = ruleBuilderCls.getMethod("allowPrivilegedPlaybackCapture", boolean.class);
-            allowPriv.invoke(ruleBuilder, true);
-        } catch (NoSuchMethodException ignored) {}
+        // Note: Do NOT call allowPrivilegedPlaybackCapture(true) here because AOSP AudioMix.Builder.build()
+        // enforces a hard 16kHz sample rate cap when privileged playback capture is set.
 
         Method addRuleAttr = ruleBuilderCls.getMethod("addRule", AudioAttributes.class, int.class);
         for (int usage : new int[]{
@@ -104,11 +101,12 @@ public final class PrivilegedAudioPolicyHelper {
             addRuleAttr.invoke(ruleBuilder, attr, RULE_MATCH_ATTRIBUTE_USAGE);
         }
 
-        Method addMixRule = ruleBuilderCls.getMethod("addMixRule", int.class, Object.class);
         if (targetAppUid > 0 && targetAppUid != selfAppUid) {
+            Method addMixRule = ruleBuilderCls.getMethod("addMixRule", int.class, Object.class);
             addMixRule.invoke(ruleBuilder, RULE_MATCH_UID, Integer.valueOf(targetAppUid));
         } else if (selfAppUid > 0) {
-            addMixRule.invoke(ruleBuilder, RULE_EXCLUDE_UID, Integer.valueOf(selfAppUid));
+            Method excludeMixRule = ruleBuilderCls.getMethod("excludeMixRule", int.class, Object.class);
+            excludeMixRule.invoke(ruleBuilder, RULE_MATCH_UID, Integer.valueOf(selfAppUid));
         }
 
         Object mixingRule = ruleBuilderCls.getMethod("build").invoke(ruleBuilder);
@@ -132,9 +130,65 @@ public final class PrivilegedAudioPolicyHelper {
 
         Class<?> policyBuilderCls = Class.forName("android.media.audiopolicy.AudioPolicy$Builder");
         Object policyBuilder = policyBuilderCls.getConstructor(Context.class).newInstance(attributionContext);
+        try {
+            android.os.Looper mainLooper = android.os.Looper.getMainLooper();
+            if (mainLooper != null) {
+                policyBuilderCls.getMethod("setLooper", android.os.Looper.class).invoke(policyBuilder, mainLooper);
+            }
+        } catch (NoSuchMethodException ignored) {}
         policyBuilderCls.getMethod("addMix", audioMix.getClass()).invoke(policyBuilder, audioMix);
-        Object audioPolicy = policyBuilderCls.getMethod("build").invoke(policyBuilder);
 
+        // When isolating a single app to multi-room speakers (muteLocalSpeaker && targetAppUid > 0),
+        // register a non-preempting external AudioFocus policy so opening another foreground media app
+        // (e.g. Douyin / Bilibili) does NOT send AUDIOFOCUS_LOSS to pause the captured music app.
+        if (muteLocalSpeaker && targetAppUid > 0) {
+            try {
+                final Object[] policyHolder = new Object[1];
+                android.media.audiopolicy.AudioPolicy.AudioPolicyFocusListener focusListener =
+                        new android.media.audiopolicy.AudioPolicy.AudioPolicyFocusListener() {
+                            @Override
+                            public void onAudioFocusRequest(android.media.AudioFocusInfo afi, int requestResult) {
+                                // Grant concurrent focus without dispatching AUDIOFOCUS_LOSS to other apps.
+                                Object p = policyHolder[0];
+                                if (p != null && afi != null) {
+                                    try {
+                                        Method setRes = AudioManager.class.getMethod(
+                                                "setFocusRequestResult",
+                                                android.media.AudioFocusInfo.class,
+                                                int.class,
+                                                p.getClass());
+                                        setRes.invoke(am, afi, AudioManager.AUDIOFOCUS_REQUEST_GRANTED, p);
+                                    } catch (Throwable ignored) {}
+                                }
+                            }
+                        };
+                policyBuilderCls.getMethod("setIsAudioFocusPolicy", boolean.class).invoke(policyBuilder, true);
+                policyBuilderCls.getMethod(
+                        "setAudioPolicyFocusListener",
+                        android.media.audiopolicy.AudioPolicy.AudioPolicyFocusListener.class
+                ).invoke(policyBuilder, focusListener);
+                Object audioPolicy = policyBuilderCls.getMethod("build").invoke(policyBuilder);
+                policyHolder[0] = audioPolicy;
+                return registerAndCreateSink(am, audioPolicy, audioMix);
+            } catch (Throwable focusEx) {
+                // Fallback without focus policy if ROM restricts external focus policies.
+                policyBuilder = policyBuilderCls.getConstructor(Context.class).newInstance(attributionContext);
+                try {
+                    android.os.Looper mainLooper = android.os.Looper.getMainLooper();
+                    if (mainLooper != null) {
+                        policyBuilderCls.getMethod("setLooper", android.os.Looper.class).invoke(policyBuilder, mainLooper);
+                    }
+                } catch (NoSuchMethodException ignored) {}
+                policyBuilderCls.getMethod("addMix", audioMix.getClass()).invoke(policyBuilder, audioMix);
+            }
+        }
+
+        Object audioPolicy = policyBuilderCls.getMethod("build").invoke(policyBuilder);
+        return registerAndCreateSink(am, audioPolicy, audioMix);
+    }
+
+    private static ActivePolicySession registerAndCreateSink(
+            AudioManager am, Object audioPolicy, Object audioMix) throws Exception {
         Method regMethod = AudioManager.class.getMethod("registerAudioPolicy", audioPolicy.getClass());
         int res = (Integer) regMethod.invoke(am, audioPolicy);
         if (res != 0) { // AudioManager.SUCCESS == 0 (@SystemApi)

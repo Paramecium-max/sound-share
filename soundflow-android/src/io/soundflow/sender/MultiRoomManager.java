@@ -71,6 +71,7 @@ public final class MultiRoomManager {
     private final NativeSender nativeSender = new NativeSender();
     private final AudioCaptureEngine audioEngine = new AudioCaptureEngine();
     private final ShizukuCaptureBridge shizukuBridge = new ShizukuCaptureBridge();
+    private final WirelessAdbCaptureBridge adbBridge = new WirelessAdbCaptureBridge();
     private final ArrayDeque<String> logBuffer = new ArrayDeque<>(160);
 
     private final AtomicBoolean initialized = new AtomicBoolean(false);
@@ -89,7 +90,8 @@ public final class MultiRoomManager {
     private volatile int uiSourceMode = AudioCaptureEngine.MODE_SYSTEM_LOOPBACK;
     private volatile boolean preferLpcm = false;
     private volatile int sampleRate = 48000;
-    private volatile int basePlayDelayMs = 350;
+    private volatile int basePlayDelayMs = 300;
+    private volatile boolean userExplicitGlobalApp = false;
     private volatile int targetAppUid = -1;
     private volatile String targetAppPkg = "";
     private volatile String targetAppName = "";
@@ -116,6 +118,9 @@ public final class MultiRoomManager {
     private MultiRoomManager() {
         audioEngine.setMode(AudioCaptureEngine.MODE_SYSTEM_LOOPBACK, "");
         callNativeQuiet("media.setRemoteControlHandledByHost", new JSONObjectMap().put("handled", true));
+        if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && targetAppUid <= 0 && !userExplicitGlobalApp) {
+            autoBindCurrentlyPlayingAppIfUnset();
+        }
         syncNativeSourceMode();
     }
 
@@ -155,12 +160,13 @@ public final class MultiRoomManager {
     public void attachContext(Context context) {
         if (context == null) return;
         this.appContext = context.getApplicationContext();
+        if (!initialized.compareAndSet(false, true)) return;
+        adbBridge.init(this.appContext);
         shizukuBridge.register(() -> {
             refreshCaptureBackend();
             broadcastStateThrottled(true);
         });
         refreshCaptureBackend();
-        if (!initialized.compareAndSet(false, true)) return;
         new Thread(() -> initOnBackground(this.appContext), "SoundFlow-SenderInit").start();
     }
 
@@ -173,6 +179,15 @@ public final class MultiRoomManager {
                 audioEngine.setPrivilegedPolicyContext(ctx);
                 platformError = "";
                 logSender("已启用系统特权免投屏直抓通道 (AudioPolicy)");
+            }
+            return;
+        }
+        if (adbBridge.isDaemonAlive()) {
+            if (!"wireless_adb".equals(captureBackend) || !audioEngine.hasMediaProjection()) {
+                captureBackend = "wireless_adb";
+                audioEngine.setWirelessAdbBridge(ctx, adbBridge);
+                platformError = "";
+                logSender("已启用无线 ADB 免投屏直抓通道 (UID 2000)");
             }
             return;
         }
@@ -192,6 +207,9 @@ public final class MultiRoomManager {
     }
 
     public synchronized void setMuteLocalApp(boolean mute) throws Exception {
+        if (mute && targetAppUid <= 0 && !userExplicitGlobalApp) {
+            autoBindCurrentlyPlayingAppIfUnset();
+        }
         if (this.muteLocalApp == mute) return;
         boolean restart = multiroomRunning.get() && uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK;
         boolean lpcm = preferLpcm;
@@ -207,8 +225,12 @@ public final class MultiRoomManager {
         }
         this.muteLocalApp = mute;
         audioEngine.setMuteLocalApp(mute);
-        if (restart && !startMultiroom(lpcm, rate, delay)) {
-            throw new IllegalStateException(platformError);
+        if (restart) {
+            if (!startMultiroom(lpcm, rate, delay)) {
+                throw new IllegalStateException(platformError);
+            }
+        } else {
+            reconcileAudioCaptureWorker();
         }
         broadcastStateThrottled(true);
     }
@@ -341,19 +363,38 @@ public final class MultiRoomManager {
         reconcileAudioCaptureWorker();
     }
 
+    private boolean isLocalMuteTakeoverDesired() {
+        return muteLocalApp
+                && uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK
+                && ("wireless_adb".equals(captureBackend)
+                        || "privileged_policy".equals(captureBackend)
+                        || "shizuku".equals(captureBackend));
+    }
+
     private synchronized void reconcileAudioCaptureWorker() {
-        boolean needJavaCapture = multiroomRunning.get() && uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK;
+        boolean needJavaCapture = uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK
+                && (multiroomRunning.get() || isLocalMuteTakeoverDesired());
         if (!needJavaCapture) {
             audioEngine.stop();
             return;
         }
         int rate = this.sampleRate > 0 ? this.sampleRate : 48000;
         int frames = this.preferLpcm ? ((rate == 44100) ? 441 : 480) : 1024;
+        if (audioEngine.getMode() != AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
+            audioEngine.setMode(AudioCaptureEngine.MODE_SYSTEM_LOOPBACK, "");
+        }
+        // If capture is already running (e.g. local-mute takeover before clicking Start),
+        // keep the active AudioPolicy session uninterrupted instead of tearing it down.
+        if (audioEngine.isRunningWith(rate, frames)) {
+            return;
+        }
         long originUs = System.nanoTime() / 1000L;
         audioEngine.start(rate, frames, originUs, new AudioCaptureEngine.Callbacks() {
             @Override
             public void onPcmFrame(byte[] stereoPcmLe, int sampleFrames, long samplePosition) {
-                nativeSender.pushPcm(stereoPcmLe, sampleFrames);
+                if (multiroomRunning.get()) {
+                    nativeSender.pushPcm(stereoPcmLe, sampleFrames);
+                }
             }
 
             @Override
@@ -397,15 +438,21 @@ public final class MultiRoomManager {
         audioEngine.setMediaProjection(mp);
         platformError = "";
         uiSourceMode = AudioCaptureEngine.MODE_SYSTEM_LOOPBACK;
+        if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && targetAppUid <= 0 && !userExplicitGlobalApp) {
+            autoBindCurrentlyPlayingAppIfUnset();
+        }
         syncNativeSourceMode();
         logSender("已获得系统音频内录授权 (已排除自身 UID 回环)");
         broadcastStateThrottled(true);
     }
 
     public void onMediaProjectionDenied() {
-        audioEngine.revokeMediaProjection("未授予手机全局抓音权限，已切回校准测试音");
+        audioEngine.revokeMediaProjection("未授予系统投屏内录权限，可直接使用「无线 ADB 免投屏」或点击「授权内录」");
         platformError = audioEngine.getLastError();
-        uiSourceMode = AudioCaptureEngine.MODE_TEST_TONE;
+        // Stay on MODE_SYSTEM_LOOPBACK so the user can directly activate Wireless ADB without being kicked back.
+        if (uiSourceMode != AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
+            uiSourceMode = AudioCaptureEngine.MODE_TEST_TONE;
+        }
         syncNativeSourceMode();
         broadcastStateThrottled(true);
     }
@@ -416,7 +463,10 @@ public final class MultiRoomManager {
         platformError = reason != null ? reason : "";
         if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK) {
             uiSourceMode = AudioCaptureEngine.MODE_TEST_TONE;
-            syncNativeSourceMode();
+            if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && targetAppUid <= 0 && !userExplicitGlobalApp) {
+            autoBindCurrentlyPlayingAppIfUnset();
+        }
+        syncNativeSourceMode();
         }
         logSender("系统内录权限已结束: " + platformError);
         broadcastStateThrottled(true);
@@ -660,8 +710,11 @@ public final class MultiRoomManager {
             } catch (Throwable ignored) {}
         }
 
+        if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && targetAppUid <= 0 && !userExplicitGlobalApp) {
+            autoBindCurrentlyPlayingAppIfUnset();
+        }
         syncNativeSourceMode();
-        int clampedDelay = Math.max(100, Math.min(1000, delayMs));
+        int clampedDelay = Math.max(40, Math.min(800, delayMs));
         JSONObject resp = callNative("multiroom.start", new JSONObjectMap()
                 .put("codec", lpcm ? "LPCM" : "AAC_LC")
                 .put("sampleRate", sr > 0 ? sr : 48000)
@@ -696,8 +749,8 @@ public final class MultiRoomManager {
 
     synchronized void stopNativeStreaming() {
         boolean wasRunning = multiroomRunning.getAndSet(false);
-        audioEngine.stop();
         callNative("multiroom.stop", null);
+        reconcileAudioCaptureWorker();
         if (wasRunning) {
             logSender("原生全屋同步推流已停止");
         }
@@ -838,6 +891,7 @@ public final class MultiRoomManager {
                 case "source.setMode": {
                     int mode = req.optInt("mode", AudioCaptureEngine.MODE_SYSTEM_LOOPBACK);
                     String param = req.optString("param", "");
+                    boolean requestProjection = req.optBoolean("requestProjection", false);
                     if (mode == AudioCaptureEngine.MODE_WAV_FILE && activeWavPath.isEmpty() && param.isEmpty()) {
                         error = "请先选择本地 WAV 音频文件";
                         break;
@@ -847,13 +901,21 @@ public final class MultiRoomManager {
                     refreshCaptureBackend();
                     audioEngine.setMode(mode, param);
                     if (mode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && !audioEngine.hasMediaProjection()) {
+                        if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && targetAppUid <= 0 && !userExplicitGlobalApp) {
+                            autoBindCurrentlyPlayingAppIfUnset();
+                        }
                         syncNativeSourceMode();
-                        if ("media_projection".equals(captureBackend) && uiDelegate != null) {
+                        // Only launch the system screen-capture (MediaProjection) dialog when the user explicitly
+                        // clicks "授权内录" (requestProjection=true), never when switching tabs or using Wireless ADB.
+                        if (requestProjection && "media_projection".equals(captureBackend) && uiDelegate != null) {
                             uiDelegate.onRequestSystemAudioCapture();
                         }
                     } else {
                         if (mode == AudioCaptureEngine.MODE_WAV_FILE && !param.isEmpty()) {
                             activeWavPath = param;
+                        }
+                        if (uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && targetAppUid <= 0 && !userExplicitGlobalApp) {
+                            autoBindCurrentlyPlayingAppIfUnset();
                         }
                         syncNativeSourceMode();
                     }
@@ -866,8 +928,43 @@ public final class MultiRoomManager {
                     break;
                 }
                 case "shizuku.requestPermission": {
-                    result = shizukuBridge.requestPermission();
+                    boolean requested = shizukuBridge.requestPermission();
+                    if (!requested) error = "未检测到运行中的 Shizuku 服务，可使用「无线 ADB 免投屏」直连本机 5555 端口";
+                    result = requested;
                     refreshCaptureBackend();
+                    broadcastStateThrottled(true);
+                    break;
+                }
+                case "adb.connect": {
+                    int port = req.optInt("port", adbBridge.getConfiguredPort());
+                    boolean enableMute = req.optBoolean("enableMute", false);
+                    boolean ok = adbBridge.connectAndStartDaemon(appContext, port);
+                    refreshCaptureBackend();
+                    if (!ok) {
+                        error = adbBridge.getLastError();
+                    } else {
+                        if (targetAppUid <= 0 && !userExplicitGlobalApp) {
+                            autoBindCurrentlyPlayingAppIfUnset();
+                        }
+                        if (enableMute) {
+                            try {
+                                setMuteLocalApp(true);
+                            } catch (Exception muteEx) {
+                                error = muteEx.getMessage();
+                            }
+                        }
+                    }
+                    result = buildStateJson();
+                    broadcastStateThrottled(true);
+                    break;
+                }
+                case "adb.disconnect": {
+                    if (muteLocalApp && "wireless_adb".equals(captureBackend)) {
+                        try { setMuteLocalApp(false); } catch (Exception ignored) {}
+                    }
+                    adbBridge.disconnect(appContext);
+                    refreshCaptureBackend();
+                    result = buildStateJson();
                     broadcastStateThrottled(true);
                     break;
                 }
@@ -875,7 +972,9 @@ public final class MultiRoomManager {
                     result = listInstalledAudioApps();
                     break;
                 case "source.setTargetApp": {
-                    changeTargetApp(req.optInt("uid", -1), req.optString("packageName", "").trim(),
+                    int reqUid = req.optInt("uid", -1);
+                    userExplicitGlobalApp = (reqUid <= 0);
+                    changeTargetApp(reqUid, req.optString("packageName", "").trim(),
                             req.optString("label", "").trim());
                     break;
                 }
@@ -961,12 +1060,18 @@ public final class MultiRoomManager {
         base.put("captureBackend", captureBackend);
         boolean shizukuAvail = shizukuBridge.isAvailable();
         boolean shizukuGrant = shizukuBridge.isGranted();
-        boolean muteSupported = "privileged_policy".equals(captureBackend) || "shizuku".equals(captureBackend);
+        boolean adbActive = "wireless_adb".equals(captureBackend) || adbBridge.isDaemonAliveCached();
+        boolean muteSupported = "privileged_policy".equals(captureBackend)
+                || "wireless_adb".equals(captureBackend)
+                || "shizuku".equals(captureBackend);
         base.put("shizukuAvailable", shizukuAvail);
         base.put("shizukuGranted", shizukuGrant);
+        base.put("adbDaemonActive", adbActive);
+        base.put("adbPort", adbBridge.getConfiguredPort());
+        base.put("adbLastError", adbBridge.getLastError());
         base.put("muteLocalApp", muteLocalApp);
         base.put("muteLocalSupported", muteSupported);
-        base.put("muteLocalHint", muteSupported ? "" : "需 Magisk 特权固化或授权 Shizuku 免投屏通道");
+        base.put("muteLocalHint", muteSupported ? "" : "点击开关或「无线 ADB 免投屏」连接本机调试端口即可开启单应用本机消音");
         base.put("targetAppUid", targetAppUid);
         base.put("targetAppPkg", targetAppPkg);
         base.put("targetAppName", targetAppName);
@@ -988,6 +1093,85 @@ public final class MultiRoomManager {
         return base;
     }
 
+    private synchronized void autoBindCurrentlyPlayingAppIfUnset() {
+        if (targetAppUid > 0 || appContext == null) return;
+        if (!"wireless_adb".equals(captureBackend)
+                && !"privileged_policy".equals(captureBackend)
+                && !"shizuku".equals(captureBackend)) {
+            return;
+        }
+        try {
+            PackageManager pm = appContext.getPackageManager();
+            String selfPkg = appContext.getPackageName();
+            int selfUid = android.os.Process.myUid();
+
+            java.util.Set<Integer> playingUids = adbBridge.queryActivePlaybackUids();
+            java.util.Set<String> playingPkgs = MediaSessionMonitorService.getActivePlayingPackages(appContext);
+
+            int bestUid = -1;
+            String bestPkg = "";
+            String bestLabel = "";
+
+            // Priority 1: app that is BOTH actively outputting media audio AND has an active PLAYING MediaSession
+            for (String pkg : playingPkgs) {
+                if (pkg == null || pkg.isEmpty() || pkg.equals(selfPkg)) continue;
+                try {
+                    ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                    if (ai.uid >= 10000 && ai.uid != selfUid && playingUids.contains(ai.uid)) {
+                        bestUid = ai.uid;
+                        bestPkg = pkg;
+                        CharSequence cs = ai.loadLabel(pm);
+                        bestLabel = (cs != null && cs.length() > 0) ? cs.toString().trim() : pkg;
+                        break;
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            // Priority 2: first actively outputting media UID from AudioPlaybackConfiguration
+            if (bestUid <= 0) {
+                for (Integer uid : playingUids) {
+                    if (uid == null || uid < 10000 || uid == selfUid) continue;
+                    String[] pkgs = pm.getPackagesForUid(uid);
+                    if (pkgs == null) continue;
+                    for (String pkg : pkgs) {
+                        if (pkg == null || pkg.isEmpty() || pkg.equals(selfPkg)) continue;
+                        try {
+                            ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                            bestUid = ai.uid;
+                            bestPkg = pkg;
+                            CharSequence cs = ai.loadLabel(pm);
+                            bestLabel = (cs != null && cs.length() > 0) ? cs.toString().trim() : pkg;
+                            break;
+                        } catch (Throwable ignored) {}
+                    }
+                    if (bestUid > 0) break;
+                }
+            }
+
+            // Priority 3: first PLAYING MediaSession package
+            if (bestUid <= 0) {
+                for (String pkg : playingPkgs) {
+                    if (pkg == null || pkg.isEmpty() || pkg.equals(selfPkg)) continue;
+                    try {
+                        ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                        if (ai.uid >= 10000 && ai.uid != selfUid) {
+                            bestUid = ai.uid;
+                            bestPkg = pkg;
+                            CharSequence cs = ai.loadLabel(pm);
+                            bestLabel = (cs != null && cs.length() > 0) ? cs.toString().trim() : pkg;
+                            break;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+
+            if (bestUid > 0 && !bestPkg.isEmpty()) {
+                changeTargetApp(bestUid, bestPkg, bestLabel);
+                logSender("已自动锁定当前发声应用为 ADB 指定抓流源: " + bestLabel + " (" + bestPkg + ", uid=" + bestUid + ")");
+            }
+        } catch (Throwable ignored) {}
+    }
+
     private JSONArray listInstalledAudioApps() {
         JSONArray arr = new JSONArray();
         Context ctx = this.appContext;
@@ -995,6 +1179,11 @@ public final class MultiRoomManager {
         try {
             PackageManager pm = ctx.getPackageManager();
             String selfPkg = ctx.getPackageName();
+            int selfUid = android.os.Process.myUid();
+
+            java.util.Set<Integer> playingUids = adbBridge.queryActivePlaybackUids();
+            java.util.Set<String> playingPkgs = MediaSessionMonitorService.getActivePlayingPackages(ctx);
+
             Intent mainIntent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
             List<ResolveInfo> resolved = pm.queryIntentActivities(mainIntent, 0);
             Map<String, JSONObject> byPkg = new LinkedHashMap<>();
@@ -1004,19 +1193,55 @@ public final class MultiRoomManager {
                     ApplicationInfo ai = ri.activityInfo.applicationInfo;
                     String pkg = ai.packageName;
                     if (pkg == null || pkg.equals(selfPkg) || byPkg.containsKey(pkg)) continue;
-                    if (ai.uid < 10000) continue;
+                    if (ai.uid < 10000 || ai.uid == selfUid) continue;
                     CharSequence cs = ai.loadLabel(pm);
                     String label = (cs != null && cs.length() > 0) ? cs.toString().trim() : pkg;
+                    boolean isPlaying = playingUids.contains(ai.uid) || playingPkgs.contains(pkg);
                     JSONObject item = new JSONObject();
                     item.put("packageName", pkg);
                     item.put("label", label);
                     item.put("uid", ai.uid);
+                    item.put("playing", isPlaying);
                     byPkg.put(pkg, item);
                 }
             }
+
+            // Include any actively playing UID/package even if it has no launcher icon
+            for (Integer uid : playingUids) {
+                if (uid == null || uid < 10000 || uid == selfUid) continue;
+                String[] uidPkgs = pm.getPackagesForUid(uid);
+                if (uidPkgs == null) continue;
+                for (String pkg : uidPkgs) {
+                    if (pkg == null || pkg.equals(selfPkg) || byPkg.containsKey(pkg)) continue;
+                    try {
+                        ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                        CharSequence cs = ai.loadLabel(pm);
+                        String label = (cs != null && cs.length() > 0) ? cs.toString().trim() : pkg;
+                        JSONObject item = new JSONObject();
+                        item.put("packageName", pkg);
+                        item.put("label", label);
+                        item.put("uid", ai.uid);
+                        item.put("playing", true);
+                        byPkg.put(pkg, item);
+                    } catch (Throwable ignored) {}
+                }
+            }
+
+            final int selectedUid = this.targetAppUid;
+            final String selectedPkg = this.targetAppPkg;
             List<JSONObject> sorted = new ArrayList<>(byPkg.values());
             Collator collator = Collator.getInstance(Locale.CHINA);
-            sorted.sort((a, b) -> collator.compare(a.optString("label", ""), b.optString("label", "")));
+            sorted.sort((a, b) -> {
+                boolean ap = a.optBoolean("playing", false);
+                boolean bp = b.optBoolean("playing", false);
+                if (ap != bp) return ap ? -1 : 1;
+                boolean as = selectedUid > 0 && a.optInt("uid", -1) == selectedUid
+                        && selectedPkg.equals(a.optString("packageName", ""));
+                boolean bs = selectedUid > 0 && b.optInt("uid", -1) == selectedUid
+                        && selectedPkg.equals(b.optString("packageName", ""));
+                if (as != bs) return as ? -1 : 1;
+                return collator.compare(a.optString("label", ""), b.optString("label", ""));
+            });
             for (JSONObject item : sorted) arr.put(item);
         } catch (Throwable ignored) {}
         return arr;

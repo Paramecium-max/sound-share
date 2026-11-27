@@ -343,6 +343,7 @@ bool MultiRoomEngine::start_multiroom(bool prefer_lpcm, uint32_t sample_rate, ui
             cfg.sample_rate,
             cfg.frame_samples,
             [this, use_aac, active_rate](const int16_t* stereo_pcm, size_t samples) {
+                master_clock_.catch_up_to_now(static_cast<uint32_t>(samples));
                 auto ts = master_clock_.next_frame_timestamps(static_cast<uint32_t>(samples), !use_aac);
                 if (use_aac) {
                     if (!aac_encoder_.encode_pcm(stereo_pcm, samples, ts.linear_pts_90khz,

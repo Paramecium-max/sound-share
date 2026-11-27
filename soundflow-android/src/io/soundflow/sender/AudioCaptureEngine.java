@@ -230,6 +230,15 @@ public class AudioCaptureEngine {
         setCaptureSource((rate, samples) -> bridge.createRecorder(appCtx, rate, samples, targetAppUid, muteLocalApp));
     }
 
+    public void setWirelessAdbBridge(Context ctx, WirelessAdbCaptureBridge bridge) {
+        if (ctx == null || bridge == null) {
+            setCaptureSource(null);
+            return;
+        }
+        final Context appCtx = ctx.getApplicationContext();
+        setCaptureSource((rate, samples) -> bridge.createRecorder(appCtx, rate, samples, targetAppUid, muteLocalApp));
+    }
+
     public void setMuteLocalApp(boolean mute) {
         synchronized (captureLock) {
             if (this.muteLocalApp == mute) return;
@@ -304,9 +313,12 @@ public class AudioCaptureEngine {
         synchronized (captureLock) {
             recorderSource = null;
             invalidateCapture();
-            if (mode.get() == MODE_SYSTEM_LOOPBACK) updateMode(MODE_TEST_TONE, "");
             if (reason != null && !reason.isEmpty()) lastError = reason;
         }
+    }
+
+    public boolean isRunningWith(int rate, int frames) {
+        return running.get() && this.sampleRate == rate && this.frameSamples == frames;
     }
 
     public boolean hasMediaProjection() {

@@ -42,7 +42,7 @@ private:
     uint64_t origin_us_ = 0;
     uint64_t total_samples_ = 0;
     uint32_t sample_rate_ = 48000;
-    uint32_t base_play_delay_ms_ = 350;
+    uint32_t base_play_delay_ms_ = 300;
 };
 
 // 滑动窗口 Min-RTT 过滤 + 在线线性回归漂移估算器 (对应系统 MiPlay_TrendlineEstimator)

@@ -26,7 +26,9 @@ class SoundFlowNative {
       }
       this.pending.get(message.id)?.finish(message.error, message.result);
     });
-    this.child.stderr.setEncoding('utf8').on('data', (data) => this.log(data));
+    readline.createInterface({ input: this.child.stderr }).on('line', (line) => {
+      if (line && line.trim()) this.log(`[core-stderr] ${line}`);
+    });
     this.child.stdin.on('error', (error) => this.fail(error));
     this.child.on('error', (error) => this.fail(error));
     this.child.on('close', (code) => this.fail(new Error(`音流原生内核已退出 (${code})`)));

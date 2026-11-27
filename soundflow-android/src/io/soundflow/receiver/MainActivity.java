@@ -526,6 +526,19 @@ public final class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void openDeveloperSettings() {
+            main.post(() -> {
+                try {
+                    startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+                } catch (Throwable ignored) {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_SETTINGS));
+                    } catch (Throwable ignored2) {}
+                }
+            });
+        }
+
+        @JavascriptInterface
         public void openSenderLyricsStage() {
             main.post(() -> {
                 performTickHaptic();
@@ -1147,7 +1160,7 @@ public final class MainActivity extends Activity {
                 }
             } else {
                 MultiRoomManager.getInstance().onMediaProjectionDenied();
-                showJsToast("已取消内录授权，已切回校准测试音");
+                showJsToast("已取消系统投屏授权，可直接使用「无线 ADB 免投屏」");
             }
         } else if (req == REQ_SENDER_WAV && res == RESULT_OK && data != null && data.getData() != null) {
             Uri uri = data.getData();

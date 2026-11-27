@@ -42,10 +42,49 @@ let codec = 'AAC_LC';
 let trackRevision = 0;
 let operation = Promise.resolve();
 const logs = [];
+const MAX_DISK_LOG_BYTES = 5 * 1024 * 1024;
+let diskLogPath = '';
+let diskLogBytes = 0;
+
+function ensureDiskLogPath() {
+  if (diskLogPath) return diskLogPath;
+  const candidates = [];
+  if (process.execPath) {
+    candidates.push(path.join(path.dirname(process.execPath), 'logs', 'soundflow.log'));
+  }
+  try {
+    candidates.push(path.join(app.getPath('userData'), 'logs', 'soundflow.log'));
+  } catch {}
+  for (const cand of candidates) {
+    try {
+      fs.mkdirSync(path.dirname(cand), { recursive: true });
+      fs.appendFileSync(cand, '');
+      const st = fs.statSync(cand);
+      diskLogPath = cand;
+      diskLogBytes = st.size;
+      return diskLogPath;
+    } catch {}
+  }
+  return '';
+}
 
 function log(value) {
-  logs.push(`${new Date().toISOString()}  ${String(value).trim().slice(0, 2000)}`);
-  if (logs.length > 240) logs.shift();
+  const line = `${new Date().toISOString()}  ${String(value).trim().slice(0, 2000)}`;
+  logs.push(line);
+  if (logs.length > 400) logs.shift();
+  try {
+    const file = ensureDiskLogPath();
+    if (!file) return;
+    if (diskLogBytes >= MAX_DISK_LOG_BYTES) {
+      const prev = file.replace(/\.log$/i, '.previous.log');
+      try { fs.unlinkSync(prev); } catch {}
+      try { fs.renameSync(file, prev); } catch {}
+      diskLogBytes = 0;
+    }
+    const payload = line + '\n';
+    fs.appendFile(file, payload, 'utf8', () => {});
+    diskLogBytes += Buffer.byteLength(payload, 'utf8');
+  } catch {}
 }
 
 function send(type, data) {
@@ -198,7 +237,18 @@ function refreshLyrics() {
 
 function receiverEvent(event) {
   const protocol = event.protocol === 'dlna' ? 'dlna' : 'miplay';
-  if (!['progress', 'audio_presentation_clock'].includes(event.event)) log(`${protocol} ${event.event} ${event.stage || event.message || ''}`);
+  if (!['progress', 'audio_presentation_clock', 'discovery_packet_received', 'protocol_trace'].includes(event.event)) {
+    const metrics = {};
+    for (const k of [
+      'stage', 'message', 'error', 'reason', 'round_trip_us', 'phase_error_us',
+      'frequency_ppm', 'latency_ms', 'output_latency_ms', 'buffered_frames',
+      'pcm_frames_per_second', 'synchronization_mode', 'queue_delay_ms', 'arrival_residual_ms',
+    ]) {
+      if (event[k] !== undefined && event[k] !== null && event[k] !== '') metrics[k] = event[k];
+    }
+    const detail = Object.keys(metrics).length ? ' ' + JSON.stringify(metrics) : '';
+    log(`[${protocol}] ${event.event}${detail}`);
+  }
   switch (event.event) {
     case 'stream_started':
     case 'audio_output_signal_started':

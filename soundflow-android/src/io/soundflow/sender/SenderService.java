@@ -7,8 +7,14 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
+import android.media.MediaMetadata;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
+import android.media.session.MediaSession;
+import android.media.session.PlaybackState;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
@@ -40,11 +46,16 @@ public final class SenderService extends Service {
     private PowerManager.WakeLock wakeLock;
     private MediaProjection activeProjection;
     private MediaProjection.Callback projectionCallback;
+    private MediaSession senderMediaSession;
+    private volatile boolean keepAliveAudioRunning = false;
+    private Thread keepAliveAudioThread;
+    private AudioTrack keepAliveSilentTrack;
 
     @Override
     public void onCreate() {
         super.onCreate();
         acquireLocks();
+        startMediaKeepAlive();
         MultiRoomManager.getInstance().attachContext(getApplicationContext());
     }
 
@@ -54,12 +65,14 @@ public final class SenderService extends Service {
         String action = intent != null ? intent.getAction() : ACTION_START;
         if (ACTION_STOP.equals(action)) {
             releaseProjection(false);
+            stopMediaKeepAlive();
             MultiRoomManager.getInstance().stopNativeStreaming();
             releaseLocks();
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
             return START_NOT_STICKY;
         }
+        startMediaKeepAlive();
 
         boolean attachProjection = ACTION_ATTACH_PROJECTION.equals(action);
         int code = attachProjection && intent != null
@@ -150,6 +163,7 @@ public final class SenderService extends Service {
     @Override
     public void onDestroy() {
         releaseProjection(false);
+        stopMediaKeepAlive();
         MultiRoomManager.getInstance().stopNativeStreaming();
         releaseLocks();
         super.onDestroy();
@@ -169,15 +183,120 @@ public final class SenderService extends Service {
                 this, 11,
                 new Intent(this, SenderService.class).setAction(ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        return new Notification.Builder(this, SoundFlowApp.SENDER_CHANNEL_ID)
+        Notification.Builder nb = new Notification.Builder(this, SoundFlowApp.SENDER_CHANNEL_ID)
                 .setContentTitle("音流 · 全屋多设备发送")
                 .setContentText(text)
                 .setSmallIcon(R.drawable.ic_soundflow_notif)
                 .setContentIntent(openPi)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
-                .addAction(new Notification.Action.Builder(null, "停止发送", stopPi).build())
-                .build();
+                .addAction(new Notification.Action.Builder(null, "停止发送", stopPi).build());
+        if (senderMediaSession != null) {
+            nb.setStyle(new Notification.MediaStyle()
+                    .setMediaSession(senderMediaSession.getSessionToken())
+                    .setShowActionsInCompactView(0));
+        }
+        return nb.build();
+    }
+
+    private void startMediaKeepAlive() {
+        if (senderMediaSession == null) {
+            try {
+                MediaSession ms = new MediaSession(this, "SoundFlowSender");
+                ms.setCallback(new MediaSession.Callback() {
+                    @Override
+                    public void onPause() {
+                        MultiRoomManager.getInstance().stopMultiroom();
+                    }
+
+                    @Override
+                    public void onStop() {
+                        MultiRoomManager.getInstance().stopMultiroom();
+                    }
+                });
+                ms.setMetadata(new MediaMetadata.Builder()
+                        .putString(MediaMetadata.METADATA_KEY_TITLE, "音流 · 全屋同步发送中")
+                        .putString(MediaMetadata.METADATA_KEY_ARTIST, "多房间低延迟音频投送")
+                        .build());
+                ms.setPlaybackState(new PlaybackState.Builder()
+                        .setActions(PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_STOP)
+                        .setState(PlaybackState.STATE_PLAYING, 0L, 1.0f)
+                        .build());
+                ms.setActive(true);
+                senderMediaSession = ms;
+            } catch (Throwable ignored) {}
+        }
+        if (!keepAliveAudioRunning) {
+            keepAliveAudioRunning = true;
+            Thread t = new Thread(() -> {
+                AudioTrack track = null;
+                try {
+                    // 48kHz stereo MODE_STREAM AudioTrack with non-zero gain (0.01f) writing all-zero PCM:
+                    // produces 100% digital silence (and self-UID is excluded by AudioPolicy) while
+                    // registering in PlaybackActivityMonitor as an active USAGE_MEDIA player so HyperOS
+                    // SmartPower / GreezeManager never freezes this process in the background.
+                    final int sr = 48000;
+                    final int minBuf = AudioTrack.getMinBufferSize(
+                            sr, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+                    final int chunkBytes = Math.max(minBuf, sr * 4 / 5); // ~200ms chunk (5 wakes/sec, <0.1% CPU)
+                    byte[] silence = new byte[chunkBytes];
+                    track = new AudioTrack.Builder()
+                            .setAudioAttributes(new AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                    .build())
+                            .setAudioFormat(new AudioFormat.Builder()
+                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                    .setSampleRate(sr)
+                                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                                    .build())
+                            .setBufferSizeInBytes(chunkBytes * 2)
+                            .setTransferMode(AudioTrack.MODE_STREAM)
+                            .build();
+                    if (track.getState() == AudioTrack.STATE_INITIALIZED) {
+                        keepAliveSilentTrack = track;
+                        track.setVolume(0.01f);
+                        track.play();
+                        while (keepAliveAudioRunning) {
+                            int w = track.write(silence, 0, silence.length, AudioTrack.WRITE_BLOCKING);
+                            if (w < 0) break;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (track != null) {
+                        if (keepAliveSilentTrack == track) keepAliveSilentTrack = null;
+                        try { track.stop(); } catch (Throwable ignored) {}
+                        try { track.release(); } catch (Throwable ignored) {}
+                    }
+                }
+            }, "SoundFlow-AudioKeepAlive");
+            t.setDaemon(true);
+            keepAliveAudioThread = t;
+            t.start();
+        }
+    }
+
+    private void stopMediaKeepAlive() {
+        keepAliveAudioRunning = false;
+        AudioTrack track = keepAliveSilentTrack;
+        keepAliveSilentTrack = null;
+        if (track != null) {
+            try { track.pause(); } catch (Throwable ignored) {}
+            try { track.flush(); } catch (Throwable ignored) {}
+            try { track.stop(); } catch (Throwable ignored) {}
+        }
+        Thread t = keepAliveAudioThread;
+        keepAliveAudioThread = null;
+        if (t != null) {
+            t.interrupt();
+        }
+        MediaSession ms = senderMediaSession;
+        senderMediaSession = null;
+        if (ms != null) {
+            try { ms.setActive(false); } catch (Throwable ignored) {}
+            try { ms.release(); } catch (Throwable ignored) {}
+        }
     }
 
     private void acquireLocks() {

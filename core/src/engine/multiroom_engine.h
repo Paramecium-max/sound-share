@@ -58,7 +58,7 @@ struct EngineStateSnapshot {
     uint16_t timer_service_port = 0;
     uint64_t session_time_offset_us = 0;
     uint32_t sample_rate = 48000;
-    uint32_t base_play_delay_ms = 350;
+    uint32_t base_play_delay_ms = 300;
     bool prefer_lpcm = false;
     int32_t master_volume = 70;
     media::AudioSourceMode source_mode = media::AudioSourceMode::TestTone;
@@ -87,7 +87,7 @@ public:
     std::string add_manual_device(const std::string& name, const std::string& ip, uint16_t cmd_port = 8899);
     bool remove_device(const std::string& device_id);
 
-    bool start_multiroom(bool prefer_lpcm = false, uint32_t sample_rate = 48000, uint32_t base_play_delay_ms = 350);
+    bool start_multiroom(bool prefer_lpcm = false, uint32_t sample_rate = 48000, uint32_t base_play_delay_ms = 300);
     void stop_multiroom();
 
     bool add_device_to_group(const std::string& device_id);

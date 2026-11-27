@@ -87,7 +87,7 @@ Value call(miplay::MultiRoomEngine& engine, const std::string& method, const Val
         const auto codec = text("codec", "AAC_LC");
         if (codec != "LPCM" && codec != "AAC_LC") throw std::invalid_argument("无效的音频编码");
         const auto rate = integer(params, "sampleRate", 48000, 1, 192000);
-        const auto delay = integer(params, "basePlayDelayMs", 350, 100, 1000);
+        const auto delay = integer(params, "basePlayDelayMs", 300, 40, 800);
         if (!engine.start_multiroom(codec == "LPCM", rate, delay)) {
             auto error = engine.last_error();
             throw RpcError{error.empty() ? "启动全屋播放失败" : error};
@@ -99,7 +99,7 @@ Value call(miplay::MultiRoomEngine& engine, const std::string& method, const Val
     } else if (method == "multiroom.removeDevice") {
         return engine.remove_device_from_group(device());
     } else if (method == "sync.setBaseDelay") {
-        engine.set_base_play_delay_ms(integer(params, "delayMs", 350, 100, 1000));
+        engine.set_base_play_delay_ms(integer(params, "delayMs", 300, 40, 800));
     } else if (method == "sync.setDeviceBias") {
         engine.set_device_delay_bias(device(), integer(params, "delayBiasMs", 0, -300, 300));
     } else if (method == "volume.setDevice") {

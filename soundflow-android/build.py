@@ -198,9 +198,32 @@ def build_apk(so_path: Path) -> Path:
         BUILD / "compiled-res.zip",
     )
 
+    stub_srcs = sorted((PROJ / "stubs").rglob("*.java"))
+    stub_classes = BUILD / "stub_classes"
+    extra_cp = []
+    d8_libs = ["--lib", SDK_JAR]
+    if stub_srcs:
+        stub_classes.mkdir(parents=True, exist_ok=True)
+        run(
+            JAVA_BIN / "javac",
+            "-encoding",
+            "UTF-8",
+            "-source",
+            "11",
+            "-target",
+            "11",
+            "-cp",
+            str(SDK_JAR),
+            "-d",
+            stub_classes,
+            *stub_srcs,
+        )
+        extra_cp.append(str(stub_classes))
+        d8_libs.extend(["--lib", stub_classes])
+
     java_srcs = sorted((PROJ / "src").rglob("*.java")) + sorted((BUILD / "gen").rglob("*.java"))
     lib_jars = sorted((PROJ / "libs").glob("*.jar"))
-    javac_cp = os.pathsep.join([str(SDK_JAR), *(str(j) for j in lib_jars)])
+    javac_cp = os.pathsep.join([str(SDK_JAR), *extra_cp, *(str(j) for j in lib_jars)])
     run(
         JAVA_BIN / "javac",
         "-encoding",
@@ -224,8 +247,7 @@ def build_apk(so_path: Path) -> Path:
         "com.android.tools.r8.D8",
         "--min-api",
         "29",
-        "--lib",
-        SDK_JAR,
+        *d8_libs,
         "--output",
         BUILD / "dex",
         *class_files,

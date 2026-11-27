@@ -680,7 +680,7 @@ fn smooth_clock_model(
     target_rate_ppb: i64,
 ) -> (i64, i64, i64) {
     let phase_error = target_offset_micros.saturating_sub(current_offset_micros);
-    if !initialized {
+    if !initialized || phase_error.abs() > MIPLAY_CLOCK_SNAP_PHASE_MICROS {
         return (target_offset_micros, target_rate_ppb, phase_error);
     }
     let phase_step = ((phase_error as f64 * MIPLAY_CLOCK_PHASE_SMOOTHING).round() as i64).clamp(
@@ -725,7 +725,6 @@ impl MiPlayPresentationClock {
         self.local_epoch.elapsed().as_micros().min(i64::MAX as u128) as i64
     }
 
-    #[cfg(not(target_os = "android"))]
     fn synchronized_server_now_micros(&self) -> Option<i64> {
         self.server_now(self.clock_model_snapshot()?)
     }
@@ -869,6 +868,7 @@ fn spawn_timer_synchronizer(
             }
 
             let mut sequence = 0_u32;
+            let mut completed_rounds = 0_u32;
             let mut estimator = TimerClockEstimator::new();
             while session_running.load(Ordering::Acquire)
                 && current_media_generation.load(Ordering::Acquire) == media_generation
@@ -892,23 +892,51 @@ fn spawn_timer_synchronizer(
                     sequence = sequence.wrapping_add(1);
                     let mut packet = [0_u8; MIPLAY_TIMER_PACKET_BYTES];
                     let client_send = clock.local_now_micros();
-                    packet[0..8].copy_from_slice(&client_send.to_le_bytes());
+                    let est_server = clock.synchronized_server_now_micros().unwrap_or(0);
+                    packet[0..8].copy_from_slice(&est_server.to_le_bytes());
+                    packet[8..16].copy_from_slice(&client_send.to_le_bytes());
                     packet[32..36].copy_from_slice(&sequence.to_le_bytes());
 
                     if socket.send(&packet).ok() != Some(packet.len()) {
                         continue;
                     }
-                    let mut response = [0_u8; MIPLAY_TIMER_PACKET_BYTES];
-                    let Ok(received) = socket.recv(&mut response) else {
-                        continue;
-                    };
-                    let client_receive = clock.local_now_micros();
-                    if received != response.len() {
-                        continue;
+                    let recv_deadline = Instant::now() + StdDuration::from_millis(350);
+                    let mut matched_sample = None;
+                    while Instant::now() < recv_deadline {
+                        let remaining = recv_deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let _ = socket.set_read_timeout(Some(remaining));
+                        let mut response = [0_u8; MIPLAY_TIMER_PACKET_BYTES];
+                        let Ok(received) = socket.recv(&mut response) else {
+                            break;
+                        };
+                        let client_receive = clock.local_now_micros();
+                        if received != response.len() {
+                            continue;
+                        }
+                        let resp_seq = u32::from_le_bytes([
+                            response[32],
+                            response[33],
+                            response[34],
+                            response[35],
+                        ]);
+                        if resp_seq != sequence {
+                            // Drain stale/delayed UDP replies from earlier sequences so the
+                            // receive queue never stays permanently off-by-one after a Wi-Fi hiccup.
+                            continue;
+                        }
+                        matched_sample = decode_timer_sample(
+                            &response,
+                            sequence,
+                            client_send,
+                            client_receive,
+                        )
+                        .map(|(offset, network_rtt)| (offset, network_rtt, client_receive));
+                        break;
                     }
-                    let Some((offset, network_rtt)) =
-                        decode_timer_sample(&response, sequence, client_send, client_receive)
-                    else {
+                    let Some((offset, network_rtt, client_receive)) = matched_sample else {
                         continue;
                     };
                     let local_midpoint_micros =
@@ -927,6 +955,7 @@ fn spawn_timer_synchronizer(
                     continue;
                 }
                 if let Some(estimate) = estimator.observe_round(&round_samples) {
+                    completed_rounds = completed_rounds.saturating_add(1);
                     let applied = clock.update_server_clock(estimate);
                     events(json!({
                         "event": "clock_synchronized",
@@ -942,13 +971,19 @@ fn spawn_timer_synchronizer(
                     }));
                 }
 
-                for _ in 0..MIPLAY_CLOCK_RESYNC_POLLS {
+                let resync_polls = if completed_rounds < MIPLAY_CLOCK_FAST_BURST_ROUNDS {
+                    MIPLAY_CLOCK_FAST_RESYNC_POLLS
+                } else {
+                    MIPLAY_CLOCK_RESYNC_POLLS
+                };
+                for _ in 0..resync_polls {
                     if !session_running.load(Ordering::Acquire)
                         || current_media_generation.load(Ordering::Acquire) != media_generation
                     {
                         return;
                     }
                     if force_sync.swap(false, Ordering::AcqRel) {
+                        completed_rounds = 0;
                         break;
                     }
                     thread::sleep(StdDuration::from_millis(MIPLAY_CLOCK_FORCE_POLL_MILLIS));
@@ -968,11 +1003,12 @@ fn decode_timer_sample(
     {
         return None;
     }
-    let server_send = i64::from_le_bytes(response[16..24].try_into().ok()?);
-    let server_receive = i64::from_le_bytes(response[24..32].try_into().ok()?);
+    let server_receive = i64::from_le_bytes(response[16..24].try_into().ok()?);
+    let server_send = i64::from_le_bytes(response[24..32].try_into().ok()?);
+    let server_proc = server_send.saturating_sub(server_receive).max(0);
     let network_rtt = client_receive
         .saturating_sub(client_send)
-        .saturating_sub(server_send.saturating_sub(server_receive));
+        .saturating_sub(server_proc);
     if !(0..=MIPLAY_CLOCK_MAX_RTT_MICROS).contains(&network_rtt) {
         return None;
     }
@@ -1919,12 +1955,7 @@ impl PcmQueue {
 
     #[cfg(not(target_os = "android"))]
     fn scheduled_playback_rate(&self, schedule_error_micros: f64, nominal_rate: f64) -> f64 {
-        if schedule_error_micros.abs() <= MIPLAY_SYNC_DEADBAND_MILLIS as f64 * 1_000.0 {
-            return nominal_rate;
-        }
-        let correction = (-schedule_error_micros / (MIPLAY_DRIFT_CORRECTION_SECONDS * 1_000_000.0))
-            .clamp(-MIPLAY_MAX_RATE_CORRECTION, MIPLAY_MAX_RATE_CORRECTION);
-        nominal_rate * (1.0 + correction)
+        scheduled_playback_rate_for_error(schedule_error_micros, nominal_rate)
     }
 
     fn front_pts_micros(&self) -> Option<f64> {
@@ -2235,6 +2266,17 @@ fn offset_buffer_frames(base: usize, offset_ms: i64) -> usize {
     base.saturating_add_signed(frames)
 }
 
+fn scheduled_playback_rate_for_error(schedule_error_micros: f64, nominal_rate: f64) -> f64 {
+    if !schedule_error_micros.is_finite()
+        || schedule_error_micros.abs() <= MIPLAY_SYNC_DEADBAND_MILLIS * 1_000.0
+    {
+        return nominal_rate;
+    }
+    let correction = (-schedule_error_micros / (MIPLAY_DRIFT_CORRECTION_SECONDS * 1_000_000.0))
+        .clamp(-MIPLAY_MAX_RATE_CORRECTION, MIPLAY_MAX_RATE_CORRECTION);
+    nominal_rate * (1.0 + correction)
+}
+
 fn offset_schedule_error_micros(error_micros: f64, offset_ms: i64) -> f64 {
     error_micros + offset_ms as f64 * 1_000.0
 }
@@ -2403,28 +2445,25 @@ const MIPLAY_SAMPLE_RATE_HZ: u32 = 48_000;
 const MIPLAY_RTP_CLOCK_HZ: u32 = 90_000;
 const MIPLAY_SOURCE_SAMPLE_RATE: usize = MIPLAY_SAMPLE_RATE_HZ as usize;
 const MIPLAY_SOURCE_CHANNELS: usize = 2;
-const MIPLAY_GROUP_PLAY_DELAY_MILLIS: usize = 800;
-const MIPLAY_MINIMUM_QUEUE_DELAY_MILLIS: usize = 650;
+const MIPLAY_GROUP_PLAY_DELAY_MILLIS: usize = 150;
+const MIPLAY_MINIMUM_QUEUE_DELAY_MILLIS: usize = 80;
 const MIPLAY_MAX_BUFFER_MILLIS: usize = 1_500;
 const MIPLAY_MAX_OUTPUT_LATENCY_MILLIS: f64 = 250.0;
-#[cfg(not(target_os = "android"))]
-const MIPLAY_SYNC_DEADBAND_MILLIS: usize = 2;
-#[cfg(not(target_os = "android"))]
-const MIPLAY_DRIFT_CORRECTION_SECONDS: f64 = 12.0;
-#[cfg(not(target_os = "android"))]
+const MIPLAY_SYNC_DEADBAND_MILLIS: f64 = 1.5;
+const MIPLAY_DRIFT_CORRECTION_SECONDS: f64 = 6.0;
 const MIPLAY_MAX_RATE_CORRECTION: f64 = 0.0025;
 #[cfg(target_os = "android")]
-const ANDROID_LATENCY_STARTUP_WAIT: StdDuration = StdDuration::from_millis(600);
+const ANDROID_LATENCY_STARTUP_WAIT: StdDuration = StdDuration::from_millis(150);
 #[cfg(target_os = "android")]
-const ANDROID_CLOCK_STARTUP_WAIT: StdDuration = StdDuration::from_millis(1_200);
+const ANDROID_CLOCK_STARTUP_WAIT: StdDuration = StdDuration::from_millis(250);
 #[cfg(target_os = "android")]
 const ANDROID_LATENCY_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
 #[cfg(target_os = "android")]
 const ANDROID_UNKNOWN_LATENCY_US: u64 = u64::MAX;
 #[cfg(target_os = "android")]
-const ANDROID_OUTPUT_BUFFER_MS: u32 = 50;
+const ANDROID_OUTPUT_BUFFER_MS: u32 = 16;
 #[cfg(any(target_os = "android", test))]
-const MIPLAY_ANDROID_PLAYOUT_RESERVE_FRAMES: usize = MIPLAY_SOURCE_SAMPLE_RATE * 96 / 1_000;
+const MIPLAY_ANDROID_PLAYOUT_RESERVE_FRAMES: usize = MIPLAY_SOURCE_SAMPLE_RATE * 24 / 1_000;
 const MIPLAY_PTS_DISCONTINUITY_MICROS: f64 = 100_000.0;
 const MIPLAY_INITIAL_LATE_DROP_MICROS: f64 = 2_000.0;
 const MIPLAY_RUNNING_LATE_DROP_MICROS: f64 = 25_000.0;
@@ -2432,16 +2471,19 @@ const MIPLAY_TIMER_PACKET_BYTES: usize = 40;
 const MIPLAY_CLOCK_SYNC_SAMPLES: usize = 10;
 const MIPLAY_CLOCK_FILTER_SAMPLES: usize = 10;
 const MIPLAY_CLOCK_FIT_HISTORY: usize = 32;
-const MIPLAY_CLOCK_MIN_FIT_ROUNDS: usize = 20;
-const MIPLAY_CLOCK_RESYNC_POLLS: usize = 50;
+const MIPLAY_CLOCK_MIN_FIT_ROUNDS: usize = 5;
+const MIPLAY_CLOCK_FAST_BURST_ROUNDS: u32 = 6;
+const MIPLAY_CLOCK_FAST_RESYNC_POLLS: usize = 3;
+const MIPLAY_CLOCK_RESYNC_POLLS: usize = 20;
 const MIPLAY_CLOCK_FORCE_POLL_MILLIS: u64 = 100;
-const MIPLAY_CLOCK_SAMPLE_INTERVAL_MILLIS: u64 = 10;
+const MIPLAY_CLOCK_SAMPLE_INTERVAL_MILLIS: u64 = 3;
 const MIPLAY_CLOCK_MAX_RTT_MICROS: i64 = 250_000;
-const MIPLAY_CLOCK_MIN_FIT_SPAN_MICROS: i64 = 5_000_000;
+const MIPLAY_CLOCK_MIN_FIT_SPAN_MICROS: i64 = 1_500_000;
 const MIPLAY_CLOCK_MAX_FREQUENCY_ERROR: f64 = 0.0005;
-const MIPLAY_CLOCK_PHASE_SMOOTHING: f64 = 0.25;
-const MIPLAY_CLOCK_RATE_SMOOTHING: f64 = 0.25;
-const MIPLAY_CLOCK_MAX_PHASE_STEP_MICROS: i64 = 5_000;
+const MIPLAY_CLOCK_PHASE_SMOOTHING: f64 = 0.35;
+const MIPLAY_CLOCK_RATE_SMOOTHING: f64 = 0.35;
+const MIPLAY_CLOCK_MAX_PHASE_STEP_MICROS: i64 = 8_000;
+const MIPLAY_CLOCK_SNAP_PHASE_MICROS: i64 = 15_000;
 const MIPLAY_AAC_FRAME_MICROS: f64 = 1024.0 * 1_000_000.0 / MIPLAY_SAMPLE_RATE_HZ as f64;
 const MIPLAY_LATENCY_REPORT_INTERVAL: StdDuration = StdDuration::from_millis(250);
 const MIPLAY_RTSP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
@@ -3122,7 +3164,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             }
         }
         let previous_playout = self.playout;
-        let leading_silence_frames = match self.playout.plan(
+        let mut leading_silence_frames = match self.playout.plan(
             queue,
             schedule_error_micros,
             synchronized_frames,
@@ -3156,8 +3198,30 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             self.last_reported_offset_ms = offset_ms;
             self.diagnostics.offset.store((offset_ms + 401) as u64, Ordering::Release);
         }
+        let mut active_schedule_error = schedule_error_micros;
+        if self.playout == (AndroidPlayout::Playing { sender_clock: true })
+            && previous_playout == (AndroidPlayout::Playing { sender_clock: true })
+            && let Some(mut err) = active_schedule_error
+        {
+            if should_hard_drop_late_frames(true, err, true) && queue.buffered_frames() > callback_reserve {
+                let late_frames = ((-err) * MIPLAY_SOURCE_SAMPLE_RATE as f64 / 1_000_000.0).floor() as usize;
+                let max_drop = queue.buffered_frames().saturating_sub(callback_reserve);
+                let dropped = queue.drop_frames(late_frames.min(max_drop));
+                err += dropped as f64 * 1_000_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
+            } else if err > MIPLAY_RUNNING_LATE_DROP_MICROS && leading_silence_frames == 0 {
+                let pad = ((err * f64::from(output_sample_rate) / 1_000_000.0).ceil() as usize)
+                    .min(callback_frames);
+                leading_silence_frames = pad;
+                err -= pad as f64 * 1_000_000.0 / f64::from(output_sample_rate);
+            }
+            active_schedule_error = Some(err);
+        }
         output[..leading_silence_frames].fill((0.0, 0.0));
-        let playback_rate = if self.playout == (AndroidPlayout::Playing { sender_clock: false })
+        let playback_rate = if self.playout == (AndroidPlayout::Playing { sender_clock: true })
+            && let Some(err) = active_schedule_error
+        {
+            scheduled_playback_rate_for_error(err, route_playback_rate)
+        } else if self.playout == (AndroidPlayout::Playing { sender_clock: false })
             && queue.buffered_frames() > callback_reserve
         {
             let excess = queue.buffered_frames() as f64 - synchronized_frames as f64;
@@ -3411,7 +3475,9 @@ fn open_android_miplay_stream(
         .filter(|rate| *rate > 0)
         .unwrap_or(MIPLAY_SAMPLE_RATE_HZ);
     output_sample_rate.store(actual_sample_rate, Ordering::Release);
-    let requested_frames = ((u64::from(actual_sample_rate) * u64::from(ANDROID_OUTPUT_BUFFER_MS) + 500) / 1_000) as i32;
+    let burst_frames = stream.get_frames_per_burst().max(96);
+    let target_frames = ((u64::from(actual_sample_rate) * u64::from(ANDROID_OUTPUT_BUFFER_MS) + 500) / 1_000) as i32;
+    let requested_frames = target_frames.max(burst_frames.saturating_mul(2));
     let buffer_result = stream.set_buffer_size_in_frames(requested_frames);
     let actual_frames = stream.get_buffer_size_in_frames();
     if let Ok(frames) = u32::try_from(actual_frames) {
@@ -4193,8 +4259,8 @@ mod tests {
     #[test]
     fn decodes_xiaomi_udp_timer_exchange() {
         let mut response = [0_u8; 40];
-        response[16..24].copy_from_slice(&140_i64.to_le_bytes());
-        response[24..32].copy_from_slice(&130_i64.to_le_bytes());
+        response[16..24].copy_from_slice(&130_i64.to_le_bytes());
+        response[24..32].copy_from_slice(&140_i64.to_le_bytes());
         response[32..36].copy_from_slice(&7_u32.to_le_bytes());
         assert_eq!(decode_timer_sample(&response, 7, 100, 180), Some((-5, 70)));
         assert_eq!(decode_timer_sample(&response, 8, 100, 180), None);

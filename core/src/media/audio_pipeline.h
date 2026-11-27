@@ -86,10 +86,10 @@ public:
 private:
     uint32_t sample_rate_ = 48000;
     size_t frame_samples_ = 480;
-    size_t preroll_frames_ = 1200;
-    size_t target_frames_ = 1920;
-    size_t low_water_frames_ = 768;
-    size_t high_water_frames_ = 3120;
+    size_t preroll_frames_ = 480;
+    size_t target_frames_ = 720;
+    size_t low_water_frames_ = 320;
+    size_t high_water_frames_ = 1440;
     size_t max_frames_ = 9600;
     bool primed_ = false;
     bool splice_pending_ = false;

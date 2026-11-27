@@ -25,12 +25,15 @@ export function initSenderController({
     captureBackend: "media_projection",
     shizukuAvailable: false,
     shizukuGranted: false,
+    adbDaemonActive: false,
+    adbPort: 5555,
+    adbLastError: "",
     muteLocalApp: false,
     muteLocalSupported: false,
     muteLocalHint: "",
     timerServicePort: 0,
     sampleRate: 48000,
-    basePlayDelayMs: 350,
+    basePlayDelayMs: 300,
     codec: "AAC_LC",
     masterVolume: 70,
     sourceMode: MODE_SYSTEM_LOOPBACK,
@@ -69,12 +72,26 @@ export function initSenderController({
 
   const sourceSegBtns = Array.from(document.querySelectorAll("#sender-source-seg button"));
   const appFilterRow = document.getElementById("sender-app-row");
-  const appSelect = document.getElementById("sender-app-select");
+  const appTriggerBtn = document.getElementById("sender-app-trigger");
+  const appTriggerText = document.getElementById("sender-app-trigger-text");
+  const appPickerBackdrop = document.getElementById("sender-app-picker-backdrop");
+  const appPickerClose = document.getElementById("sender-app-picker-close");
+  const appPickerList = document.getElementById("sender-app-picker-list");
+  const appSearchInput = document.getElementById("sender-app-search");
   const appRefreshBtn = document.getElementById("sender-app-refresh-btn");
   const muteLocalRow = document.getElementById("sender-mute-local-row");
   const muteLocalDesc = document.getElementById("sender-mute-local-desc");
   const muteLocalSwitch = document.getElementById("sender-mute-local-switch");
+  const adbBtn = document.getElementById("sender-adb-btn");
   const shizukuBtn = document.getElementById("sender-shizuku-btn");
+  const guardAdbDesc = document.getElementById("guard-adb-desc");
+  const guardAdbPort = document.getElementById("guard-adb-port");
+  const btnAdbConnect = document.getElementById("btn-adb-connect");
+  const btnAdbDisconnect = document.getElementById("btn-adb-disconnect");
+  const rowGuardShizuku = document.getElementById("row-guard-shizuku");
+  const guardShizukuDesc = document.getElementById("guard-shizuku-desc");
+  const guardShizukuIcon = document.getElementById("guard-shizuku-icon");
+  const rowDevSettings = document.getElementById("row-dev-settings");
   const projectionRow = document.getElementById("sender-projection-banner");
   const projectionBtn = document.getElementById("sender-projection-btn");
   const notifBanner = document.getElementById("sender-notif-banner");
@@ -119,7 +136,7 @@ export function initSenderController({
   const guardNotifDesc = document.getElementById("notif-access-desc");
   const guardNotifIcon = document.getElementById("notif-icon-box");
 
-  function rpcAsync(method, params = {}) {
+  function rpcAsync(method, params = {}, timeoutMs = 8000) {
     return new Promise((resolve) => {
       const id = "srpc_" + (rpcSeq++);
       const payload = JSON.stringify({ id, method, ...params });
@@ -131,7 +148,7 @@ export function initSenderController({
             pendingRpcs.delete(id);
             resolve({ error: "timeout" });
           }
-        }, 8000);
+        }, timeoutMs);
       } else if (window.SoundFlowBridge?.senderRpc) {
         try {
           const raw = window.SoundFlowBridge.senderRpc(payload);
@@ -396,21 +413,17 @@ export function initSenderController({
   }
 
   function syncAppSelectSelection() {
-    if (!appSelect) return;
-    const desiredVal = state.targetAppUid > 0 && state.targetAppPkg
-      ? `${state.targetAppUid}|${state.targetAppPkg}`
-      : "0";
-    const exists = Array.from(appSelect.options).some((opt) => opt.value === desiredVal);
-    if (exists) {
-      appSelect.value = desiredVal;
-    } else if (state.targetAppUid > 0 && state.targetAppPkg) {
-      const opt = document.createElement("option");
-      opt.value = desiredVal;
-      opt.textContent = `仅采集：${state.targetAppName || state.targetAppPkg}`;
-      appSelect.appendChild(opt);
-      appSelect.value = desiredVal;
+    if (!appTriggerText) return;
+    if (state.targetAppUid > 0 && state.targetAppPkg) {
+      const matched = installedApps.find((a) => a.uid === state.targetAppUid && a.packageName === state.targetAppPkg);
+      const label = state.targetAppName || matched?.label || state.targetAppPkg;
+      const prefix = matched?.playing ? "🔊 " : "仅发送：";
+      appTriggerText.textContent = `${prefix}${label}`;
     } else {
-      appSelect.value = "0";
+      const playingCount = installedApps.filter((a) => !!a.playing).length;
+      appTriggerText.textContent = playingCount > 0
+        ? `全部媒体应用（${playingCount} 个发声中 · 点此选择）`
+        : "全部媒体应用（点此选择或搜索）";
     }
   }
 
@@ -445,21 +458,33 @@ export function initSenderController({
     }
     syncAppSelectSelection();
 
-    const isDirectPrivileged = state.captureBackend === "privileged_policy" || state.captureBackend === "shizuku";
+    const isDirectPrivileged = state.captureBackend === "privileged_policy"
+      || state.captureBackend === "wireless_adb"
+      || state.captureBackend === "shizuku";
+    const isAndroidHost = window.SoundFlowBridge?.platform !== "win32";
     if (muteLocalRow) {
       muteLocalRow.style.display = state.sourceMode === MODE_SYSTEM_LOOPBACK ? "flex" : "none";
     }
     if (muteLocalSwitch) {
       muteLocalSwitch.setAttribute("aria-checked", String(!!state.muteLocalApp));
-      muteLocalSwitch.disabled = !state.muteLocalSupported && !state.muteLocalApp;
+      muteLocalSwitch.disabled = !isAndroidHost && !state.muteLocalSupported && !state.muteLocalApp;
+    }
+    if (adbBtn) {
+      const showAdb = isAndroidHost && state.captureBackend !== "privileged_policy";
+      adbBtn.style.display = showAdb ? "inline-flex" : "none";
+      adbBtn.textContent = state.adbDaemonActive ? "ADB 直抓已就绪" : "无线 ADB 免投屏";
     }
     if (shizukuBtn) {
-      const showShizuku = !isDirectPrivileged && !!state.shizukuAvailable && !state.shizukuGranted && state.captureBackend === "media_projection";
+      const showShizuku = isAndroidHost && !isDirectPrivileged && !!state.shizukuAvailable && !state.shizukuGranted;
       shizukuBtn.style.display = showShizuku ? "inline-flex" : "none";
     }
     if (muteLocalDesc) {
       if (isDirectPrivileged) {
-        const badge = state.captureBackend === "privileged_policy" ? "系统特权直抓 · 免投屏" : "Shizuku 直抓 · 免投屏";
+        const badge = state.captureBackend === "privileged_policy"
+          ? "系统特权直抓 · 免投屏"
+          : state.captureBackend === "wireless_adb"
+            ? "无线 ADB 直抓 · 免投屏"
+            : "Shizuku 直抓 · 免投屏";
         muteLocalDesc.textContent = singleAppActive
           ? `${badge} · 仅在全屋音箱发声，本机其他应用照常外放`
           : `${badge} · 开启后拦截媒体外放仅走全屋音箱`;
@@ -468,7 +493,37 @@ export function initSenderController({
           ? "仅在全屋音箱发声，电脑本地其他应用照常外放"
           : "需选择单个目标应用后可仅对该应用开启本机消音";
       } else {
-        muteLocalDesc.textContent = state.muteLocalHint || "当前环境暂不支持单应用本机独立消音";
+        muteLocalDesc.textContent = state.muteLocalHint || "点击「无线 ADB 免投屏」连接本机调试端口即可开启单应用本机消音";
+      }
+    }
+    if (guardAdbDesc) {
+      if (state.adbDaemonActive) {
+        guardAdbDesc.textContent = `已激活 · 正在通过本机无线 ADB (127.0.0.1:${state.adbPort || 5555}) 提供 UID 2000 免投屏单应用静音抓音`;
+      } else if (state.adbLastError) {
+        guardAdbDesc.textContent = state.adbLastError;
+      } else {
+        guardAdbDesc.textContent = "未连接 · 点击「连接激活」直连本机无线 ADB 端口（首次会弹出系统调试授权框，勾选一律允许即可）";
+      }
+    }
+    if (guardAdbPort && document.activeElement !== guardAdbPort && state.adbPort > 0) {
+      guardAdbPort.value = String(state.adbPort);
+    }
+    if (btnAdbConnect) {
+      btnAdbConnect.textContent = state.adbDaemonActive ? "重新连接" : "连接激活";
+    }
+    if (btnAdbDisconnect) {
+      btnAdbDisconnect.style.display = state.adbDaemonActive ? "inline-flex" : "none";
+    }
+    if (guardShizukuDesc && guardShizukuIcon) {
+      if (state.shizukuGranted) {
+        guardShizukuDesc.textContent = "已授权 · Shizuku 免投屏直抓通道可用";
+        guardShizukuIcon.className = "row-icon green";
+      } else if (state.shizukuAvailable) {
+        guardShizukuDesc.textContent = "已检测到 Shizuku 服务 · 点击发起授权";
+        guardShizukuIcon.className = "row-icon orange";
+      } else {
+        guardShizukuDesc.textContent = "未检测到运行中的 Shizuku；已优先推荐使用上方内置无线 ADB 直连";
+        guardShizukuIcon.className = "row-icon";
       }
     }
 
@@ -531,7 +586,7 @@ export function initSenderController({
     if (baseDelaySlider && !seekingBaseDelay && typeof state.basePlayDelayMs === "number") {
       baseDelaySlider.value = String(state.basePlayDelayMs);
       if (baseDelayVal) baseDelayVal.textContent = state.basePlayDelayMs + " ms";
-      setSliderFill(baseDelaySlider, ((state.basePlayDelayMs - 100) / 900) * 100);
+      setSliderFill(baseDelaySlider, ((state.basePlayDelayMs - 40) / 760) * 100);
     }
     if (guardNotifDesc && guardNotifIcon && window.SoundFlowBridge?.platform !== "win32") {
       guardNotifDesc.textContent = state.notificationAccessGranted
@@ -544,26 +599,119 @@ export function initSenderController({
     onSenderStateChanged?.(state);
   }
 
+  function closeAppPicker() {
+    appPickerBackdrop?.classList.remove("open");
+  }
+
+  async function selectTargetApp(uid, pkg, label) {
+    closeAppPicker();
+    if (uid <= 0 || !pkg) {
+      const res = await rpcAsync("source.setTargetApp", { uid: -1, packageName: "", label: "" });
+      if (res?.error) { syncAppSelectSelection(); showToast(res.error); return; }
+      showToast("已切换为全局媒体内录（发送全部媒体声音）");
+      return;
+    }
+    const res = await rpcAsync("source.setTargetApp", { uid, packageName: pkg, label });
+    if (res?.error) { syncAppSelectSelection(); showToast(res.error); return; }
+    showToast(`已锁定仅发送「${label}」的声音`);
+  }
+
+  function renderInstalledAppOptions() {
+    syncAppSelectSelection();
+    if (!appPickerList) return;
+    const kw = (appSearchInput?.value || "").trim().toLowerCase();
+    const filtered = kw
+      ? installedApps.filter((a) =>
+          (a.label || "").toLowerCase().includes(kw)
+          || (a.packageName || "").toLowerCase().includes(kw))
+      : installedApps;
+
+    appPickerList.innerHTML = "";
+
+    const makeItem = ({ title, sub, selected, playing, onClick }) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "app-picker-item" + (selected ? " selected" : "");
+      btn.innerHTML = `
+        <div class="app-picker-item-copy">
+          <div class="app-picker-item-title"></div>
+          <div class="app-picker-item-sub"></div>
+        </div>
+        ${playing ? '<span class="app-picker-badge">正在发声</span>' : ""}
+      `;
+      btn.querySelector(".app-picker-item-title").textContent = title;
+      btn.querySelector(".app-picker-item-sub").textContent = sub;
+      btn.addEventListener("click", onClick);
+      return btn;
+    };
+
+    if (!kw) {
+      appPickerList.appendChild(makeItem({
+        title: "全部媒体应用（全局内录）",
+        sub: "自动排除本应用回声，转发手机所有媒体声音",
+        selected: !(state.targetAppUid > 0),
+        playing: false,
+        onClick: () => selectTargetApp(-1, "", ""),
+      }));
+    }
+
+    const playingApps = filtered.filter((a) => !!a.playing);
+    const otherApps = filtered.filter((a) => !a.playing);
+
+    if (playingApps.length > 0) {
+      const hdr = document.createElement("div");
+      hdr.className = "app-picker-section";
+      hdr.textContent = `正在发声的应用 (${playingApps.length})`;
+      appPickerList.appendChild(hdr);
+      for (const app of playingApps) {
+        const isSel = state.targetAppUid === app.uid && state.targetAppPkg === app.packageName;
+        appPickerList.appendChild(makeItem({
+          title: app.label || app.packageName,
+          sub: app.packageName,
+          selected: isSel,
+          playing: true,
+          onClick: () => selectTargetApp(app.uid, app.packageName, app.label || app.packageName),
+        }));
+      }
+    }
+
+    if (otherApps.length > 0) {
+      const hdr = document.createElement("div");
+      hdr.className = "app-picker-section";
+      hdr.textContent = kw ? `搜索结果 (${otherApps.length})` : `全部已安装应用 (${otherApps.length})`;
+      appPickerList.appendChild(hdr);
+      for (const app of otherApps) {
+        const isSel = state.targetAppUid === app.uid && state.targetAppPkg === app.packageName;
+        appPickerList.appendChild(makeItem({
+          title: app.label || app.packageName,
+          sub: app.packageName,
+          selected: isSel,
+          playing: false,
+          onClick: () => selectTargetApp(app.uid, app.packageName, app.label || app.packageName),
+        }));
+      }
+    }
+
+    if (kw && filtered.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "app-picker-section";
+      empty.textContent = `未找到匹配「${kw}」的应用`;
+      appPickerList.appendChild(empty);
+    }
+  }
+
   async function refreshInstalledApps(notify = false) {
     const res = await rpcAsync("app.listAudioApps");
     if (res?.error && notify) showToast(res.error);
-    if (!Array.isArray(res?.result) || !appSelect) return;
+    if (!Array.isArray(res?.result)) return;
     installedApps = res.result;
-    appSelect.innerHTML = "";
-    const allOpt = document.createElement("option");
-    allOpt.value = "0";
-    allOpt.textContent = "全部媒体应用（全局内录 · 自动排除本应用回声）";
-    appSelect.appendChild(allOpt);
-
-    for (const app of installedApps) {
-      const opt = document.createElement("option");
-      opt.value = `${app.uid}|${app.packageName}`;
-      opt.dataset.label = app.label;
-      opt.textContent = `仅发送：${app.label} (${app.packageName})`;
-      appSelect.appendChild(opt);
+    renderInstalledAppOptions();
+    if (notify) {
+      const playingCount = installedApps.filter((a) => !!a.playing).length;
+      showToast(playingCount > 0
+        ? `已刷新 ${installedApps.length} 个应用，置顶 ${playingCount} 个正在发声的应用`
+        : `已加载本机 ${installedApps.length} 个应用`);
     }
-    syncAppSelectSelection();
-    if (notify) showToast(`已加载本机 ${installedApps.length} 个应用`);
   }
 
   async function refreshInterfaces() {
@@ -600,28 +748,51 @@ export function initSenderController({
     });
   });
 
-  appSelect?.addEventListener("change", async () => {
-    const val = appSelect.value || "0";
-    if (val === "0" || !val.includes("|")) {
-      const res = await rpcAsync("source.setTargetApp", { uid: -1, packageName: "", label: "" });
-      if (res?.error) { syncAppSelectSelection(); showToast(res.error); return; }
-      showToast("已切换为全局媒体内录（发送全部媒体声音）");
-      return;
-    }
-    const sep = val.indexOf("|");
-    const uid = Number(val.slice(0, sep)) || -1;
-    const pkg = val.slice(sep + 1);
-    const matched = installedApps.find((a) => a.uid === uid && a.packageName === pkg);
-    const label = matched?.label || pkg;
-    const res = await rpcAsync("source.setTargetApp", { uid, packageName: pkg, label });
-    if (res?.error) { syncAppSelectSelection(); showToast(res.error); return; }
-    showToast(`已锁定仅发送「${label}」的声音`);
+  appTriggerBtn?.addEventListener("click", async () => {
+    if (appSearchInput) appSearchInput.value = "";
+    appPickerBackdrop?.classList.add("open");
+    renderInstalledAppOptions();
+    await refreshInstalledApps(false);
+    setTimeout(() => appSearchInput?.focus(), 60);
+  });
+
+  appPickerClose?.addEventListener("click", closeAppPicker);
+  appPickerBackdrop?.addEventListener("click", (e) => {
+    if (e.target === appPickerBackdrop) closeAppPicker();
+  });
+
+  appSearchInput?.addEventListener("input", () => {
+    renderInstalledAppOptions();
   });
 
   appRefreshBtn?.addEventListener("click", () => refreshInstalledApps(true));
 
+  async function connectWirelessAdb(enableMute = false) {
+    const port = Number(guardAdbPort?.value || state.adbPort || 5555) || 5555;
+    showToast(`正在连接本机无线 ADB (127.0.0.1:${port})，如弹出调试授权请点允许…`);
+    const res = await rpcAsync("adb.connect", { port, enableMute }, 40000);
+    if (res?.error) {
+      showToast(res.error);
+      return false;
+    }
+    if (res?.result) {
+      state = { ...state, ...res.result };
+      renderState();
+    }
+    refreshInstalledApps(false);
+    const boundHint = state.targetAppUid > 0 && state.targetAppName
+      ? ` · 已自动锁定「${state.targetAppName}」`
+      : "";
+    showToast((enableMute ? "无线 ADB 已激活并开启本机静音投送源" : "无线 ADB 特权免投屏通道已激活") + boundHint);
+    return true;
+  }
+
   muteLocalSwitch?.addEventListener("click", async () => {
     const next = !state.muteLocalApp;
+    if (next && !state.muteLocalSupported && window.SoundFlowBridge?.platform !== "win32") {
+      await connectWirelessAdb(true);
+      return;
+    }
     muteLocalSwitch.setAttribute("aria-checked", String(next));
     const res = await rpcAsync("source.setMuteLocalApp", { muteLocalApp: next });
     if (res?.error) {
@@ -632,6 +803,33 @@ export function initSenderController({
     showToast(next ? "已开启本机静音投送源" : "已恢复本机同响");
   });
 
+  adbBtn?.addEventListener("click", () => {
+    connectWirelessAdb(false);
+  });
+
+  btnAdbConnect?.addEventListener("click", () => {
+    connectWirelessAdb(false);
+  });
+
+  btnAdbDisconnect?.addEventListener("click", async () => {
+    const res = await rpcAsync("adb.disconnect");
+    if (res?.result) {
+      state = { ...state, ...res.result };
+      renderState();
+    }
+    showToast("已断开无线 ADB 特权音频守护进程");
+  });
+
+  rowGuardShizuku?.addEventListener("click", async () => {
+    const res = await rpcAsync("shizuku.requestPermission");
+    if (res?.error) showToast(res.error);
+    else showToast("已发起 Shizuku 授权请求");
+  });
+
+  rowDevSettings?.addEventListener("click", () => {
+    window.SoundFlowBridge?.openDeveloperSettings?.();
+  });
+
   shizukuBtn?.addEventListener("click", async () => {
     const res = await rpcAsync("shizuku.requestPermission");
     if (res?.error) showToast(res.error);
@@ -639,7 +837,7 @@ export function initSenderController({
   });
 
   projectionBtn?.addEventListener("click", () => {
-    rpcAsync("source.setMode", { mode: MODE_SYSTEM_LOOPBACK });
+    rpcAsync("source.setMode", { mode: MODE_SYSTEM_LOOPBACK, requestProjection: true });
   });
 
   notifBtn?.addEventListener("click", () => {
@@ -737,7 +935,7 @@ export function initSenderController({
     baseDelaySlider.addEventListener("input", () => {
       const v = Number(baseDelaySlider.value);
       if (baseDelayVal) baseDelayVal.textContent = v + " ms";
-      setSliderFill(baseDelaySlider, ((v - 100) / 900) * 100);
+      setSliderFill(baseDelaySlider, ((v - 40) / 760) * 100);
     });
     baseDelaySlider.addEventListener("change", () => {
       seekingBaseDelay = false;
@@ -746,10 +944,10 @@ export function initSenderController({
     baseDelaySlider.addEventListener("pointercancel", () => { seekingBaseDelay = false; });
   }
   baseDelayReset?.addEventListener("click", () => {
-    if (baseDelaySlider) baseDelaySlider.value = "350";
-    if (baseDelayVal) baseDelayVal.textContent = "350 ms";
-    if (baseDelaySlider) setSliderFill(baseDelaySlider, ((350 - 100) / 900) * 100);
-    rpcAsync("sync.setBaseDelay", { delayMs: 350 });
+    if (baseDelaySlider) baseDelaySlider.value = "300";
+    if (baseDelayVal) baseDelayVal.textContent = "300 ms";
+    if (baseDelaySlider) setSliderFill(baseDelaySlider, ((300 - 40) / 760) * 100);
+    rpcAsync("sync.setBaseDelay", { delayMs: 300 });
   });
 
   bindIpSelect?.addEventListener("change", async () => {
@@ -817,7 +1015,7 @@ export function initSenderController({
           }
         });
         refreshInterfaces();
-        if (!installedApps.length) refreshInstalledApps(false);
+        refreshInstalledApps(false);
       }
     },
   };

@@ -83,9 +83,11 @@ void MasterMediaClock::catch_up_to_now(uint32_t frame_samples, uint64_t now_us) 
     if (origin_us_ == 0 || now_us <= origin_us_) return;
     const uint64_t elapsed_us = now_us - origin_us_;
     const uint64_t expected_samples = (elapsed_us * sample_rate_) / 1000000ULL;
-    // 稳态允许 3 帧以内的微抖裕量；一旦因声卡重路由或系统卡顿滞后超过 3 帧，立即按整帧边界追齐墙钟
-    const uint64_t tolerance = static_cast<uint64_t>(frame_samples) * 3ULL;
+    // 稳态允许 2 帧以内微抖；一旦滞后或超前超过 2 帧，立即按整帧边界双向锚定墙钟，防止 PTS 与 TimerService 漂移
+    const uint64_t tolerance = static_cast<uint64_t>(frame_samples) * 2ULL;
     if (expected_samples > total_samples_ + tolerance) {
+        total_samples_ = (expected_samples / frame_samples) * frame_samples;
+    } else if (total_samples_ > expected_samples + tolerance) {
         total_samples_ = (expected_samples / frame_samples) * frame_samples;
     }
 }

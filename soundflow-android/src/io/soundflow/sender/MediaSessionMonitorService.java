@@ -139,6 +139,42 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
         return true;
     }
 
+    public static java.util.Set<String> getActivePlayingPackages(Context ctx) {
+        java.util.Set<String> pkgs = new java.util.LinkedHashSet<>();
+        String selfPkg = ctx != null ? ctx.getPackageName() : "";
+        MediaSessionMonitorService svc = activeInstance;
+        if (svc != null) {
+            for (TrackedController tc : svc.tracked) {
+                try {
+                    if (tc == null || tc.controller == null) continue;
+                    String pkg = tc.controller.getPackageName();
+                    if (pkg == null || pkg.isEmpty() || pkg.equals(selfPkg)) continue;
+                    PlaybackState ps = tc.controller.getPlaybackState();
+                    if (ps != null && ps.getState() == PlaybackState.STATE_PLAYING) {
+                        pkgs.add(pkg);
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        if (ctx != null && hasPrivilegedMediaControl(ctx)) {
+            try {
+                MediaSessionManager msm = (MediaSessionManager) ctx.getSystemService(Context.MEDIA_SESSION_SERVICE);
+                if (msm != null) {
+                    for (MediaController c : msm.getActiveSessions(null)) {
+                        if (c == null) continue;
+                        String pkg = c.getPackageName();
+                        if (pkg == null || pkg.isEmpty() || pkg.equals(selfPkg)) continue;
+                        PlaybackState ps = c.getPlaybackState();
+                        if (ps != null && ps.getState() == PlaybackState.STATE_PLAYING) {
+                            pkgs.add(pkg);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        return pkgs;
+    }
+
     public static void pollCurrentPosition(Context ctx) {
         MediaSessionMonitorService svc = activeInstance;
         if (svc != null) {

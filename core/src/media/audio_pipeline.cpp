@@ -961,15 +961,15 @@ void StereoDownmixer::convert(const uint8_t* input, size_t frames, int16_t* outp
 void SmoothLoopbackFifo::reset(uint32_t sample_rate, size_t frame_samples) {
     sample_rate_ = sample_rate > 0 ? sample_rate : 48000;
     frame_samples_ = frame_samples > 0 ? frame_samples : 480;
-    // 建立充足的防抖水位（~45ms 目标中心），吸收 WASAPI 10ms 分包边界与 OS 调度微抖，避免误抽干
-    const size_t ms20 = (static_cast<size_t>(sample_rate_) * 20) / 1000;
-    const size_t ms45 = (static_cast<size_t>(sample_rate_) * 45) / 1000;
-    const size_t ms30 = (static_cast<size_t>(sample_rate_) * 30) / 1000;
+    // 低延迟防抖水位（~15ms 目标中心），压低发送端隐性采集延迟同时平滑吸收 10ms 分包抖动
+    const size_t ms5  = (static_cast<size_t>(sample_rate_) * 5) / 1000;
+    const size_t ms8  = (static_cast<size_t>(sample_rate_) * 8) / 1000;
     const size_t ms10 = (static_cast<size_t>(sample_rate_) * 10) / 1000;
-    preroll_frames_    = frame_samples_ + ms20;
-    target_frames_     = std::max(frame_samples_ * 2, ms45);
-    low_water_frames_  = frame_samples_ + ms10;
-    high_water_frames_ = target_frames_ + ms30;
+    const size_t ms15 = (static_cast<size_t>(sample_rate_) * 15) / 1000;
+    preroll_frames_    = std::max(frame_samples_, ms10);
+    target_frames_     = std::max(frame_samples_ + ms5, ms15);
+    low_water_frames_  = std::max(frame_samples_, ms8);
+    high_water_frames_ = target_frames_ + ms15;
     max_frames_        = std::max(high_water_frames_ + frame_samples_ * 2, static_cast<size_t>(sample_rate_) / 4);
     primed_ = false;
     splice_pending_ = false;
