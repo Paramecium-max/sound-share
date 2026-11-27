@@ -18,6 +18,7 @@ function parseLrc(content) {
 
 export function attachDesktopStage(bridge, stage, app) {
   if (bridge?.platform !== "win32") return;
+  document.documentElement.classList.add("soundflow-windows");
   document.documentElement.dataset.soundflowPlatform = "windows";
   const theme = matchMedia("(prefers-color-scheme: dark)");
   const syncTheme = () => app.setSafeInsets(12, 0, 12, 0, theme.matches);
