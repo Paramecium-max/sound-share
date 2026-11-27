@@ -218,11 +218,12 @@ function buildWordsForLine(text, startMs, endMs) {
   const hasCjk = /[\u4e00-\u9fff\u3040-\u30ff]/.test(trimmed);
   const tokens = hasCjk ? Array.from(trimmed) : trimmed.split(/(\s+)/).filter(Boolean);
   const count = Math.max(1, tokens.length);
-  const span = Math.max(400, safeEnd - safeStart);
+  const span = Math.max(1, safeEnd - safeStart);
   const step = span / count;
   return tokens.map((tok, i) => {
-    const ws = Math.round(safeStart + i * step);
-    const we = i + 1 === count ? safeEnd : Math.max(ws + 40, Math.round(safeStart + (i + 1) * step));
+    const ws = Math.min(safeEnd, Math.max(safeStart, Math.round(safeStart + i * step)));
+    const rawWe = i + 1 === count ? safeEnd : Math.round(safeStart + (i + 1) * step);
+    const we = Math.min(safeEnd, Math.max(ws, rawWe));
     return {
       word: tok,
       romanWord: "",
@@ -841,7 +842,7 @@ window.SoundFlowStage = {
     const v = Number(level);
     audioEnergy = Number.isFinite(v) ? Math.max(0, Math.min(1, v * 1.45)) : 0;
     const p = Number(posMs);
-    if (Number.isFinite(p) && p >= 0) {
+    if (Number.isFinite(p) && p >= 0 && (!fullLrcActive || Math.abs(p - currentTimeMs) >= 600)) {
       currentTimeMs = p;
     }
     processSpectrumOnset(audioEnergy, Number(bass) || 0, Number(mid) || 0, Number(high) || 0, preview);
@@ -898,8 +899,6 @@ window.SoundFlowStage = {
         this.syncPosition(currentPosMs, false);
         return;
       }
-      fullLyricSignature = signature;
-      fullLrcActive = true;
       lastMatchedLrcIdx = -1;
       pendingLineQueue = [];
       modeBadgeEl.textContent = modeLabel || "完整同步歌词";
@@ -921,10 +920,12 @@ window.SoundFlowStage = {
       fullLrcLines = mapped;
       const pos = Math.max(0, Number(currentPosMs) || 0);
       currentTimeMs = pos;
-      updateRendererModeClass();
       const eff = Math.round(effectiveClockMs());
       lyricPlayer.setLyricLines(mapped, eff);
       lyricPlayer.setCurrentTime(eff, true);
+      fullLyricSignature = signature;
+      fullLrcActive = true;
+      updateRendererModeClass();
       if (isPlaying) lyricPlayer.update(16 * animSpeed);
       rebuildSmoothRailDom();
       scheduleStageRelayout();
@@ -935,7 +936,9 @@ window.SoundFlowStage = {
 
   syncPosition(positionMs, seek) {
     const p = Math.max(0, Number(positionMs) || 0);
-    const forceSeek = Boolean(seek) || Math.abs(p - currentTimeMs) >= 1200;
+    const drift = Math.abs(p - currentTimeMs);
+    if (!seek && fullLrcActive && drift < 600) return;
+    const forceSeek = Boolean(seek) || drift >= 2000;
     currentTimeMs = p;
     if (usingNativeAmll()) {
       try {
