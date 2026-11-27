@@ -921,12 +921,13 @@ window.SoundFlowStage = {
       const pos = Math.max(0, Number(currentPosMs) || 0);
       currentTimeMs = pos;
       const eff = Math.round(effectiveClockMs());
+      lyricPlayer.resetScroll?.();
       lyricPlayer.setLyricLines(mapped, eff);
       lyricPlayer.setCurrentTime(eff, true);
       fullLyricSignature = signature;
       fullLrcActive = true;
       updateRendererModeClass();
-      if (isPlaying) lyricPlayer.update(16 * animSpeed);
+      lyricPlayer.update(0);
       rebuildSmoothRailDom();
       scheduleStageRelayout();
     } catch (e) {
@@ -939,11 +940,15 @@ window.SoundFlowStage = {
     const drift = Math.abs(p - currentTimeMs);
     if (!seek && fullLrcActive && drift < 600) return;
     const forceSeek = Boolean(seek) || drift >= 2000;
+    if (forceSeek) {
+      console.warn(`SF_LRC_SYNC pos=${p} prev=${Math.round(currentTimeMs)} seek=${forceSeek} lines=${fullLrcLines.length}`);
+    }
     currentTimeMs = p;
     if (usingNativeAmll()) {
       try {
+        if (forceSeek) lyricPlayer.resetScroll?.();
         lyricPlayer.setCurrentTime(Math.round(effectiveClockMs()), forceSeek);
-        if (isPlaying || forceSeek) lyricPlayer.update(forceSeek ? 0 : 16 * animSpeed);
+        if (forceSeek) lyricPlayer.update(0);
       } catch (_) {}
     } else {
       syncSmoothRailHighlight(forceSeek);

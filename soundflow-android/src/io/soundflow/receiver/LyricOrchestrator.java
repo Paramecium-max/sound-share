@@ -75,6 +75,7 @@ public final class LyricOrchestrator {
     private String lastLrcPayload = "";
     private String lastArtworkSignature = "";
     private String rememberedTrackTitle = "";
+    private String rememberedTrackArtist = "";
     private String rememberedTrackAlbum = "";
     private long rememberedTrackDurSec = -1;
     private long songStartElapsedMs = 0;
@@ -233,7 +234,7 @@ public final class LyricOrchestrator {
 
     private String audioMeterArguments(float peak, long positionMs, int spectrumPacked) {
         long posArg = -1L;
-        if (hasFullLrcForCurrentSong && positionMs > 0
+        if (hasFullLrcForCurrentSong && !useSenderClock && positionMs > 0
                 && Math.abs(positionMs - currentPlaybackPosition()) >= 320L) {
             playbackPositionMs = positionMs;
             positionAnchorElapsedMs = SystemClock.elapsedRealtime();
@@ -288,6 +289,8 @@ public final class LyricOrchestrator {
         String cleanTitle = safeTrim(rawTitle);
         String cleanArtist = safeTrim(rawArtist);
         String cleanAlbum = safeTrim(rawAlbum);
+        boolean isInternalProcessAlbum = cleanAlbum.startsWith("process:") || cleanAlbum.startsWith("wav:");
+        if (isInternalProcessAlbum) cleanAlbum = "";
         long durSec = durationMs / 1000L;
         if (cleanTitle.isEmpty() && cleanArtist.isEmpty() && cleanAlbum.isEmpty()) return;
 
@@ -295,10 +298,23 @@ public final class LyricOrchestrator {
         String artistName;
         String activeLine = !isEmpty(explicitLyricLine) ? explicitLyricLine.trim() : "";
 
-        // Xiaomi players commonly push the active lyric sentence in `title` while
-        // encoding `<SongTitle>-<ArtistName>` in `artist` and/or keeping song name in `album`.
-        int dashSplit = "xiaomi".equals(protocol) ? findSongArtistDash(cleanArtist) : -1;
-        if (!rememberedTrackTitle.isEmpty() && cleanArtist.startsWith(rememberedTrackTitle + "-")) {
+        // PC / SoundFlow / DLNA senders deliver clean track title/artist alongside explicit
+        // full LRC and/or lyricLine + positionMs. Never apply legacy Xiaomi phone heuristics
+        // (which repurpose `title` for live lyric sentences) to standard rich senders.
+        boolean isStandardRichSender = "dlna".equals(protocol)
+                || isInternalProcessAlbum
+                || !isEmpty(explicitLrc)
+                || !isEmpty(explicitLyricLine);
+
+        int dashSplit = (!isStandardRichSender && "xiaomi".equals(protocol)) ? findSongArtistDash(cleanArtist) : -1;
+        if (isStandardRichSender) {
+            songName = !cleanTitle.isEmpty() ? cleanTitle : cleanAlbum;
+            artistName = cleanArtist;
+            rememberedTrackTitle = songName;
+            rememberedTrackArtist = artistName;
+            rememberedTrackAlbum = cleanAlbum;
+            rememberedTrackDurSec = durSec;
+        } else if (!rememberedTrackTitle.isEmpty() && cleanArtist.startsWith(rememberedTrackTitle + "-")) {
             songName = rememberedTrackTitle;
             artistName = cleanArtist.substring(rememberedTrackTitle.length() + 1).trim();
             if (activeLine.isEmpty() && !cleanTitle.equalsIgnoreCase(songName)) activeLine = cleanTitle;
@@ -310,13 +326,17 @@ public final class LyricOrchestrator {
             songName = cleanArtist.substring(0, dashSplit).trim();
             artistName = cleanArtist.substring(dashSplit + 1).trim();
             rememberedTrackTitle = songName;
+            rememberedTrackArtist = artistName;
             rememberedTrackAlbum = cleanAlbum;
             rememberedTrackDurSec = durSec;
             if (activeLine.isEmpty()) activeLine = cleanTitle;
         } else if ("xiaomi".equals(protocol)
                 && !rememberedTrackTitle.isEmpty()
+                && durSec > 0
                 && durSec == rememberedTrackDurSec
+                && !cleanAlbum.isEmpty()
                 && cleanAlbum.equals(rememberedTrackAlbum)
+                && (rememberedTrackArtist.isEmpty() || cleanArtist.equalsIgnoreCase(rememberedTrackArtist))
                 && !cleanTitle.isEmpty()
                 && !cleanTitle.equalsIgnoreCase(rememberedTrackTitle)) {
             songName = rememberedTrackTitle;
@@ -324,6 +344,7 @@ public final class LyricOrchestrator {
             if (activeLine.isEmpty()) activeLine = cleanTitle;
         } else {
             rememberedTrackTitle = !cleanTitle.isEmpty() ? cleanTitle : cleanAlbum;
+            rememberedTrackArtist = cleanArtist;
             rememberedTrackAlbum = cleanAlbum;
             rememberedTrackDurSec = durSec;
             songName = rememberedTrackTitle;
