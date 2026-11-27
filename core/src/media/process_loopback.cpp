@@ -6,12 +6,16 @@
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <tlhelp32.h>
+#include <winver.h>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cwctype>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #endif
 
 namespace miplay::media {
@@ -101,12 +105,74 @@ std::wstring process_path(uint32_t pid) {
     return wide;
 }
 
+std::string wide_to_utf8_str(std::wstring_view wide) {
+    if (wide.empty()) return {};
+    const auto bytes = WideCharToMultiByte(
+        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return {};
+    std::string result(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(
+        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), result.data(), bytes, nullptr, nullptr);
+    return result;
+}
+
 std::string process_image(std::wstring wide) {
     wide.erase(0, wide.find_last_of(L"\\/") + 1);
-    const auto bytes = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
-    std::string result(bytes, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), result.data(), bytes, nullptr, nullptr);
-    return result;
+    return wide_to_utf8_str(wide);
+}
+
+std::string process_friendly_label(const std::wstring& full_path, const std::string& fallback_image) {
+    DWORD dummy = 0;
+    const DWORD info_size = GetFileVersionInfoSizeW(full_path.c_str(), &dummy);
+    if (info_size > 0 && info_size <= 1024 * 1024) {
+        std::vector<uint8_t> ver_buf(info_size);
+        if (GetFileVersionInfoW(full_path.c_str(), 0, info_size, ver_buf.data())) {
+            struct LangAndCodePage { WORD language; WORD code_page; };
+            std::vector<std::wstring> prefixes;
+            LangAndCodePage* trans = nullptr;
+            UINT trans_bytes = 0;
+            if (VerQueryValueW(ver_buf.data(), L"\\VarFileInfo\\Translation",
+                               reinterpret_cast<LPVOID*>(&trans), &trans_bytes) &&
+                trans && trans_bytes >= sizeof(LangAndCodePage)) {
+                const size_t count = trans_bytes / sizeof(LangAndCodePage);
+                for (size_t i = 0; i < count; ++i) {
+                    wchar_t hex[32]{};
+                    swprintf(hex, 32, L"%04x%04x", trans[i].language, trans[i].code_page);
+                    prefixes.emplace_back(hex);
+                }
+            }
+            for (const wchar_t* common : {L"080404b0", L"040904b0", L"040904e4", L"080403a8"}) {
+                if (std::find(prefixes.begin(), prefixes.end(), common) == prefixes.end()) {
+                    prefixes.emplace_back(common);
+                }
+            }
+            for (const wchar_t* field : {L"FileDescription", L"ProductName"}) {
+                for (const auto& lc : prefixes) {
+                    const std::wstring sub = L"\\StringFileInfo\\" + lc + L"\\" + field;
+                    LPWSTR val = nullptr;
+                    UINT val_chars = 0;
+                    if (VerQueryValueW(ver_buf.data(), sub.c_str(),
+                                       reinterpret_cast<LPVOID*>(&val), &val_chars) &&
+                        val && val_chars > 0) {
+                        std::wstring_view sv(val);
+                        if (const auto nul = sv.find(L'\0'); nul != std::wstring_view::npos) {
+                            sv = sv.substr(0, nul);
+                        }
+                        while (!sv.empty() && std::iswspace(sv.front())) sv.remove_prefix(1);
+                        while (!sv.empty() && std::iswspace(sv.back())) sv.remove_suffix(1);
+                        if (!sv.empty()) return wide_to_utf8_str(sv);
+                    }
+                }
+            }
+        }
+    }
+    if (fallback_image.size() > 4) {
+        const auto tail = fallback_image.substr(fallback_image.size() - 4);
+        if (tail == ".exe" || tail == ".EXE") {
+            return fallback_image.substr(0, fallback_image.size() - 4);
+        }
+    }
+    return fallback_image;
 }
 
 } // namespace
@@ -204,10 +270,16 @@ std::vector<AudioApp> list_audio_apps() {
             if (!parent || parent == root || _wcsicmp(path.c_str(), process_path(parent).c_str()) != 0) break;
             root = parent;
         }
-        if (roots.insert(root).second) apps.push_back({root, process_image(path)});
+        if (roots.insert(root).second) {
+            const auto root_path = (root == pid) ? path : process_path(root);
+            const auto& effective_path = root_path.empty() ? path : root_path;
+            auto img = process_image(effective_path);
+            auto lbl = process_friendly_label(effective_path, img);
+            apps.push_back({root, std::move(img), std::move(lbl)});
+        }
     }
     std::sort(apps.begin(), apps.end(), [](const AudioApp& a, const AudioApp& b) {
-        return a.image < b.image;
+        return a.label < b.label;
     });
 #endif
     return apps;

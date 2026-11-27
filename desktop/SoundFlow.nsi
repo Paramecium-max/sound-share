@@ -7,24 +7,14 @@ RequestExecutionLevel user
 SetCompressor zlib
 LoadLanguageFile "${NSISDIR}\Contrib\Language files\SimpChinese.nlf"
 
-Page directory
-Page instfiles
+!ifdef BUILD_UNINSTALLER
+!uninstfinalize '${CAPTURE_CMD} "%1" "${UNINST_OUT}"'
+Section
+  WriteUninstaller "$EXEDIR\Uninstall.exe"
+SectionEnd
+
 UninstPage uninstConfirm
 UninstPage instfiles
-
-Section
-  SetOutPath "$INSTDIR"
-  File /r "${STAGE}\*"
-  WriteUninstaller "$INSTDIR\Uninstall.exe"
-  CreateDirectory "$SMPROGRAMS\SoundFlow"
-  CreateShortCut "$SMPROGRAMS\SoundFlow\SoundFlow.lnk" "$INSTDIR\SoundFlow.exe"
-  WriteRegStr HKCU "Software\SoundFlow" "InstallDir" "$INSTDIR"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "DisplayName" "SoundFlow"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "UninstallString" '"$INSTDIR\Uninstall.exe"'
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "NoModify" 1
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "NoRepair" 1
-SectionEnd
 
 Section Uninstall
   Delete "$SMPROGRAMS\SoundFlow\SoundFlow.lnk"
@@ -54,3 +44,21 @@ Section Uninstall
   RMDir /r "$INSTDIR\resources"
   RMDir "$INSTDIR"
 SectionEnd
+!else
+Page directory
+Page instfiles
+
+Section
+  SetOutPath "$INSTDIR"
+  File /r "${STAGE}\*"
+  File "${UNINSTALLER_EXE}"
+  CreateDirectory "$SMPROGRAMS\SoundFlow"
+  CreateShortCut "$SMPROGRAMS\SoundFlow\SoundFlow.lnk" "$INSTDIR\SoundFlow.exe"
+  WriteRegStr HKCU "Software\SoundFlow" "InstallDir" "$INSTDIR"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "DisplayName" "SoundFlow"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "NoModify" 1
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoundFlow" "NoRepair" 1
+SectionEnd
+!endif

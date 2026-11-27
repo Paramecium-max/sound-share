@@ -73,6 +73,70 @@ pub fn reset_live_output_peak() {
     LIVE_OUTPUT_SPECTRUM_PACKED.store(0, Ordering::Relaxed);
 }
 
+/// Feeds decoded stereo PCM frames from an auxiliary renderer (such as desktop DLNA)
+/// into the shared lock-free output peak/3-band meter and beat-onset detector.
+pub fn report_external_output_pcm(
+    frames: &[(f32, f32)],
+    sample_rate: u32,
+    latency_ms: f64,
+    lp_state: &mut (f32, f32),
+) {
+    if frames.is_empty() {
+        return;
+    }
+    let sr = sample_rate.max(8_000) as f32;
+    let alpha_low = 1.0 - (-std::f32::consts::TAU * 250.0 / sr).exp();
+    let alpha_mid = 1.0 - (-std::f32::consts::TAU * 2000.0 / sr).exp();
+    let mut peak = 0.0_f32;
+    let (mut sum_low, mut sum_mid, mut sum_high) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for &(l, r) in frames {
+        let p = l.abs().max(r.abs());
+        if p.is_finite() && p > peak {
+            peak = p;
+        }
+        let mono = 0.5 * (l + r);
+        if !mono.is_finite() {
+            continue;
+        }
+        lp_state.0 += alpha_low * (mono - lp_state.0);
+        lp_state.1 += alpha_mid * (mono - lp_state.1);
+        let bass = lp_state.0;
+        let mid = lp_state.1 - lp_state.0;
+        let high = mono - lp_state.1;
+        sum_low += bass * bass;
+        sum_mid += mid * mid;
+        sum_high += high * high;
+    }
+    let clamped_peak = peak.clamp(0.0, 1.0);
+    LIVE_OUTPUT_PEAK_BITS.store(clamped_peak.to_bits(), Ordering::Relaxed);
+    let inv = 1.0 / frames.len() as f32;
+    let pack_band = |ms: f32, gain: f32| -> u32 {
+        let v = (ms * inv).sqrt().sqrt() * gain;
+        (v.clamp(0.0, 1.0) * 255.0).round() as u32
+    };
+    let p_b = ((clamped_peak.sqrt() * 255.0).round() as u32).min(255);
+    let b_b = pack_band(sum_low, 1.85).min(255);
+    let m_b = pack_band(sum_mid, 2.05).min(255);
+    let h_b = pack_band(sum_high, 2.35).min(255);
+    let mut prev = LIVE_OUTPUT_SPECTRUM_PACKED.load(Ordering::Relaxed);
+    for _ in 0..2 {
+        let next = ((prev >> 24).max(p_b) << 24)
+            | (((prev >> 16) & 0xff).max(b_b) << 16)
+            | (((prev >> 8) & 0xff).max(m_b) << 8)
+            | ((prev & 0xff).max(h_b));
+        match LIVE_OUTPUT_SPECTRUM_PACKED.compare_exchange(
+            prev,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(cur) => prev = cur,
+        }
+    }
+    crate::onset::tap_output(frames, sample_rate.max(8_000), latency_ms);
+}
+
 const POSITION_RESUME_SETTLING_WINDOW: StdDuration = StdDuration::from_millis(1_500);
 
 /**

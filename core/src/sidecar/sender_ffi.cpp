@@ -22,6 +22,7 @@ struct Sender {
     miplay::MultiRoomEngine engine;
 
     Sender() {
+        engine.set_reject_self_ip(true);
         engine.set_event_callback([this](const std::string& raw) {
             auto event = miplay::json::parse(raw);
             const auto* fields = std::get_if<miplay::json::Value::Object>(&event.data);
@@ -80,6 +81,13 @@ extern "C" SOUNDFLOW_EXPORT const char* soundflow_sender_request(void* context, 
     if (!context) return nullptr;
     try { return static_cast<Sender*>(context)->request(json ? json : ""); }
     catch (...) { return nullptr; }
+}
+
+extern "C" SOUNDFLOW_EXPORT void soundflow_sender_push_pcm(
+    void* context, const int16_t* pcm, size_t frames) noexcept {
+    if (!context || !pcm || frames == 0) return;
+    try { static_cast<Sender*>(context)->engine.push_external_pcm(pcm, frames); }
+    catch (...) {}
 }
 
 extern "C" SOUNDFLOW_EXPORT void soundflow_sender_destroy(void* context) noexcept {

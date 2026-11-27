@@ -51,6 +51,7 @@ struct EngineStateSnapshot {
     bool discovery_running = false;
     bool multiroom_running = false;
     bool loopback_supported = true;
+    bool process_loopback_fallback = false;
     uint16_t timer_service_port = 0;
     uint64_t session_time_offset_us = 0;
     uint32_t sample_rate = 48000;
@@ -72,6 +73,7 @@ public:
     ~MultiRoomEngine();
 
     void set_event_callback(JsonEventCallback cb);
+    void set_reject_self_ip(bool reject) { reject_self_ip_.store(reject); }
     void set_bind_ip(const std::string& ip);
     std::string bind_ip() const;
 
@@ -187,6 +189,7 @@ private:
     std::string last_error_;
     std::atomic<uint64_t> next_session_id_{1};
     std::atomic<uint16_t> test_rtsp_bind_port_{0};
+    std::atomic<bool> reject_self_ip_{false};
 
     discovery::MdnsDiscovery discovery_;
     sync::MasterMediaClock master_clock_;
@@ -199,7 +202,6 @@ private:
     bool has_external_media_ = false;
     cmd::MediaInfoPayload external_media_;
     media::LrcDocument external_lrc_;
-    bool external_media_paused_ = false;
     std::string last_broadcast_media_sig_;
     std::atomic<bool> remote_control_handled_by_host_{false};
     std::mutex cb_mu_;

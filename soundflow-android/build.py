@@ -58,7 +58,7 @@ OUT_APP = OUT_ROOT / "应用"
 OUT_ZIP = OUT_ROOT / "刷机包"
 DEBUG_DIR = Path(os.environ.get("SOUNDFLOW_DEBUG_DIR", str(ROOT / "调试文件/音流独立接收器")))
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 
 def run(*args, **kw):

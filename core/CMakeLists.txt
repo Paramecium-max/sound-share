@@ -46,7 +46,7 @@ target_link_libraries(miplay_core
 )
 
 if(WIN32)
-    target_link_libraries(miplay_core PUBLIC ws2_32 iphlpapi ole32 uuid)
+    target_link_libraries(miplay_core PUBLIC ws2_32 iphlpapi ole32 uuid version)
     target_compile_definitions(miplay_core PUBLIC _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 

@@ -17,6 +17,14 @@ captures/
 # Keys & signing
 *.keystore
 *.jks
+*.pfx
+desktop/.keys/
+soundflow-android/keys/
+soundflow-android/build/
+soundflow-android/target/
+调试文件/
+输出内容/
+miplay_version
 
 # Python cache
 __pycache__/

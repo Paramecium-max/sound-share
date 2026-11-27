@@ -27,7 +27,7 @@ T parameter(const Value::Object& object, const char* key, T fallback) {
 
 int integer(const Value::Object& object, const char* key, int fallback, int min, int max) {
     auto number = parameter(object, key, miplay::json::Number{std::to_string(fallback)});
-    int parsed;
+    int parsed = fallback;
     const auto end = number.text.data() + number.text.size();
     const auto result = std::from_chars(number.text.data(), end, parsed);
     if (result.ec != std::errc{} || result.ptr != end || parsed < min || parsed > max) {
@@ -116,7 +116,9 @@ Value call(miplay::MultiRoomEngine& engine, const std::string& method, const Val
         Value::Array result;
         for (const auto& app : miplay::media::list_audio_apps()) {
             result.emplace_back(Value::Object{
-                {"uid", app.pid}, {"packageName", app.image}, {"label", app.image},
+                {"uid", app.pid},
+                {"packageName", app.image},
+                {"label", app.label.empty() ? app.image : app.label},
             });
         }
         return result;

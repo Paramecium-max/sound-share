@@ -535,6 +535,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 senderStagePreviewActive = true;
+                MultiRoomManager.getInstance().setSenderStageActive(true);
                 lastSenderTrackSig = "";
                 syncSenderLyricsStage(true);
             });
@@ -545,6 +546,7 @@ public final class MainActivity extends Activity {
             main.post(() -> {
                 if (!senderStagePreviewActive) return;
                 senderStagePreviewActive = false;
+                MultiRoomManager.getInstance().setSenderStageActive(false);
                 if (!latestSnapshot.getBoolean("session_active", false)) {
                     lyricOrchestrator.clearStage();
                     eval("window.SoundFlowStage && window.SoundFlowStage.setVisibility(false)");
@@ -750,6 +752,7 @@ public final class MainActivity extends Activity {
         currentPlaying = playing;
         if (session) {
             senderStagePreviewActive = false;
+            MultiRoomManager.getInstance().setSenderStageActive(false);
             eval("window.SoundFlowStage && window.SoundFlowStage.setVisibility(true)");
             lyricOrchestrator.setPlayingState(playing);
             lyricOrchestrator.onMediaUpdate(
@@ -793,9 +796,37 @@ public final class MainActivity extends Activity {
         });
         mgr.setEventSink(eventJson -> {
             eval("window.SoundFlowSender && window.SoundFlowSender.onEvent(" + JSONObject.quote(eventJson) + ")");
-            if (senderStagePreviewActive && !latestSnapshot.getBoolean("session_active", false)) {
-                if (eventJson != null && eventJson.contains("\"type\":\"state\"")) {
+            if (senderStagePreviewActive && !latestSnapshot.getBoolean("session_active", false) && eventJson != null) {
+                if (eventJson.contains("\"type\":\"state\"")) {
                     main.post(() -> syncSenderLyricsStage(false));
+                } else if (eventJson.contains("\"type\":\"spectrum\"")) {
+                    try {
+                        JSONObject sp = new JSONObject(eventJson);
+                        org.json.JSONArray lv = sp.optJSONArray("levels");
+                        if (lv != null && lv.length() >= 4) {
+                            int n = lv.length();
+                            float bass = 0f, mid = 0f, high = 0f, peak = 0f;
+                            int bEnd = Math.max(1, n / 4);
+                            int mEnd = Math.max(bEnd + 1, (n * 3) / 4);
+                            for (int i = 0; i < n; i++) {
+                                float v = Math.max(0f, Math.min(1f, (float) lv.optDouble(i, 0.0)));
+                                if (v > peak) peak = v;
+                                if (i < bEnd) bass += v;
+                                else if (i < mEnd) mid += v;
+                                else high += v;
+                            }
+                            bass /= bEnd;
+                            mid /= Math.max(1, mEnd - bEnd);
+                            high /= Math.max(1, n - mEnd);
+                            int packed = (Math.min(255, Math.round(peak * 255f)) << 24)
+                                    | (Math.min(255, Math.round(bass * 255f)) << 16)
+                                    | (Math.min(255, Math.round(mid * 255f)) << 8)
+                                    | Math.min(255, Math.round(high * 255f));
+                            final float finalPeak = peak;
+                            final int finalPacked = packed;
+                            main.post(() -> lyricOrchestrator.updateAudioEnergy(finalPeak, -1L, finalPacked));
+                        }
+                    } catch (Throwable ignored) {}
                 }
             }
         });

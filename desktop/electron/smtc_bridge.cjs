@@ -54,6 +54,8 @@ while ($true) {
         [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1]))
       } else { '' }
       $lastSig = ''
+    } elseif ($act -eq 'REFRESH') {
+      $lastSig = ''
     }
     $session = Selected-Session
     if ($session) {
@@ -78,6 +80,8 @@ while ($true) {
       $targetImage = if ($parts.Length -ge 2) {
         [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1]))
       } else { '' }
+      $lastSig = ''
+    } elseif ($act -eq 'REFRESH') {
       $lastSig = ''
     }
     $session = Selected-Session
@@ -177,6 +181,10 @@ class SmtcBridge {
     this.available = false;
     this.lastTrack = { available: false };
     this.proc?.stdin.write(`TARGET ${Buffer.from(image, 'utf8').toString('base64')}\n`);
+  }
+
+  refreshNow() {
+    this.proc?.stdin.write('REFRESH\n');
   }
 
   dispatchAction(action, positionMs = 0) {

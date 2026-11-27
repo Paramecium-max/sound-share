@@ -16,6 +16,7 @@ namespace miplay::media {
 struct AudioApp {
     uint32_t pid;
     std::string image;
+    std::string label;
 };
 
 std::vector<AudioApp> list_audio_apps();

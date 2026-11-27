@@ -111,6 +111,7 @@ public:
     AudioSourceMode source_mode() const { return mode_.load(); }
     std::string source_param() const;
     std::string last_error() const;
+    bool is_process_loopback_fallback() const { return process_loopback_fallback_.load(); }
 
     static void recover_playback_route();
     static bool is_loopback_supported();
@@ -170,9 +171,10 @@ private:
     std::vector<std::string> test_loopback_argv_;
 
     std::mutex ext_mu_;
-    std::vector<int16_t> ext_ring_;
+    SmoothLoopbackFifo ext_fifo_;
+    std::atomic<bool> process_loopback_fallback_{false};
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
     // Exclusively owned by the audio worker.
     int loopback_fd_ = -1;
     int loopback_pid_ = -1;

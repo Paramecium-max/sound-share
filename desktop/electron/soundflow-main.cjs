@@ -70,6 +70,28 @@ function isUi(event) {
 
 function native(method, args) { return core.request(method, args); }
 
+function resolveUiDir() {
+  for (const candidate of [
+    path.join(__dirname, '../soundflow-ui'),
+    path.join(__dirname, '../../soundflow-android/assets/ui'),
+  ]) {
+    if (fs.existsSync(path.join(candidate, 'index.html'))) return candidate;
+  }
+  return path.join(__dirname, '../soundflow-ui');
+}
+
+function resolveCoreBinary() {
+  const exeName = process.platform === 'win32' ? 'soundflow-core.exe' : 'soundflow-core';
+  const candidates = [
+    process.env.SOUNDFLOW_CORE_BIN,
+    process.resourcesPath ? path.join(process.resourcesPath, 'bin', exeName) : '',
+    path.join(__dirname, '../../soundflow-android/build/desktop-target/x86_64-pc-windows-msvc/release', exeName),
+    path.join(__dirname, '../../core/build-soundflow-win/rust/x86_64-pc-windows-gnu/release', exeName),
+    path.join(__dirname, '../../soundflow-android/target/release', exeName),
+  ].filter(Boolean);
+  return candidates.find((file) => fs.existsSync(file)) || candidates[0];
+}
+
 async function senderRequest(method, params = {}) {
   const reply = await native('sender', { method, ...params });
   if (reply.error) throw new Error(reply.error);
@@ -248,7 +270,27 @@ async function poll() {
       sender = data.sender.data;
       if (changed) publishSenderState();
       for (const event of data.sender.events) {
-        if (event.type === 'spectrum' && !senderTab) continue;
+        if (event.type === 'spectrum') {
+          if (visualDemand && senderStage && sender.multiroomRunning && Array.isArray(event.levels) && event.levels.length >= 4) {
+            const lv = event.levels;
+            const n = lv.length;
+            const bEnd = Math.max(1, Math.floor(n / 4));
+            const mEnd = Math.max(bEnd + 1, Math.floor((n * 3) / 4));
+            let bass = 0, mid = 0, high = 0, level = 0;
+            for (let i = 0; i < n; i++) {
+              const v = Math.max(0, Math.min(1, Number(lv[i]) || 0));
+              if (v > level) level = v;
+              if (i < bEnd) bass += v;
+              else if (i < mEnd) mid += v;
+              else high += v;
+            }
+            bass /= bEnd;
+            mid /= Math.max(1, mEnd - bEnd);
+            high /= Math.max(1, n - mEnd);
+            send('audio', { level, bands: [bass, mid, high], onsets: [] });
+          }
+          if (!senderTab) continue;
+        }
         if (event.type === 'remoteControl' && sender.sourceMode === 2) {
           smtc.dispatchAction(event.action, event.positionMs);
         }
@@ -287,8 +329,9 @@ async function updateTarget(params) {
   if (params.uid > 0 && !selection) throw new Error('该音频进程已退出，请刷新音源应用列表');
   await senderRequest('source.setMode', { mode: 2, param: `process:${selection?.uid ?? 0}` });
   target = selection;
-  smtc.setTargetImage(target?.packageName ?? '');
   await senderRequest('media.setMetadata', { title: '', artist: '', album: '', sourceName: target?.label ?? 'Windows 音频' });
+  smtc.setTargetImage(target?.packageName ?? '');
+  smtc.refreshNow();
   return true;
 }
 
@@ -475,8 +518,8 @@ else {
     try { settings = { ...savedDefaults, ...JSON.parse(fs.readFileSync(settingsFile, 'utf8')) }; }
     catch { settings = { ...savedDefaults }; }
     settings.uuid ||= randomUUID();
-    const ui = path.join(__dirname, '../soundflow-ui');
-    const binary = path.join(process.resourcesPath, 'bin', 'soundflow-core.exe');
+    const ui = resolveUiDir();
+    const binary = resolveCoreBinary();
     core = new SoundFlowNative(binary, log);
     smtc = new SmtcBridge((current) => {
       if (sender.sourceMode !== 2) return;
@@ -530,7 +573,9 @@ else {
   }).catch((error) => { log(error.message); dialog.showErrorBox('音流启动失败', error.message); app.quit(); });
 }
 
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  if (quitting || !settings?.tray) app.quit();
+});
 app.on('before-quit', () => {
   quitting = true;
   clearInterval(pollTimer);

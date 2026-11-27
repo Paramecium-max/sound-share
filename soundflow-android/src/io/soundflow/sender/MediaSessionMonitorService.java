@@ -104,27 +104,29 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
         return null;
     }
 
-    public static boolean dispatchControl(Context ctx, CmdSession.RemoteControlEvent ev) {
-        if (ev == null) return false;
+    public static boolean dispatchControl(Context ctx, String action, long positionMs) {
+        if (action == null || action.isEmpty()) return false;
+        String norm = action.trim().toLowerCase(java.util.Locale.US);
         MediaController c = resolveBestExternalController(ctx);
-        if (c != null && dispatchToController(c, ev)) {
+        if (c != null && dispatchToController(c, norm, positionMs)) {
             return true;
         }
         if (ctx == null) return false;
         AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
         if (am == null) return false;
         int keyCode;
-        switch (ev.action) {
-            case PAUSE:
+        switch (norm) {
+            case "pause":
                 keyCode = KeyEvent.KEYCODE_MEDIA_PAUSE;
                 break;
-            case RESUME:
+            case "resume":
                 keyCode = KeyEvent.KEYCODE_MEDIA_PLAY;
                 break;
-            case NEXT:
+            case "next":
                 keyCode = KeyEvent.KEYCODE_MEDIA_NEXT;
                 break;
-            case PREVIOUS:
+            case "prev":
+            case "previous":
                 keyCode = KeyEvent.KEYCODE_MEDIA_PREVIOUS;
                 break;
             default:
@@ -264,24 +266,25 @@ public final class MediaSessionMonitorService extends NotificationListenerServic
         return fallback;
     }
 
-    private static boolean dispatchToController(MediaController c, CmdSession.RemoteControlEvent ev) {
+    private static boolean dispatchToController(MediaController c, String action, long positionMs) {
         MediaController.TransportControls tc = c.getTransportControls();
         if (tc == null) return false;
-        switch (ev.action) {
-            case PAUSE:
+        switch (action) {
+            case "pause":
                 tc.pause();
                 return true;
-            case RESUME:
+            case "resume":
                 tc.play();
                 return true;
-            case NEXT:
+            case "next":
                 tc.skipToNext();
                 return true;
-            case PREVIOUS:
+            case "prev":
+            case "previous":
                 tc.skipToPrevious();
                 return true;
-            case SEEK:
-                tc.seekTo(Math.max(0L, ev.positionMs));
+            case "seek":
+                tc.seekTo(Math.max(0L, positionMs));
                 return true;
             default:
                 return false;

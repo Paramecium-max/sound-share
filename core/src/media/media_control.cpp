@@ -9,7 +9,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
 #include <fcntl.h>
 #include <spawn.h>
 #include <unistd.h>
@@ -214,7 +214,7 @@ bool SystemMediaController::dispatch_action(cmd::RemoteControlAction action, uin
     inputs[1].ki.wVk = vk;
     inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
     return ::SendInput(2, inputs, sizeof(INPUT)) == 2;
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
     std::vector<std::string> argv = {"playerctl"};
     switch (action) {
         case cmd::RemoteControlAction::Pause:

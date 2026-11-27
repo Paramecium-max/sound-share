@@ -79,7 +79,7 @@ public class AudioCaptureEngine {
     private final Runnable audioPriority;
 
     public AudioCaptureEngine() {
-        this(TimerService::monotonicNowUs, () ->
+        this(() -> System.nanoTime() / 1000L, () ->
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO));
     }
 

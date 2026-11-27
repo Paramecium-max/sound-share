@@ -14,6 +14,9 @@
   #include <mfidl.h>
   #include <mferror.h>
   #include <mftransform.h>
+#elif defined(__ANDROID__)
+  #include <media/NdkMediaCodec.h>
+  #include <media/NdkMediaFormat.h>
 #endif
 
 namespace miplay::media {
@@ -408,6 +411,141 @@ struct AacEncoder::Impl {
         }
         cv.notify_one();
         return result.get();
+    }
+};
+
+#elif defined(__ANDROID__)
+
+struct AacEncoder::Impl {
+    AMediaCodec* codec = nullptr;
+    std::atomic<bool> ready{false};
+    uint32_t sample_rate = 48000;
+    uint32_t channels = 2;
+    uint32_t target_bitrate = 192000;
+    AacTimeline timeline;
+    std::mutex mutex;
+
+    bool create_codec() {
+        release_codec();
+        codec = AMediaCodec_createEncoderByType("audio/mp4a-latm");
+        if (!codec) return false;
+        AMediaFormat* fmt = AMediaFormat_new();
+        if (!fmt) {
+            AMediaCodec_delete(codec);
+            codec = nullptr;
+            return false;
+        }
+        AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, "audio/mp4a-latm");
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_SAMPLE_RATE, static_cast<int32_t>(sample_rate));
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_CHANNEL_COUNT, static_cast<int32_t>(channels));
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_BIT_RATE, static_cast<int32_t>(target_bitrate));
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_AAC_PROFILE, 2); // AACObjectLC
+        AMediaFormat_setInt32(fmt, "pcm-encoding", 2);               // ENCODING_PCM_16BIT
+        const media_status_t st = AMediaCodec_configure(
+            codec, fmt, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+        AMediaFormat_delete(fmt);
+        if (st != AMEDIA_OK || AMediaCodec_start(codec) != AMEDIA_OK) {
+            release_codec();
+            return false;
+        }
+        timeline.clear();
+        ready.store(true);
+        return true;
+    }
+
+    void release_codec() {
+        ready.store(false);
+        timeline.clear();
+        if (codec) {
+            AMediaCodec_stop(codec);
+            AMediaCodec_delete(codec);
+            codec = nullptr;
+        }
+    }
+
+    bool init(uint32_t sr, uint32_t ch, uint32_t bitrate) {
+        std::lock_guard lock(mutex);
+        sample_rate = sr > 0 ? sr : 48000;
+        channels = ch > 0 ? ch : 2;
+        target_bitrate = bitrate > 0 ? bitrate : 192000;
+        return create_codec();
+    }
+
+    void shutdown() {
+        std::lock_guard lock(mutex);
+        release_codec();
+    }
+
+    bool drain(const TimedAdtsCallback& cb) {
+        for (int tries = 0; tries < 24; ++tries) {
+            AMediaCodecBufferInfo info{};
+            const ssize_t out_idx = AMediaCodec_dequeueOutputBuffer(codec, &info, 0);
+            if (out_idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER) return true;
+            if (out_idx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED ||
+                out_idx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
+                continue;
+            }
+            if (out_idx < 0) return false;
+
+            if ((info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) != 0 || info.size <= 0) {
+                AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(out_idx), false);
+                continue;
+            }
+
+            size_t out_cap = 0;
+            uint8_t* buf = AMediaCodec_getOutputBuffer(codec, static_cast<size_t>(out_idx), &out_cap);
+            std::vector<uint8_t> bytes;
+            if (buf && info.offset >= 0 &&
+                static_cast<size_t>(info.offset) + static_cast<size_t>(info.size) <= out_cap) {
+                bytes.assign(buf + info.offset, buf + info.offset + info.size);
+            }
+            AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(out_idx), false);
+            if (bytes.empty()) return false;
+
+            bool mapped = true;
+            AacEncoder::emit_adts_frames(bytes.data(), bytes.size(), sample_rate, channels,
+                [&](const uint8_t* au, size_t size) {
+                    const auto pts = timeline.take_output();
+                    if (!pts) {
+                        mapped = false;
+                        return;
+                    }
+                    cb(au, size, *pts);
+                });
+            if (!mapped) return false;
+        }
+        return false;
+    }
+
+    bool submit_locked(const int16_t* pcm, uint64_t pts, const TimedAdtsCallback& cb) {
+        const size_t bytes = 1024 * channels * sizeof(int16_t);
+        const uint64_t pts_us = pts * 100ULL / 9ULL;
+        return timeline.submit(pts, [&]() -> AacInputResult {
+            const ssize_t in_idx = AMediaCodec_dequeueInputBuffer(codec, 4000);
+            if (in_idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER) return AacInputResult::Backpressure;
+            if (in_idx < 0) return AacInputResult::Failed;
+            size_t cap = 0;
+            uint8_t* dst = AMediaCodec_getInputBuffer(codec, static_cast<size_t>(in_idx), &cap);
+            if (!dst || cap < bytes) {
+                AMediaCodec_queueInputBuffer(codec, static_cast<size_t>(in_idx), 0, 0, pts_us, 0);
+                return AacInputResult::Failed;
+            }
+            std::memcpy(dst, pcm, bytes);
+            if (AMediaCodec_queueInputBuffer(codec, static_cast<size_t>(in_idx), 0, bytes, pts_us, 0) != AMEDIA_OK) {
+                return AacInputResult::Failed;
+            }
+            return AacInputResult::Accepted;
+        }, [&]() { return drain(cb); });
+    }
+
+    bool encode(const int16_t* pcm, size_t frames, uint64_t pts, const TimedAdtsCallback& cb) {
+        if (!pcm || frames != 1024 || !cb) return false;
+        std::lock_guard lock(mutex);
+        if (!ready.load() || !codec) return false;
+        if (submit_locked(pcm, pts, cb)) return true;
+        // Recreate codec cleanly on transient MediaServer / buffer error and retry current frame once.
+        if (!create_codec()) return false;
+        return submit_locked(pcm, pts, cb);
     }
 };
 

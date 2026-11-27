@@ -15,6 +15,7 @@
   #include <ifaddrs.h>
   #include <net/if.h>
   #include <poll.h>
+  #include <sys/ioctl.h>
 #endif
 
 namespace miplay::net {
@@ -150,21 +151,71 @@ std::vector<NetworkInterface> list_ipv4_interfaces() {
     std::vector<NetworkInterface> result;
 #ifndef _WIN32
     struct ifaddrs* ifaddr = nullptr;
-    if (getifaddrs(&ifaddr) != 0 || !ifaddr) return result;
-    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-        if (!(ifa->ifa_flags & IFF_UP) ||
-            !(ifa->ifa_flags & (IFF_RUNNING | IFF_LOOPBACK))) continue;
-        char ip[INET_ADDRSTRLEN]{};
-        auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
-        inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
-        NetworkInterface iface;
-        iface.name = ifa->ifa_name ? ifa->ifa_name : "";
-        iface.ipv4 = ip;
-        iface.is_loopback = (ifa->ifa_flags & IFF_LOOPBACK) != 0;
-        result.push_back(std::move(iface));
+    if (getifaddrs(&ifaddr) == 0 && ifaddr) {
+        for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+            if (!(ifa->ifa_flags & IFF_UP) ||
+                !(ifa->ifa_flags & (IFF_RUNNING | IFF_LOOPBACK))) continue;
+            char ip[INET_ADDRSTRLEN]{};
+            auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+            inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+            NetworkInterface iface;
+            iface.name = ifa->ifa_name ? ifa->ifa_name : "";
+            iface.ipv4 = ip;
+            iface.is_loopback = (ifa->ifa_flags & IFF_LOOPBACK) != 0;
+            result.push_back(std::move(iface));
+        }
+        freeifaddrs(ifaddr);
     }
-    freeifaddrs(ifaddr);
+    // Android 11+ blocks netlink RTM_GETLINK in untrusted app sandboxes (getifaddrs -> EACCES).
+    // Fall back to SIOCGIFCONF + SIOCGIFFLAGS over an AF_INET datagram socket.
+    if (result.empty()) {
+        int sock = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (sock >= 0) {
+            std::vector<char> buf(16384, 0);
+            struct ifconf ifc{};
+            ifc.ifc_len = static_cast<int>(buf.size());
+            ifc.ifc_buf = buf.data();
+            if (::ioctl(sock, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len > 0) {
+                const char* ptr = buf.data();
+                const char* end = ptr + ifc.ifc_len;
+                while (ptr + sizeof(struct ifreq) <= end) {
+                    struct ifreq ifr{};
+                    std::memcpy(&ifr, ptr, sizeof(ifr));
+                    ptr += sizeof(struct ifreq);
+                    if (ifr.ifr_addr.sa_family != AF_INET) continue;
+                    char ip[INET_ADDRSTRLEN]{};
+                    auto* sin = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
+                    inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+                    struct ifreq flag_req{};
+                    std::strncpy(flag_req.ifr_name, ifr.ifr_name, IFNAMSIZ - 1);
+                    short flags = IFF_UP | IFF_RUNNING;
+                    if (::ioctl(sock, SIOCGIFFLAGS, &flag_req) == 0) {
+                        flags = flag_req.ifr_flags;
+                    }
+                    if (!(flags & IFF_UP)) continue;
+                    NetworkInterface iface;
+                    iface.name = ifr.ifr_name;
+                    iface.ipv4 = ip;
+                    iface.is_loopback = (flags & IFF_LOOPBACK) != 0 || iface.ipv4.rfind("127.", 0) == 0;
+                    const bool dup = std::any_of(result.begin(), result.end(), [&](const auto& e) {
+                        return e.name == iface.name && e.ipv4 == iface.ipv4;
+                    });
+                    if (!dup) result.push_back(std::move(iface));
+                }
+            }
+            ::close(sock);
+        }
+    }
+    if (result.empty()) {
+        std::string routed = local_ipv4_for_peer("192.168.1.1", 80);
+        if (routed.empty() || routed.rfind("127.", 0) == 0) {
+            routed = local_ipv4_for_peer("10.0.0.1", 80);
+        }
+        if (!routed.empty() && routed.rfind("127.", 0) != 0) {
+            result.push_back(NetworkInterface{"wlan0", routed, false});
+        }
+    }
 #else
     ULONG out_len = 16384;
     std::vector<uint8_t> buf;

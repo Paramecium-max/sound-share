@@ -154,6 +154,9 @@ void MultiRoomEngine::refresh_discovery(bool automatic) {
 }
 
 void MultiRoomEngine::on_discovery_update(const discovery::DiscoveredDevice& device) {
+    if (reject_self_ip_.load() && net::is_local_ipv4(device.ip)) {
+        return;
+    }
     bool changed = false;
     bool reconcile = false;
     {
@@ -210,6 +213,17 @@ void MultiRoomEngine::reconcile_streams() {
             auto available = net::pick_default_lan_ipv4();
             changed = bind_ip_ != available;
             bind_ip_ = std::move(available);
+        }
+        if (reject_self_ip_.load()) {
+            for (auto it = devices_.begin(); it != devices_.end();) {
+                if (net::is_local_ipv4(it->second.info.ip)) {
+                    detach_device_stream_locked(it->second, detached);
+                    it = devices_.erase(it);
+                    changed = true;
+                } else {
+                    ++it;
+                }
+            }
         }
         if (multiroom_running_) {
             for (auto& [id, dev] : devices_) {
@@ -336,7 +350,7 @@ bool MultiRoomEngine::start_multiroom(bool prefer_lpcm, uint32_t sample_rate, ui
                             const uint64_t pts = capture_pts + master_clock_.base_play_delay_ms() * 90ULL;
                             multi_sender_.broadcast_audio_frame(adts, len, pts, static_cast<uint32_t>(pts));
                         })) {
-                        set_last_error("Windows AAC 编码失败，已重置编码器并跳过受影响的 PCM");
+                        set_last_error("AAC 编码失败，已重置编码器并跳过受影响的 PCM");
                     }
                 } else {
                     auto lpcm_frame = media::TsPacketizer::wrap_wfd_lpcm(stereo_pcm, samples, active_rate);
@@ -738,7 +752,8 @@ bool MultiRoomEngine::set_source_mode(media::AudioSourceMode mode, const std::st
     cmd::MediaInfoPayload info;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (mode != media::AudioSourceMode::SystemLoopback) {
+        if (mode != media::AudioSourceMode::SystemLoopback &&
+            mode != media::AudioSourceMode::ExternalPcm) {
             has_external_media_ = false;
         }
         info = build_effective_media_info_locked();
@@ -755,8 +770,11 @@ void MultiRoomEngine::push_external_pcm(const int16_t* stereo_pcm, size_t frame_
 
 cmd::MediaInfoPayload MultiRoomEngine::build_effective_media_info_locked() const {
     const auto base = audio_pipeline_.current_meta();
+    const auto cur_mode = audio_pipeline_.source_mode();
     cmd::MediaInfoPayload out;
-    if (has_external_media_ && audio_pipeline_.source_mode() == media::AudioSourceMode::SystemLoopback) {
+    if (has_external_media_ &&
+        (cur_mode == media::AudioSourceMode::SystemLoopback ||
+         cur_mode == media::AudioSourceMode::ExternalPcm)) {
         out = external_media_;
         if (out.title.empty()) out.title = base.title;
         if (out.artist.empty()) out.artist = base.artist;
@@ -812,6 +830,9 @@ void MultiRoomEngine::broadcast_position_ms(uint64_t position_ms) {
 }
 
 void MultiRoomEngine::set_media_metadata(const cmd::MediaInfoPayload& info, bool broadcast) {
+    if (!info.lyrics.empty() && audio_pipeline_.source_mode() == media::AudioSourceMode::WavFile) {
+        audio_pipeline_.set_wav_lrc_text(info.lyrics);
+    }
     cmd::MediaInfoPayload effective;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -1014,6 +1035,7 @@ EngineStateSnapshot MultiRoomEngine::snapshot_state() const {
     snap.discovery_running = discovery_running_;
     snap.multiroom_running = multiroom_running_;
     snap.loopback_supported = media::AudioPipeline::is_loopback_supported();
+    snap.process_loopback_fallback = audio_pipeline_.is_process_loopback_fallback();
     snap.timer_service_port = timer_service_.port();
     snap.session_time_offset_us = master_clock_.session_origin_us();
     snap.sample_rate = active_audio_cfg_.sample_rate;
@@ -1076,7 +1098,8 @@ json::Value MultiRoomEngine::snapshot_state_value() const {
     return json::Value::Object{
         {"bindIp", snap.bind_ip}, {"autoBind", snap.auto_bind},
         {"discoveryRunning", snap.discovery_running}, {"multiroomRunning", snap.multiroom_running},
-        {"loopbackSupported", snap.loopback_supported}, {"timerServicePort", snap.timer_service_port},
+        {"loopbackSupported", snap.loopback_supported}, {"processLoopbackFallback", snap.process_loopback_fallback},
+        {"timerServicePort", snap.timer_service_port},
         {"sessionTimeOffsetUs", snap.session_time_offset_us}, {"sampleRate", snap.sample_rate},
         {"basePlayDelayMs", snap.base_play_delay_ms}, {"codec", snap.prefer_lpcm ? "LPCM" : "AAC_LC"},
         {"masterVolume", snap.master_volume}, {"sourceMode", static_cast<int>(snap.source_mode)},

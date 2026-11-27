@@ -19,7 +19,9 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
+import java.net.HttpURLConnection;
 import java.net.Inet4Address;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.MulticastSocket;
@@ -28,6 +30,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.HashMap;
@@ -488,7 +491,7 @@ public final class DlnaRendererServer {
     private String handleAvTransport(String action, String body) {
         if (action.contains("SetAVTransportURI")) {
             String uri = xmlTag(body, "CurrentURI");
-            if (!isAllowedMediaUri(uri)) {
+            if (!isAllowedMediaUri(uri, localIp)) {
                 listener.onDlnaLog("DLNA 拒绝非 HTTP(S) 或受限目标 URI");
                 return soapResp("AVTransport", "SetAVTransportURI", "");
             }
@@ -592,13 +595,19 @@ public final class DlnaRendererServer {
         if (uri == null || uri.isEmpty()) return;
         if (!running) return;
         releasePlayer();
+        String validatedUri = resolveAndValidateMediaUri(uri, localIp);
+        if (validatedUri == null) {
+            listener.onDlnaError("DLNA 媒体地址未通过局域网安全校验（已拦截受限目标或非法重定向）");
+            emitState("STOPPED");
+            return;
+        }
         try {
             player = new MediaPlayer();
             player.setAudioAttributes(new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build());
-            player.setDataSource(uri);
+            player.setDataSource(validatedUri);
             player.setOnPreparedListener(mp -> {
                 if (!running || player != mp) { mp.release(); return; }
                 audioSessionId = mp.getAudioSessionId();
@@ -733,26 +742,115 @@ public final class DlnaRendererServer {
         return null;
     }
 
-    private static boolean isAllowedMediaUri(String raw) {
-        if (raw == null || raw.isEmpty()) return false;
+    private static boolean isAllowedInetAddress(InetAddress addr, String selfIp) {
+        if (addr == null) return false;
+        if (addr.isLoopbackAddress() || addr.isAnyLocalAddress()
+                || addr.isLinkLocalAddress() || addr.isMulticastAddress()) {
+            return false;
+        }
+        String hostAddr = addr.getHostAddress();
+        if (hostAddr != null && selfIp != null && !selfIp.isEmpty() && hostAddr.equals(selfIp)) {
+            return false;
+        }
+        if (addr instanceof Inet4Address) {
+            byte[] b = addr.getAddress();
+            if (b.length == 4 && (b[0] & 0xff) == 255 && (b[1] & 0xff) == 255
+                    && (b[2] & 0xff) == 255 && (b[3] & 0xff) == 255) {
+                return false;
+            }
+        } else if (addr instanceof Inet6Address) {
+            byte[] b = addr.getAddress();
+            // Reject IPv4-mapped loopback/link-local/unspecified ::ffff:a.b.c.d
+            if (b.length == 16) {
+                boolean v4Mapped = true;
+                for (int i = 0; i < 10; i++) {
+                    if (b[i] != 0) { v4Mapped = false; break; }
+                }
+                if (v4Mapped && b[10] == (byte) 0xff && b[11] == (byte) 0xff) {
+                    int b0 = b[12] & 0xff, b1 = b[13] & 0xff;
+                    if (b0 == 0 || b0 == 127 || b0 >= 224 || (b0 == 169 && b1 == 254)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    static boolean isAllowedMediaUri(String raw, String selfIp) {
+        if (raw == null || raw.isEmpty() || raw.length() > 4096) return false;
+        String trimmed = raw.trim();
+        for (int i = 0; i < trimmed.length(); i++) {
+            char c = trimmed.charAt(i);
+            if (c <= 0x20 || c == 0x7f) return false;
+        }
         try {
-            URI u = URI.create(raw.trim());
+            URI u = URI.create(trimmed);
             String scheme = u.getScheme();
             if (scheme == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
                 return false;
             }
+            if (u.getRawUserInfo() != null) return false;
             String host = u.getHost();
             if (host == null || host.isEmpty()) return false;
-            String lower = host.toLowerCase(Locale.ROOT);
-            if ("localhost".equals(lower) || "::1".equals(lower) || "[::1]".equals(lower)
-                    || "0.0.0.0".equals(lower) || lower.startsWith("127.")
-                    || "169.254.169.254".equals(lower)) {
+            String cleanHost = host.startsWith("[") && host.endsWith("]")
+                    ? host.substring(1, host.length() - 1) : host;
+            String lower = cleanHost.toLowerCase(Locale.ROOT);
+            if ("localhost".equals(lower) || lower.endsWith(".localhost") || lower.endsWith(".localdomain")
+                    || "::1".equals(lower) || "0:0:0:0:0:0:0:1".equals(lower)
+                    || "::".equals(lower) || "0.0.0.0".equals(lower)
+                    || "255.255.255.255".equals(lower)
+                    || lower.startsWith("127.") || lower.startsWith("169.254.")
+                    || lower.startsWith("fe80:") || lower.startsWith("::ffff:127.")
+                    || lower.startsWith("::ffff:169.254.") || lower.startsWith("::ffff:0.")
+                    || (selfIp != null && !selfIp.isEmpty() && selfIp.equals(lower))) {
                 return false;
             }
+            if (u.getPort() == 0) return false;
             return true;
         } catch (IllegalArgumentException e) {
             return false;
         }
+    }
+
+    private static String resolveAndValidateMediaUri(String initialUri, String selfIp) {
+        String current = initialUri;
+        for (int hop = 0; hop <= 3; hop++) {
+            if (!isAllowedMediaUri(current, selfIp)) return null;
+            HttpURLConnection conn = null;
+            try {
+                URI parsed = URI.create(current.trim());
+                String host = parsed.getHost();
+                if (host == null) return null;
+                String lookupHost = host.startsWith("[") && host.endsWith("]")
+                        ? host.substring(1, host.length() - 1) : host;
+                InetAddress[] resolved = InetAddress.getAllByName(lookupHost);
+                if (resolved == null || resolved.length == 0) return null;
+                for (InetAddress addr : resolved) {
+                    if (!isAllowedInetAddress(addr, selfIp)) return null;
+                }
+                conn = (HttpURLConnection) new URL(current.trim()).openConnection();
+                conn.setInstanceFollowRedirects(false);
+                conn.setRequestMethod("GET");
+                conn.setRequestProperty("Range", "bytes=0-0");
+                conn.setConnectTimeout(4000);
+                conn.setReadTimeout(4000);
+                int code = conn.getResponseCode();
+                if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                    if (hop == 3) return null;
+                    String loc = conn.getHeaderField("Location");
+                    if (loc == null || loc.trim().isEmpty()) return null;
+                    current = parsed.resolve(loc.trim()).toString();
+                    continue;
+                }
+                return current.trim();
+            } catch (Exception e) {
+                return null;
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }
+        return null;
     }
 
     private static final Map<String, Pattern> SOAP_TAGS;

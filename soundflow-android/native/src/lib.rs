@@ -506,7 +506,4 @@ pub extern "system" fn Java_io_soundflow_receiver_NativeBridge_setOnsetSensitivi
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod packetizer;
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod timer;
+mod sender;
