@@ -1,0 +1,8 @@
+[workspace]
+members = ["native", "upstream/src/FusionPlay.MiPlaySdk", "upstream/src/FusionPlay.AndroidIfAddrs"]
+resolver = "3"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = "symbols"

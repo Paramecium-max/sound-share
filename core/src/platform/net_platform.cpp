@@ -214,6 +214,7 @@ std::string pick_default_lan_ipv4() {
 }
 
 bool is_local_ipv4(const std::string& ip) {
+    if (ip.rfind("127.", 0) == 0) return true;
     const auto interfaces = list_ipv4_interfaces();
     return std::any_of(interfaces.begin(), interfaces.end(), [&](const auto& iface) { return iface.ipv4 == ip; });
 }

@@ -1,0 +1,15 @@
+SoundFlow Receiver (io.soundflow.receiver)
+License: AGPL-3.0-only
+
+Included open-source upstream components and design system references:
+1. FusionPlay-Android (FusionPlay.MiPlaySdk & FusionPlay.AndroidIfAddrs)
+   https://github.com/rosienosiesie/FusionPlay-Android
+   License: AGPL-3.0-only (see LICENSE.txt)
+
+2. Apple Music-like Lyrics (@applemusic-like-lyrics/core v0.6.0)
+   https://github.com/amll-dev/applemusic-like-lyrics
+   License: AGPL-3.0-only (see AMLL-LICENSE.txt)
+
+3. Liquid Glass optical rim refraction & design tokens reference (xenitV1/liquid-glass-skill)
+   https://github.com/xenitV1/liquid-glass-skill
+   Guided by UI/UX Pro Max design skill (nextlevelbuilder/ui-ux-pro-max-skill)

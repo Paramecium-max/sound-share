@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.soundflow.receiver"
+    android:versionCode="133"
+    android:versionName="1.2.1">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Used for optional DLNA playback session Visualizer and user-consented
+         AudioPlaybackCapture system internal audio loopback; microphone input is never used. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <application
+        android:name=".SoundFlowApp"
+        android:label="音流 · 全屋收发一体"
+        android:icon="@drawable/ic_soundflow_launcher"
+        android:theme="@style/AppTheme"
+        android:allowBackup="false"
+        android:extractNativeLibs="false"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:hardwareAccelerated="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".ReceiverService"
+            android:process=":receiver"
+            android:exported="true"
+            android:permission="io.soundflow.receiver.permission.CONTROL_RECEIVER"
+            android:stopWithTask="false"
+            android:foregroundServiceType="connectedDevice|mediaPlayback">
+            <intent-filter>
+                <action android:name="io.soundflow.receiver.ACTION_START_RECEIVER" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".KeepAliveJobService"
+            android:process=":receiver"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false" />
+
+        <service
+            android:name="io.soundflow.sender.SenderService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback|mediaProjection" />
+
+        <service
+            android:name="io.soundflow.sender.MediaSessionMonitorService"
+            android:label="音流全屋曲目与状态栏歌词同步"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:process=":receiver"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+    <permission
+        android:name="io.soundflow.receiver.permission.CONTROL_RECEIVER"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="io.soundflow.receiver.permission.CONTROL_RECEIVER" />
+</manifest>

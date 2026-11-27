@@ -15,7 +15,11 @@ namespace miplay::sync {
 uint64_t monotonic_now_us() {
 #if defined(__linux__)
     struct timespec ts{};
+#if defined(__ANDROID__)
+    clock_gettime(CLOCK_BOOTTIME, &ts); // Android elapsedRealtimeNanos() includes device suspend.
+#else
     clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
     return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL +
            static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
 #else

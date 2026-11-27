@@ -10,8 +10,8 @@
     "build:renderer": "tsc --noEmit && vite build",
     "start": "npm run build:renderer && electron .",
     "dist:linux": "npm run build:renderer && npx --yes electron-builder --linux",
-    "dist:win": "npm run build:renderer && npx --yes electron-builder --win",
-    "dist:win:zip": "npm run build:renderer && npx --yes electron-builder --win zip",
+    "dist:win": "python package_windows.py",
+    "dist:win:zip": "python package_windows.py --zip-only",
     "dist:mac": "npm run build:renderer && npx --yes electron-builder --mac"
   },
   "dependencies": {

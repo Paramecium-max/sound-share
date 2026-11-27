@@ -1,0 +1,7 @@
+id=soundflow_receiver
+name=SoundFlow 音流 · 全屋收发一体系统服务固化模块
+version=v1.2.1
+versionCode=133
+author=SoundFlow
+description=将音流全屋收发一体应用固化为特权系统服务并注入防杀白名单与免设置媒体控制权限，后台收发不断流。
+

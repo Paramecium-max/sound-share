@@ -100,6 +100,8 @@ public:
     bool load_lrc_file(const std::string& path, std::string* err_out = nullptr);
     void set_remote_control_handled_by_host(bool handled);
     void tick_media_sync();
+    void seek_wav_ms(uint64_t position) { audio_pipeline_.seek_wav_ms(position); }
+    void set_wav_paused(bool paused) { audio_pipeline_.set_wav_paused(paused); }
     std::string last_error() const;
 
     static std::vector<media::LoopbackSourceInfo> list_loopback_sources();

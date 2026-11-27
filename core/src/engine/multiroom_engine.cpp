@@ -1022,7 +1022,7 @@ EngineStateSnapshot MultiRoomEngine::snapshot_state() const {
     snap.master_volume = master_volume_;
     snap.source_mode = audio_pipeline_.source_mode();
     snap.source_param = audio_pipeline_.source_param();
-    snap.last_error = last_error_;
+    snap.last_error = last_error_.empty() ? audio_pipeline_.last_error() : last_error_;
     const auto effective_media = build_effective_media_info_locked();
     snap.track_meta = audio_pipeline_.current_meta();
     snap.track_meta.title = effective_media.title;

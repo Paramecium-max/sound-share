@@ -30,6 +30,17 @@ $reader = [Console]::In
 $pendingRead = $reader.ReadLineAsync()
 $lastSig = ''
 $nextPoll = [DateTime]::UtcNow
+$targetImage = ''
+function Selected-Session {
+  if (-not $targetImage) { return $mgr.GetCurrentSession() }
+  $targetName = [IO.Path]::GetFileNameWithoutExtension($targetImage)
+  return $mgr.GetSessions() | Where-Object {
+    $sourceId = [string]$_.SourceAppUserModelId
+    $sourceName = [IO.Path]::GetFileNameWithoutExtension($sourceId)
+    $sourceName -eq $targetName -or
+      $sourceId -match ('(?:^|[.])' + [regex]::Escape($targetName) + '(?:_|!|$)')
+  } | Select-Object -First 1
+}
 
 while ($true) {
   if ($pendingRead.IsCompleted) {
@@ -38,7 +49,13 @@ while ($true) {
     $pendingRead = $reader.ReadLineAsync()
     $parts = $cmdLine.Trim().Split(' ')
     $act = $parts[0]
-    $session = $mgr.GetCurrentSession()
+    if ($act -eq 'TARGET') {
+      $targetImage = if ($parts.Length -ge 2) {
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1]))
+      } else { '' }
+      $lastSig = ''
+    }
+    $session = Selected-Session
     if ($session) {
       try {
         if ($act -eq 'PAUSE') { [void](Await-WinRT ($session.TryPauseAsync()) ([bool])) }
@@ -57,7 +74,13 @@ while ($true) {
   $now = [DateTime]::UtcNow
   if ($now -ge $nextPoll) {
     $nextPoll = $now.AddMilliseconds(1200)
-    $session = $mgr.GetCurrentSession()
+    if ($act -eq 'TARGET') {
+      $targetImage = if ($parts.Length -ge 2) {
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1]))
+      } else { '' }
+      $lastSig = ''
+    }
+    $session = Selected-Session
     if ($session) {
       try {
         $props = Await-WinRT ($session.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
@@ -71,6 +94,7 @@ while ($true) {
         $status = if ($pb) { [string]$pb.PlaybackStatus } else { 'Unknown' }
         $payload = @{
           available = $true
+          targetImage = $targetImage
           title = $title
           artist = $artist
           album = $album
@@ -86,7 +110,7 @@ while ($true) {
         }
       } catch {}
     } else {
-      $empty = '{"available":false}'
+      $empty = @{ available = $false; targetImage = $targetImage } | ConvertTo-Json -Compress
       if ($empty -ne $lastSig) {
         $lastSig = $empty
         [Console]::Out.WriteLine("SMTC " + $empty)
@@ -105,6 +129,7 @@ class SmtcBridge {
     this.available = false;
     this.lastTrack = { available: false };
     this.stdoutBuf = '';
+    this.targetImage = '';
   }
 
   start() {
@@ -126,6 +151,7 @@ class SmtcBridge {
           if (!line.startsWith('SMTC ')) continue;
           try {
             const parsed = JSON.parse(line.slice(5));
+            if ((parsed?.targetImage || '') !== this.targetImage) continue;
             this.available = Boolean(parsed && parsed.available);
             this.lastTrack = parsed || { available: false };
             this.onTrackUpdate?.(this.lastTrack);
@@ -144,6 +170,13 @@ class SmtcBridge {
       this.available = false;
       this.proc = null;
     }
+  }
+
+  setTargetImage(image) {
+    this.targetImage = image;
+    this.available = false;
+    this.lastTrack = { available: false };
+    this.proc?.stdin.write(`TARGET ${Buffer.from(image, 'utf8').toString('base64')}\n`);
   }
 
   dispatchAction(action, positionMs = 0) {

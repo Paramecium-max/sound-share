@@ -1,4 +1,5 @@
 #include "media/audio_pipeline.h"
+#include "media/process_loopback.h"
 #include "sync/master_clock.h"
 
 #include <algorithm>
@@ -399,7 +400,7 @@ public:
     ~WasapiCapture() { stop(); }
 
     bool start(uint32_t target_rate, size_t frame_samples, const std::wstring& requested_endpoint,
-               const std::atomic<bool>& source_running) {
+               const std::atomic<bool>& source_running, std::optional<uint32_t> process_pid = {}) {
         stop();
         target_rate_ = target_rate > 0 ? target_rate : 48000;
         frame_samples_ = frame_samples > 0 ? frame_samples : 480;
@@ -417,7 +418,7 @@ public:
             std::optional<bool> result;
         };
         auto startup = std::make_shared<Startup>();
-        capture_th_ = std::thread([this, startup, &source_running]() {
+        capture_th_ = std::thread([this, startup, &source_running, process_pid]() {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             const HRESULT hr_com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             const bool com_init = SUCCEEDED(hr_com);
@@ -436,6 +437,7 @@ public:
             IAudioClient* keepalive_client = nullptr;
             IAudioRenderClient* keepalive_render = nullptr;
             UINT32 keepalive_buf_frames = 0;
+            HANDLE sample_event = nullptr;
             WAVEFORMATEX* mix_fmt = nullptr;
             bool following_default = requested_endpoint_.empty();
             std::wstring active_ep_id;
@@ -450,6 +452,7 @@ public:
                 if (mix_fmt) CoTaskMemFree(mix_fmt);
                 if (device) device->Release();
                 if (enumerator) enumerator->Release();
+                if (sample_event) CloseHandle(sample_event);
                 if (com_init) CoUninitialize();
             };
 
@@ -461,7 +464,23 @@ public:
             uint32_t channel_mask = 0;
 
             do {
-                if (!com_init || !create_device_enumerator(&enumerator) || !enumerator) break;
+                if (!com_init) break;
+                if (process_pid) {
+                    following_default = false;
+                    audio_client = activate_process_loopback(*process_pid);
+                    WAVEFORMATEX format{WAVE_FORMAT_PCM, 2, target_rate_, target_rate_ * 4, 4, 16, 0};
+                    sample_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    const DWORD flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+                    if (!audio_client || !sample_event || FAILED(audio_client->Initialize(
+                            AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, &format, nullptr)) ||
+                        FAILED(audio_client->SetEventHandle(sample_event)) ||
+                        FAILED(audio_client->GetService(iid_acc, reinterpret_cast<void**>(&capture_client))) ||
+                        stop_req_.load() || !source_running.load() || FAILED(audio_client->Start())) break;
+                    ok = true;
+                    break;
+                }
+                if (!create_device_enumerator(&enumerator) || !enumerator) break;
                 if (!requested_endpoint_.empty()) {
                     if (FAILED(enumerator->GetDevice(requested_endpoint_.c_str(), &device)) || !device) break;
                 }
@@ -655,7 +674,9 @@ public:
                 }
 
                 // 每 4ms 排空一次 WASAPI 捕获缓冲区，确保 10ms 包到达后 <4ms 即进平滑 FIFO，0 溢出
-                if (poll_timer) {
+                if (sample_event) {
+                    WaitForSingleObject(sample_event, 8);
+                } else if (poll_timer) {
                     LARGE_INTEGER due{};
                     due.QuadPart = -40000LL; // 4 ms
                     if (!SetWaitableTimer(poll_timer.get(), &due, 0, nullptr, nullptr, FALSE) ||
@@ -1390,7 +1411,7 @@ bool AudioPipeline::set_source_mode(AudioSourceMode mode, const std::string& par
             wav_paused_.store(false);
         } else if (mode == AudioSourceMode::SystemLoopback) {
 #ifdef _WIN32
-            meta_.title = "Windows 系统音频直抓 / 输出接管";
+            meta_.title = process_loopback_pid(param) ? "Windows 应用音频" : "Windows 系统音频直抓 / 输出接管";
 #else
             meta_.title = "系统全局音频环回";
 #endif
@@ -1761,6 +1782,7 @@ void AudioPipeline::worker_loop() {
         } else if (cur_mode == AudioSourceMode::SystemLoopback) {
 #ifdef _WIN32
             const auto now = std::chrono::steady_clock::now();
+            const auto process_pid = process_loopback_pid(win_param);
             const bool wants_route = want_takeover && is_streaming;
             if (now >= next_route_attempt && (!wasapi.is_active() || using_fallback || wants_route)) {
                 next_route_attempt = now + std::chrono::milliseconds(800);
@@ -1778,8 +1800,16 @@ void AudioPipeline::worker_loop() {
                 }
                 using_fallback = (wants_route || explicit_capture) && target_ep.empty();
                 if (!wasapi.is_active() || captured_endpoint != target_ep) {
-                    if (wasapi.start(sample_rate_, frame_samples_, target_ep, running_)) {
+                    if (wasapi.start(sample_rate_, frame_samples_, target_ep, running_, process_pid)) {
                         captured_endpoint = target_ep;
+                        if (process_pid) {
+                            std::lock_guard lock(param_mu_);
+                            if (source_gen_.load() == cur_gen) last_error_.clear();
+                        }
+                    } else if (process_pid) {
+                        std::lock_guard lock(param_mu_);
+                        if (source_gen_.load() == cur_gen)
+                            last_error_ = "进程环回采集启动失败，需要 Windows 10 Build 20348 或更高版本";
                     } else if (!target_ep.empty()) {
                         playback_route.stop();
                         captured_endpoint.clear();

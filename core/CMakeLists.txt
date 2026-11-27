@@ -22,12 +22,15 @@ add_library(miplay_core STATIC
     src/cmd/cmd_session.cpp
     src/media/ts_packetizer.cpp
     src/media/rtp_sender.cpp
+    src/media/rtp_framing.cpp
     src/media/aac_encoder.cpp
     src/media/audio_pipeline.cpp
+    src/media/process_loopback.cpp
     src/media/media_control.cpp
     src/rtsp/wfd_rtsp_server.cpp
     src/engine/multiroom_engine.cpp
     src/c_api/miplay_c_api.cpp
+    src/sidecar/sender_rpc.cpp
 )
 
 target_include_directories(miplay_core
@@ -72,3 +75,8 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME sidecar_rpc COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sidecar_rpc.py"
                                     "$<TARGET_FILE:miplay_core_sidecar>")
 endif()
+
+# Rust host loads this C ABI in-process so the sender and receiver share a PID.
+add_library(soundflow_sender SHARED src/sidecar/sender_ffi.cpp)
+target_include_directories(soundflow_sender PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(soundflow_sender PRIVATE miplay_core)

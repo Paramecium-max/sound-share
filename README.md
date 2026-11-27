@@ -44,3 +44,29 @@ npm run dist:linux   # AppImage / deb
 npm run dist:win     # Windows NSIS 安装包
 npm run dist:mac     # macOS DMG
 ```
+
+## 音流 · 全屋收发一体
+
+两端共用 `soundflow-android/web` 的四栏界面。Android 通过 JNI 装载
+`libsoundflow.so`，其中包含 Rust MiPlay 接收以及两端共用的 MPEG-TS、
+RTP 和校时模块。Windows 的 `soundflow-core.exe` 在同一进程内运行 Rust
+MiPlay、DLNA 接收和 C++ 发送引擎。桌面发送支持从 Windows 10 Build 20348
+起使用进程树环回采集。选择全局内录时由系统音频混音层排除内核进程的接收输出。
+
+```bash
+npm ci --prefix soundflow-android/web
+python3 soundflow-android/build.py
+cargo test --locked --manifest-path soundflow-android/Cargo.toml --workspace
+```
+
+Android 编译需要 Android 35 平台、NDK、JDK 和 Rust 的
+`aarch64-linux-android` target。升级已有安装时，用
+`SOUNDFLOW_KS_FILE`、`SOUNDFLOW_KS_ALIAS`、`SOUNDFLOW_KS_PASS` 传入原签名。
+单应用采集仍受目标应用的 Android Playback Capture 策略约束。
+
+在 Windows 上安装 CMake、Visual Studio C++ 工具链、Windows SDK、NSIS 及 Rust
+的 `x86_64-pc-windows-msvc` target，执行 `python desktop/package_windows.py`。
+Linux 交叉构建使用 `desktop/build_windows.sh`，需要 Zig、MinGW-w64、NSIS
+和 Rust 的 `x86_64-pc-windows-gnu` target。也可用
+`package_windows.py --rust-core <exe> --sender-dll <dll>` 打包已经交叉编译的二进制。
+`--electron-dist` 可指定本地 Windows x64 Electron 目录或 ZIP。
