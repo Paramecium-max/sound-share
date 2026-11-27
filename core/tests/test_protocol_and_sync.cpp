@@ -2041,6 +2041,12 @@ static void test_remote_control_and_lrc_sync() {
         for (int i = 0; i < 8; ++i) pos_le[i] = static_cast<uint8_t>((pos_val >> (8 * i)) & 0xFF);
         auto s = cmd::decode_remote_control_events(static_cast<uint16_t>(cmd::CmdType::SetPosition), pos_le);
         CHECK(s.size() == 1 && s[0].action == cmd::RemoteControlAction::Seek && s[0].position_ms == 45200ULL);
+        const auto type = static_cast<uint16_t>(cmd::CmdType::SetPosition);
+        s = cmd::decode_remote_control_events(type, {0, 0, 0, 0, 0, 0, 0xe1, 0x09});
+        CHECK(s.size() == 1 && s[0].position_ms == 57609ULL);
+        CHECK(cmd::decode_remote_control_events(type, std::vector<uint8_t>(8, 0xff)).empty());
+        pos_le.push_back(0);
+        CHECK(cmd::decode_remote_control_events(type, pos_le).empty());
     }
 
     // 3. LRC 解析（UTF-8 BOM + 多时间标签 + [offset] + 毫秒二分查找）

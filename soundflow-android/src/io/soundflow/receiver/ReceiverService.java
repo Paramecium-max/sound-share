@@ -188,6 +188,7 @@ public final class ReceiverService extends Service {
     private long mediaDurationMs = 0;
     private long mediaPositionMs = 0;
     private long mediaPositionAnchorElapsed = 0;
+    private boolean miplayPositionKnown;
     private long suppressVolumeEchoUntil = 0;
     private long lastMediaSeq = 0;
 
@@ -965,6 +966,7 @@ public final class ReceiverService extends Service {
             mediaDurationMs = 0;
             mediaPositionMs = 0;
             mediaPositionAnchorElapsed = 0;
+            miplayPositionKnown = false;
             sourceName = "小米妙播发送端";
             formatText = "";
             updateMediaSessionMetadata();
@@ -1153,6 +1155,7 @@ public final class ReceiverService extends Service {
                 mediaDurationMs = 0;
                 mediaPositionMs = 0;
                 mediaPositionAnchorElapsed = 0;
+                miplayPositionKnown = false;
                 statusText = idleStatus();
                 releasePlaybackLocks();
                 snapshotDirty = true;
@@ -1166,21 +1169,41 @@ public final class ReceiverService extends Service {
                     statusText = playing ? "正在播放投送音频" : "播放已暂停";
                     if (playing) acquirePlaybackLocks();
                 }
-                if (!mediaAlbum.equals(optCleanString(e, "album"))
-                        || !mediaArtist.equals(optCleanString(e, "artist"))) visualGeneration++;
+                String title = optCleanString(e, "title");
+                String artist = optCleanString(e, "artist");
+                String album = optCleanString(e, "album");
+                String lyrics = optCleanString(e, "lyrics");
+                String lyricLine = optCleanString(e, "lyric_line");
+                boolean artistOrAlbumChanged = !mediaAlbum.equals(album) || !mediaArtist.equals(artist);
+                if (artistOrAlbumChanged) visualGeneration++;
+                // Older Xiaomi sources sometimes put the current lyric line in the title.
+                boolean richMetadata = album.startsWith("process:") || album.startsWith("wav:")
+                        || !lyrics.isEmpty() || !lyricLine.isEmpty();
+                boolean newTrack = artistOrAlbumChanged || (richMetadata && !mediaTitle.equals(title));
                 activeProtocol = "xiaomi";
-                mediaTitle = optCleanString(e, "title");
-                mediaArtist = optCleanString(e, "artist");
-                mediaAlbum = optCleanString(e, "album");
-                mediaLyricsLrc = optCleanString(e, "lyrics");
-                mediaLyricLine = optCleanString(e, "lyric_line");
+                mediaTitle = title;
+                mediaArtist = artist;
+                mediaAlbum = album;
+                mediaLyricsLrc = lyrics;
+                mediaLyricLine = lyricLine;
                 String art = optCleanString(e, "artwork").replaceAll("\\s+", "");
                 if (art.length() <= 196608) mediaArtwork = art;
                 else mediaArtwork = "";
-                mediaDurationMs = e.optLong("duration_ms", 0);
-                if (!e.isNull("position_ms")) {
-                    mediaPositionMs = e.optLong("position_ms", 0);
+                long duration = PlaybackPosition.parseMiPlayMillis(e.opt("duration_ms"));
+                if (duration > 0 || newTrack) mediaDurationMs = Math.max(0L, duration);
+                long position = PlaybackPosition.parseMiPlayMillis(e.opt("position_ms"));
+                // Legacy live-lyric metadata can repeat a placeholder zero.
+                // An explicit SET_POSITION can still seek back to zero.
+                boolean legacyPlaceholder = position == 0 && !richMetadata && !newTrack
+                        && miplayPositionKnown;
+                if (!legacyPlaceholder && PlaybackPosition.isValidMiPlay(position, mediaDurationMs)) {
+                    mediaPositionMs = position;
                     mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
+                    miplayPositionKnown = true;
+                } else if (newTrack || !PlaybackPosition.isValidMiPlay(mediaPositionMs, mediaDurationMs)) {
+                    mediaPositionMs = 0;
+                    mediaPositionAnchorElapsed = 0;
+                    miplayPositionKnown = false;
                 }
                 lastMediaSeq++;
                 updateMediaSessionMetadata();
@@ -1189,15 +1212,18 @@ public final class ReceiverService extends Service {
                 break;
             }
             case "progress": {
-                long nextPos = Math.max(0L, e.optLong("position_ms", 0L));
+                long nextPos = PlaybackPosition.parseMiPlayMillis(e.opt("position_ms"));
+                if (!PlaybackPosition.isValidMiPlay(nextPos, mediaDurationMs)) break;
                 long now = SystemClock.elapsedRealtime();
                 long expected = publishedMediaPosition + (playing && publishedMediaAt != 0
                         ? Math.max(0L, now - publishedMediaAt) : 0L);
+                boolean returnedToStart = nextPos == 0 && mediaPositionMs > 0;
                 mediaPositionMs = nextPos;
-                mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
-                if (Math.abs(nextPos - expected) >= 450L) {
+                mediaPositionAnchorElapsed = now;
+                if (!miplayPositionKnown || returnedToStart || Math.abs(nextPos - expected) >= 450L) {
                     mediaDirty = true;
                 }
+                miplayPositionKnown = true;
                 break;
             }
             case "volume":
@@ -1305,6 +1331,7 @@ public final class ReceiverService extends Service {
         }
         b.putLong("duration_ms", mediaDurationMs);
         b.putLong("position_ms", currentLivePositionMs());
+        b.putBoolean("position_known", !"xiaomi".equals(activeProtocol) || miplayPositionKnown);
         b.putLong("media_seq", lastMediaSeq);
         b.putLong("visual_generation", visualGeneration);
         return b;
@@ -1491,6 +1518,7 @@ public final class ReceiverService extends Service {
         mediaDurationMs = 0;
         mediaPositionMs = 0;
         mediaPositionAnchorElapsed = 0;
+        miplayPositionKnown = false;
         lastError = "";
         getSharedPreferences(PREF, MODE_PRIVATE).edit().putBoolean("enabled", false).apply();
         main.removeCallbacks(reconnectTask);

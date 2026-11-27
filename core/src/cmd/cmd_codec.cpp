@@ -271,14 +271,13 @@ std::vector<RemoteControlEvent> decode_remote_control_events(uint16_t cmd_type,
         out.push_back(RemoteControlEvent{RemoteControlAction::Resume, 0, -1, "cmd-resume"});
         return out;
     }
-    if (cmd_type == static_cast<uint16_t>(CmdType::SetPosition) && payload.size() >= 8) {
-        uint64_t le = read_le_u64(payload.data());
-        uint64_t be = read_be_u64(payload.data());
-        // 合理毫秒上限（24 小时 = 86,400,000 ms），兼容小端/大端实现
-        constexpr uint64_t kMaxReasonableMs = 86400000ULL;
-        uint64_t pos_ms = (le <= kMaxReasonableMs) ? le : ((be <= kMaxReasonableMs) ? be : le);
-        out.push_back(RemoteControlEvent{RemoteControlAction::Seek, pos_ms, -1, "cmd-setposition"});
-        return out;
+    if (cmd_type == static_cast<uint16_t>(CmdType::SetPosition) && payload.size() == 8) {
+        constexpr uint64_t kMaxPositionMs = 24ULL * 60 * 60 * 1000;
+        const uint64_t le = read_le_u64(payload.data());
+        const uint64_t pos_ms = le <= kMaxPositionMs ? le : read_be_u64(payload.data());
+        if (pos_ms <= kMaxPositionMs) {
+            out.push_back(RemoteControlEvent{RemoteControlAction::Seek, pos_ms, -1, "cmd-setposition"});
+        }
     }
     return out;
 }

@@ -65,6 +65,7 @@ const PREVIOUS_MEDIA_PLAYER_ACK: u8 = 0x4b;
 const NEXT_MEDIA_PLAYER_ACK: u8 = 0x4d;
 const SET_POSITION: u8 = 0x56;
 const SET_POSITION_ACK: u8 = 0x57;
+const MAX_MIPLAY_POSITION_MS: u64 = 24 * 60 * 60 * 1_000;
 const SET_MEDIA_STATE: u8 = 0x5e;
 const SET_MEDIA_STATE_ACK: u8 = 0x5f;
 const MOBILE_AUDIO_STREAMING_MODE_ACK: [u8; 5] = [0, 0, 0, 0, 1];
@@ -1669,9 +1670,8 @@ fn run_session(
             SET_POSITION => {
                 if let Some(active_session_id) =
                     hub.active_source_session_id(session_id, remote.ip())
-                    && frame.body.len() >= 8
+                    && let Some(position_ms) = decode_set_position_ms(&frame.body)
                 {
-                    let position_ms = u64::from_be_bytes(frame.body[..8].try_into().unwrap());
                     let (changed, resumed) = hub.observe_position(active_session_id, position_ms);
                     if resumed {
                         emit_playback(true, true, &events);
@@ -1801,6 +1801,17 @@ struct Incoming {
     wire_body_length: usize,
     #[cfg(not(target_os = "android"))]
     wire_body_prefix: Vec<u8>,
+}
+
+fn decode_set_position_ms(body: &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = body.try_into().ok()?;
+    let big_endian = u64::from_be_bytes(bytes);
+    let little_endian = u64::from_le_bytes(bytes);
+    // The 24-hour bound matches the C++ MiPlay decoder. Below 2^32,
+    // zero is the only value that can be in range in both byte orders.
+    [big_endian, little_endian]
+        .into_iter()
+        .find(|&position_ms| position_ms <= MAX_MIPLAY_POSITION_MS)
 }
 
 fn read_frame(stream: &mut TcpStream, cipher: &mut ControlCipher) -> Result<Incoming> {
@@ -2282,7 +2293,7 @@ fn emit_media_info(body: &[u8], events: &EventEmitter) {
         "position_ms": json_u64_field(
             &value,
             &["mPosition", "position", "positionMs", "position_ms"],
-        ),
+        ).filter(|&position_ms| position_ms <= MAX_MIPLAY_POSITION_MS),
         "artwork": artwork,
         "metadata_change_type": json_u64_field(
             &value,
@@ -2925,6 +2936,33 @@ mod tests {
     }
 
     #[test]
+    fn set_position_accepts_both_byte_orders_and_rejects_invalid_bodies() {
+        let soundflow = [0x09, 0xe1, 0, 0, 0, 0, 0, 0];
+        assert_eq!(super::decode_set_position_ms(&soundflow), Some(57_609));
+        assert_eq!(
+            super::decode_set_position_ms(&57_609_u64.to_be_bytes()),
+            Some(57_609)
+        );
+        assert_eq!(super::decode_set_position_ms(&[0; 8]), Some(0));
+        assert_eq!(super::decode_set_position_ms(&[0; 7]), None);
+        assert_eq!(super::decode_set_position_ms(&[0; 9]), None);
+        assert_eq!(super::decode_set_position_ms(&[0xff; 8]), None);
+        for position in [248_000, super::MAX_MIPLAY_POSITION_MS] {
+            assert_eq!(
+                super::decode_set_position_ms(&position.to_le_bytes()),
+                Some(position)
+            );
+            assert_eq!(
+                super::decode_set_position_ms(&position.to_be_bytes()),
+                Some(position)
+            );
+        }
+        let out_of_range = super::MAX_MIPLAY_POSITION_MS + 1;
+        assert_eq!(super::decode_set_position_ms(&out_of_range.to_be_bytes()), None);
+        assert_eq!(super::decode_set_position_ms(&out_of_range.to_le_bytes()), None);
+    }
+
+    #[test]
     fn control_header_supports_full_value_type_and_u32_length() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3294,6 +3332,23 @@ mod tests {
         assert_eq!(events[0]["duration_ms"], 240_000);
         assert_eq!(events[0]["position_ms"], 42_000);
         assert_eq!(events[0]["metadata_change_type"], 2);
+    }
+
+    #[test]
+    fn media_info_keeps_lyrics_when_position_is_out_of_range() {
+        let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = Arc::clone(&recorded);
+        let events: EventEmitter = Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        });
+        emit_media_info(
+            br#"{"mTitle":"track","mLrc":"[00:01.00]line","mPosition":711850216101249024}"#,
+            &events,
+        );
+
+        let events = recorded.lock().unwrap();
+        assert_eq!(events[0]["lyrics"], "[00:01.00]line");
+        assert!(events[0]["position_ms"].is_null());
     }
 
     #[test]

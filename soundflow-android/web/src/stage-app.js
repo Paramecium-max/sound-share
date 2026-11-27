@@ -841,9 +841,9 @@ window.SoundFlowStage = {
   onTick(level, posMs, bass = 0, mid = 0, high = 0, preview = false) {
     const v = Number(level);
     audioEnergy = Number.isFinite(v) ? Math.max(0, Math.min(1, v * 1.45)) : 0;
-    const p = Number(posMs);
-    if (Number.isFinite(p) && p >= 0 && (!fullLrcActive || Math.abs(p - currentTimeMs) >= 600)) {
-      currentTimeMs = p;
+    if (Number.isSafeInteger(posMs) && posMs >= 0 &&
+        (!fullLrcActive || Math.abs(posMs - currentTimeMs) >= 600)) {
+      currentTimeMs = posMs;
     }
     processSpectrumOnset(audioEnergy, Number(bass) || 0, Number(mid) || 0, Number(high) || 0, preview);
   },
@@ -918,15 +918,19 @@ window.SoundFlowStage = {
         };
       });
       fullLrcLines = mapped;
-      const pos = Math.max(0, Number(currentPosMs) || 0);
-      currentTimeMs = pos;
+      if (Number.isSafeInteger(currentPosMs) && currentPosMs >= 0) {
+        currentTimeMs = currentPosMs;
+      }
+      // Lyrics can arrive after playback starts. Make the viewport measurable
+      // and resume AMLL before it creates the active line's word animations.
+      fullLrcActive = true;
+      updateRendererModeClass();
+      syncVisualActivity();
       const eff = Math.round(effectiveClockMs());
       lyricPlayer.resetScroll?.();
       lyricPlayer.setLyricLines(mapped, eff);
       lyricPlayer.setCurrentTime(eff, true);
       fullLyricSignature = signature;
-      fullLrcActive = true;
-      updateRendererModeClass();
       lyricPlayer.update(0);
       rebuildSmoothRailDom();
       scheduleStageRelayout();
@@ -936,7 +940,8 @@ window.SoundFlowStage = {
   },
 
   syncPosition(positionMs, seek) {
-    const p = Math.max(0, Number(positionMs) || 0);
+    if (!Number.isSafeInteger(positionMs) || positionMs < 0) return;
+    const p = positionMs;
     const drift = Math.abs(p - currentTimeMs);
     if (!seek && fullLrcActive && drift < 600) return;
     const forceSeek = Boolean(seek) || drift >= 2000;
@@ -968,6 +973,7 @@ window.SoundFlowStage = {
       nextStreamStartMs = 0;
       modeBadgeEl.textContent = "纯离线 · 局域网实时";
       updateRendererModeClass();
+      syncVisualActivity();
       rebuildSmoothRailDom();
     }
     if (!clean) return;

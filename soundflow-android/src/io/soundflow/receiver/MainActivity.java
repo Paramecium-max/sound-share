@@ -766,7 +766,7 @@ public final class MainActivity extends Activity {
                     b.getString("format", ""),
                     b.getString("active_protocol", "xiaomi"),
                     b.getLong("duration_ms", 0),
-                    b.getLong("position_ms", 0),
+                    b.getBoolean("position_known", true) ? b.getLong("position_ms", 0) : -1L,
                     b.getBoolean("auto_online_lyrics", false)
             );
         } else if (!senderStagePreviewActive) {

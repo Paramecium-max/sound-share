@@ -272,18 +272,13 @@ public final class LyricOrchestrator {
             this.autoOnlineEnabled = autoOnlineLookup;
             invalidateOnlineLookup();
         }
-        useSenderClock = "dlna".equals(protocol) || positionMs > 0;
-        long prevPos = currentPlaybackPosition();
-        boolean jumped = positionMs >= 0 && Math.abs(positionMs - prevPos) >= 1200L;
-        if (positionMs >= 0 && positionMs != lastSenderPositionMs) {
-            playbackPositionMs = positionMs;
-            lastSenderPositionMs = positionMs;
-            positionAnchorElapsedMs = SystemClock.elapsedRealtime();
+        if ("xiaomi".equals(protocol) && !PlaybackPosition.isValidMiPlay(positionMs, durationMs)) {
+            positionMs = -1L;
         }
-        if (hasFullLrcForCurrentSong && positionMs > 0) {
-            evalOrQueue("window.SoundFlowStage && window.SoundFlowStage.syncPosition(" + positionMs + "," + jumped + ");");
+        if (mediaSeq == lastMediaSeq && mediaSeq != 0) {
+            updateSenderPosition(protocol, positionMs);
+            return;
         }
-        if (mediaSeq == lastMediaSeq && mediaSeq != 0) return;
         lastMediaSeq = mediaSeq;
 
         String cleanTitle = safeTrim(rawTitle);
@@ -292,7 +287,10 @@ public final class LyricOrchestrator {
         boolean isInternalProcessAlbum = cleanAlbum.startsWith("process:") || cleanAlbum.startsWith("wav:");
         if (isInternalProcessAlbum) cleanAlbum = "";
         long durSec = durationMs / 1000L;
-        if (cleanTitle.isEmpty() && cleanArtist.isEmpty() && cleanAlbum.isEmpty()) return;
+        if (cleanTitle.isEmpty() && cleanArtist.isEmpty() && cleanAlbum.isEmpty()) {
+            updateSenderPosition(protocol, positionMs);
+            return;
+        }
 
         String songName;
         String artistName;
@@ -369,6 +367,7 @@ public final class LyricOrchestrator {
             currentDurationMs = durationMs;
             playbackPositionMs = Math.max(0, positionMs);
             lastSenderPositionMs = positionMs;
+            useSenderClock = "dlna".equals(protocol) || positionMs > 0;
             positionAnchorElapsedMs = SystemClock.elapsedRealtime();
             songStartElapsedMs = SystemClock.elapsedRealtime();
             lanRecordedLines.clear();
@@ -385,6 +384,7 @@ public final class LyricOrchestrator {
                     + "window.SoundFlowStage && window.SoundFlowStage.pushRealtimeLine('',true);";
             evalOrQueue(hdrCall);
         } else {
+            updateSenderPosition(protocol, positionMs);
             if (durationMs > 0) currentDurationMs = durationMs;
             evalOrQueue("window.SoundFlowStage && window.SoundFlowStage.setTrackHeader("
                     + JSONObject.quote(songName) + ","
@@ -420,6 +420,21 @@ public final class LyricOrchestrator {
                     + JSONObject.quote("dlna".equals(protocol) ? "此投送未附带歌词" : "等待发送端同步歌词") + ",false);");
         }
 
+    }
+
+    private void updateSenderPosition(String protocol, long positionMs) {
+        if ("dlna".equals(protocol) || positionMs > 0) useSenderClock = true;
+        if (positionMs < 0 || (positionMs == 0 && !useSenderClock)) return;
+        boolean jumped = (positionMs == 0 && lastSenderPositionMs > 0)
+                || Math.abs(positionMs - currentPlaybackPosition()) >= 1200L;
+        if (positionMs != lastSenderPositionMs) {
+            playbackPositionMs = positionMs;
+            lastSenderPositionMs = positionMs;
+            positionAnchorElapsedMs = SystemClock.elapsedRealtime();
+        }
+        if (hasFullLrcForCurrentSong) {
+            evalOrQueue("window.SoundFlowStage && window.SoundFlowStage.syncPosition(" + positionMs + "," + jumped + ");");
+        }
     }
 
     private void loadTrackLyrics(String song, String artist, String embedded, String songKey) {
