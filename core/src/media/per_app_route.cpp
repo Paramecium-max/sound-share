@@ -8,7 +8,7 @@
 #include <windows.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
-#include <functiondiscoverykeys_devpkey.h>
+#include <propsys.h>
 #include <tlhelp32.h>
 
 #include <atomic>
@@ -283,12 +283,16 @@ struct SecondaryEndpoint {
 };
 
 std::wstring read_device_friendly_name(IMMDevice* dev) {
+    static constexpr PROPERTYKEY kPkeyDeviceFriendlyName = {
+        {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
+        14
+    };
     IPropertyStore* store = nullptr;
     if (FAILED(dev->OpenPropertyStore(STGM_READ, &store)) || !store) return {};
     PROPVARIANT pv;
     PropVariantInit(&pv);
     std::wstring out;
-    if (SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) {
+    if (SUCCEEDED(store->GetValue(kPkeyDeviceFriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) {
         out = pv.pwszVal;
     }
     PropVariantClear(&pv);
