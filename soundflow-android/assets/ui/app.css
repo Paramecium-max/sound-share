@@ -10,6 +10,16 @@ html {
   background: var(--ground-2);
 }
 
+html.soundflow-windows {
+  scrollbar-color: var(--label-3) var(--ground-2);
+}
+
+@media (forced-colors: active) {
+  html.soundflow-windows {
+    scrollbar-color: auto;
+  }
+}
+
 body {
   margin: 0;
   padding: 0;

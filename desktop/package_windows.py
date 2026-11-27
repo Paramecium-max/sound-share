@@ -10,6 +10,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import struct
 import tempfile
 import urllib.request
 import zipfile
@@ -246,6 +247,68 @@ class AuthenticodeSigner:
             raise RuntimeError(f"{target.name} does not have a verified timestamp")
 
 
+def verify_native_imports(core: Path):
+    image = core.read_bytes()
+    try:
+        pe = struct.unpack_from("<I", image, 0x3C)[0]
+        header = pe + 24
+        machine, section_count = struct.unpack_from("<HH", image, pe + 4)
+        optional_size = struct.unpack_from("<H", image, pe + 20)[0]
+        magic = struct.unpack_from("<H", image, header)[0]
+        if (image[:2], image[pe:pe + 4], machine, magic) != (b"MZ", b"PE\0\0", 0x8664, 0x20B):
+            raise ValueError("expected a Windows x64 PE")
+        directory_rva, directory_size = struct.unpack_from("<II", image, header + 120)
+        sections = [
+            struct.unpack_from("<IIII", image, header + optional_size + i * 40 + 8)
+            for i in range(section_count)
+        ]
+
+        def offset(rva, count):
+            for _, address, size, file_offset in sections:
+                relative = rva - address
+                if 0 <= relative <= size - count and file_offset + relative + count <= len(image):
+                    return file_offset + relative
+            raise ValueError(f"import RVA 0x{rva:X} is outside the PE image")
+
+        for i in range(directory_size // 20):
+            entry = struct.unpack_from("<5I", image, offset(directory_rva + i * 20, 20))
+            if not any(entry):
+                if i == 0:
+                    raise ValueError("no native imports")
+                return
+            lookup, _, _, dll, thunk = entry
+            name_offset = offset(dll, 1)
+            dll_name = image[name_offset:image.index(b"\0", name_offset)].decode("ascii")
+            # A descriptor with a zero first lookup leaves its IAT entries unresolved.
+            first_lookup = struct.unpack_from("<Q", image, offset(lookup or thunk, 8))[0]
+            if not thunk or not first_lookup:
+                raise ValueError(f"empty import lookup table for {dll_name}")
+        raise ValueError("missing end of import directory")
+    except (ValueError, struct.error) as error:
+        raise RuntimeError(f"{core.name} has an invalid Windows import directory: {error}") from error
+
+
+def verify_native_startup(core: Path):
+    request = {"id": 1, "method": "sender", "args": {"method": "state.get"}}
+    try:
+        result = subprocess.run(
+            [str(core)], cwd=core.parent, input=json.dumps(request) + "\n",
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Packaged SoundFlow native core did not complete its startup check") from error
+    if result.returncode:
+        code = result.returncode & 0xFFFFFFFF
+        raise RuntimeError(f"Packaged SoundFlow native core exited during startup (0x{code:08X})")
+    replies = [json.loads(line) for line in result.stdout.splitlines()]
+    if len(replies) != 2 or replies[0] != {"ready": True}:
+        raise RuntimeError("Packaged SoundFlow native core did not acknowledge startup")
+    reply = replies[1]
+    state = reply.get("result", {}).get("result")
+    if reply.get("id") != 1 or not isinstance(state, dict) or state.get("multiroomRunning") is not False:
+        raise RuntimeError("Packaged SoundFlow native core failed its state query")
+
+
 def native_binaries():
     if os.name != "nt":
         raise RuntimeError("Pass --rust-core and --sender-dll when packaging a cross-compiled build")
@@ -405,6 +468,10 @@ def main():
         if signer is not None:
             for pe in signed_targets:
                 signer.sign_file(pe)
+
+        verify_native_imports(binaries / "soundflow-core.exe")
+        if os.name == "nt":
+            verify_native_startup(binaries / "soundflow-core.exe")
 
         out_portable_dir = output / name
         if out_portable_dir.exists():
