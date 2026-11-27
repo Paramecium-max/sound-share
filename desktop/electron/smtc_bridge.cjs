@@ -265,9 +265,12 @@ class SmtcBridge {
         } catch {}
       }
       if (!newest) return '';
-      if (referenceTimeMs > 0 && Math.abs(newest.mtimeMs - referenceTimeMs) > 120 * 1000) {
-        // Still allow reading if it was modified within the last 30 minutes
-        if (Date.now() - newest.mtimeMs > 30 * 60 * 1000) return '';
+      // Strictly bind Kw_Song_Cache MUSICRID only when modified within +-15s of the ACT:LYRIC event
+      // to prevent cross-attaching a stale/pre-buffered song's MUSICRID to the current track.
+      if (referenceTimeMs > 0) {
+        if (Math.abs(newest.mtimeMs - referenceTimeMs) > 15 * 1000) return '';
+      } else if (Date.now() - newest.mtimeMs > 60 * 1000) {
+        return '';
       }
       const text = await fsp.readFile(newest.full, 'ascii');
       const m = text.match(/MUSICRID=MUSIC_(\d+)/i);
@@ -329,9 +332,27 @@ class SmtcBridge {
       const mTitle = line.match(/\|N:([^|]*)/);
       const mArtist = line.match(/\|A:([^|]*)/);
       if (mTitle && mTitle[1].trim()) {
+        const candMs = parseActLogTimestampMs(line);
+        // Check if this track immediately failed playback (RESFAIL/NoRes + ENDTYPE:1/PT:0)
+        let failedImmediately = false;
+        let sawNoRes = false;
+        for (let j = i + 1; j < Math.min(lines.length, i + 12); j++) {
+          const nextLine = lines[j];
+          if (nextLine.includes('ACT:LYRIC|')) break;
+          const nextMs = parseActLogTimestampMs(nextLine);
+          if (candMs > 0 && nextMs > 0 && (nextMs - candMs) > 3000) break;
+          if (nextLine.includes('ACT:RESFAIL|') || nextLine.includes('FAILED:NORES')) {
+            sawNoRes = true;
+          }
+          if (sawNoRes && nextLine.includes('ACT:PLAY_MUSIC|') && (nextLine.includes('|PT:0|') || nextLine.includes('|ENDTYPE:1|'))) {
+            failedImmediately = true;
+            break;
+          }
+        }
+        if (failedImmediately) continue;
         foundTitle = mTitle[1].trim();
         foundArtist = mArtist ? mArtist[1].trim() : '';
-        foundLogMs = parseActLogTimestampMs(line);
+        foundLogMs = candMs;
         break;
       }
     }

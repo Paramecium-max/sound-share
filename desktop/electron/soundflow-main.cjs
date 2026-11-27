@@ -635,30 +635,17 @@ else {
         return;
       }
 
-      // Same track: advance position and live lyric sentence
+      // Same track: push lightweight position updates; native multiroom_engine computes
+      // lyricLine from the already-uploaded full LRC and broadcasts progress cleanly.
       const posMs = current.positionMs || 0;
-      const durMs = current.durationMs || sender.track?.durationMs || 0;
-      const album = current.album || sender.track?.album || '';
       const curLine = lrcLineAt(senderLrcLines, posMs);
       if (curLine !== senderLastLine) {
         senderLastLine = curLine;
-        senderRequest('media.setMetadata', {
-          title: current.title,
-          artist: current.artist || '',
-          album,
-          positionMs: posMs,
-          durationMs: durMs,
-          lyrics: senderLrc,
-          lyricLine: curLine,
-          sourceName: target?.label ?? 'Windows 音频',
-          broadcast: true,
-        }).catch((error) => log(error.message));
-      } else {
-        senderRequest('media.setPosition', {
-          positionMs: posMs,
-          broadcast: true,
-        }).catch((error) => log(error.message));
       }
+      senderRequest('media.setPosition', {
+        positionMs: posMs,
+        broadcast: true,
+      }).catch((error) => log(error.message));
       if (senderStage) {
         send('position', posMs);
       }

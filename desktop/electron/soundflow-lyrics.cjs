@@ -101,7 +101,10 @@ function decodeKuwoSearchLyricDat(rawContent) {
       out[i] = raw[i] ^ KUWO_XOR_KEY[i % KUWO_XOR_KEY.length];
     }
     const text = new TextDecoder('gb18030').decode(out);
-    const cleaned = text.replace(/<-?\d+,-?\d+>/g, '');
+    // Strip Kuwo word-by-word timing tags like <offset,dur> or <offset,dur,0> and [kuwo:...] headers
+    const cleaned = text
+      .replace(/<-?\d+(?:,-?\d+){1,3}>/g, '')
+      .replace(/^\[kuwo:[^\]]*\]\r?\n?/gim, '');
     if (!isTimed(cleaned)) return null;
     const tiMatch = cleaned.match(/^\[ti:([^\]]*)\]/im);
     const arMatch = cleaned.match(/^\[ar:([^\]]*)\]/im);
@@ -207,11 +210,19 @@ async function lookupKuwoH5ByMusicId(musicId, track, signal) {
       const infoAlbum = String(info.album || '').trim();
       const durationMs = Number(info.duration) > 0 ? Number(info.duration) * 1000 : 0;
 
-      // Ensure the cached MUSICRID matches the track if track.title is already known
+      // Strictly verify the cached MUSICRID matches the track title (and artist when available)
+      // to avoid substring false positives (e.g. "飞" vs "飞（风浪没平息...）").
       if (track?.title && infoTitle) {
         const want = normalizeName(track.title);
         const got = normalizeName(infoTitle);
-        if (want && got && !got.includes(want) && !want.includes(got)) {
+        if (want && got && got !== want) {
+          return null;
+        }
+      }
+      if (track?.artist && infoArtist) {
+        const wantA = normalizeName(track.artist);
+        const gotA = normalizeName(infoArtist);
+        if (wantA && gotA && !gotA.includes(wantA) && !wantA.includes(gotA)) {
           return null;
         }
       }

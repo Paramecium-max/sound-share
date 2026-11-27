@@ -60,6 +60,17 @@ lyricPlayer.setEnableSpring(true);
 lyricPlayer.setEnableBlur(false);
 lyricPlayer.setEnableScale(true);
 lyricPlayer.setWordFadeWidth(0.55);
+lyricPlayer.addEventListener("line-click", (e) => {
+  const line = e?.line?.getLine?.() ?? e?.line;
+  const startMs = Number(line?.startTime);
+  if (!Number.isFinite(startMs) || startMs < 0) return;
+  currentTimeMs = startMs;
+  try {
+    lyricPlayer.setCurrentTime(Math.round(effectiveClockMs()), true);
+    lyricPlayer.update(0);
+  } catch (_) {}
+  window.SoundFlowBridge?.sendControl?.("seek", Math.round(startMs));
+});
 lyricHost.appendChild(lyricPlayer.getElement());
 
 let isPlaying = false;
@@ -924,14 +935,15 @@ window.SoundFlowStage = {
 
   syncPosition(positionMs, seek) {
     const p = Math.max(0, Number(positionMs) || 0);
+    const forceSeek = Boolean(seek) || Math.abs(p - currentTimeMs) >= 1200;
     currentTimeMs = p;
     if (usingNativeAmll()) {
       try {
-        lyricPlayer.setCurrentTime(Math.round(effectiveClockMs()), !!seek);
-        if (isPlaying) lyricPlayer.update(16 * animSpeed);
+        lyricPlayer.setCurrentTime(Math.round(effectiveClockMs()), forceSeek);
+        if (isPlaying || forceSeek) lyricPlayer.update(forceSeek ? 0 : 16 * animSpeed);
       } catch (_) {}
     } else {
-      syncSmoothRailHighlight(!!seek);
+      syncSmoothRailHighlight(forceSeek);
     }
   },
 

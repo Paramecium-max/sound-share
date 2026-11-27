@@ -272,13 +272,15 @@ public final class LyricOrchestrator {
             invalidateOnlineLookup();
         }
         useSenderClock = "dlna".equals(protocol) || positionMs > 0;
+        long prevPos = currentPlaybackPosition();
+        boolean jumped = positionMs >= 0 && Math.abs(positionMs - prevPos) >= 1200L;
         if (positionMs >= 0 && positionMs != lastSenderPositionMs) {
             playbackPositionMs = positionMs;
             lastSenderPositionMs = positionMs;
             positionAnchorElapsedMs = SystemClock.elapsedRealtime();
         }
         if (hasFullLrcForCurrentSong && positionMs > 0) {
-            evalOrQueue("window.SoundFlowStage && window.SoundFlowStage.syncPosition(" + positionMs + ",false);");
+            evalOrQueue("window.SoundFlowStage && window.SoundFlowStage.syncPosition(" + positionMs + "," + jumped + ");");
         }
         if (mediaSeq == lastMediaSeq && mediaSeq != 0) return;
         lastMediaSeq = mediaSeq;
@@ -796,7 +798,8 @@ public final class LyricOrchestrator {
     public static List<LrcLine> parseLrc(String raw) {
         List<LrcLine> out = new ArrayList<>();
         if (raw == null || raw.isEmpty()) return out;
-        for (String line : raw.split("\\r?\\n")) {
+        String cleanedRaw = raw.replaceAll("<-?\\d+(?:,-?\\d+){1,3}>", "");
+        for (String line : cleanedRaw.split("\\r?\\n")) {
             Matcher m = LRC_TAG.matcher(line);
             List<Long> stamps = new ArrayList<>();
             int lastEnd = 0;
