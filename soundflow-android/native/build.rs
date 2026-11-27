@@ -42,6 +42,8 @@ fn main() {
         "src/media/audio_pipeline.h",
         "src/media/process_loopback.cpp",
         "src/media/process_loopback.h",
+        "src/media/per_app_route.cpp",
+        "src/media/per_app_route.h",
         "src/media/media_control.cpp",
         "src/media/media_control.h",
         "src/rtsp/wfd_rtsp_server.cpp",

@@ -128,6 +128,9 @@ Value call(miplay::MultiRoomEngine& engine, const std::string& method, const Val
         if (!engine.set_source_mode(mode, text("param"), &error)) {
             throw RpcError{error.empty() ? "切换音源失败" : error};
         }
+    } else if (method == "source.setMuteLocalApp") {
+        engine.set_mute_local_app(parameter(params, "muteLocalApp", false));
+        return engine.snapshot_state_value();
     } else if (method == "wav.seek") {
         engine.seek_wav_ms(integer(params, "positionMs", 0, 0, 86400000));
     } else if (method == "wav.pause") {

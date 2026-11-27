@@ -240,10 +240,33 @@ public final class OfflineRegression {
         System.out.println("[PASS] testCapturePacing");
     }
 
+    private static void testMuteLocalAppGenerationInvalidation() {
+        AudioCaptureEngine engine = new AudioCaptureEngine(() -> System.nanoTime() / 1000, () -> {});
+        FakeRecorder first = new FakeRecorder();
+        FakeRecorder second = new FakeRecorder();
+        AtomicInteger creations = new AtomicInteger();
+        engine.setCaptureSource((rate, size) -> creations.getAndIncrement() == 0 ? first : second);
+        engine.start(48000, 480, System.nanoTime() / 1000, new AudioCaptureEngine.Callbacks() {
+            @Override public void onPcmFrame(byte[] pcm, int count, long position) {}
+            @Override public void onSpectrum(float[] bands) {}
+        });
+        await(first.reading);
+        check(!engine.isMuteLocalApp(), "muteLocalApp should default to false");
+        engine.setMuteLocalApp(true);
+        await(first.released);
+        await(second.reading);
+        check(engine.isMuteLocalApp(), "muteLocalApp should be true after toggle");
+        check(first.stops.get() == 1 && first.releases.get() == 1, "first recorder was not stopped on mute toggle");
+        engine.stop();
+        await(second.released);
+        System.out.println("[PASS] testMuteLocalAppGenerationInvalidation");
+    }
+
     public static void main(String[] args) throws Exception {
         testNativeSenderLifecycleAndProtocol();
         testNativeWavAndLrcLoading();
         testRecorderGenerations();
         testCapturePacing();
+        testMuteLocalAppGenerationInvalidation();
     }
 }

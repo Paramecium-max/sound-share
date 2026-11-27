@@ -52,6 +52,7 @@ public class AudioCaptureEngine {
     private volatile RecorderSource recorderSource;
     private volatile int targetAppUid = -1;
     private volatile String targetAppLabel = "";
+    private volatile boolean muteLocalApp = false;
     private final Object captureLock = new Object();
     private long captureGeneration;
     private Recorder activeRecorder;
@@ -209,6 +210,65 @@ public class AudioCaptureEngine {
 
     public void setMediaProjection(MediaProjection mp) {
         setCaptureSource(mp == null ? null : (rate, samples) -> buildPlaybackRecorder(mp, rate, samples, targetAppUid));
+    }
+
+    public void setPrivilegedPolicyContext(Context ctx) {
+        if (ctx == null) {
+            setCaptureSource(null);
+            return;
+        }
+        final Context appCtx = ctx.getApplicationContext();
+        setCaptureSource((rate, samples) -> buildPrivilegedPolicyRecorder(appCtx, rate, targetAppUid, muteLocalApp));
+    }
+
+    public void setShizukuBridge(Context ctx, ShizukuCaptureBridge bridge) {
+        if (ctx == null || bridge == null) {
+            setCaptureSource(null);
+            return;
+        }
+        final Context appCtx = ctx.getApplicationContext();
+        setCaptureSource((rate, samples) -> bridge.createRecorder(appCtx, rate, samples, targetAppUid, muteLocalApp));
+    }
+
+    public void setMuteLocalApp(boolean mute) {
+        synchronized (captureLock) {
+            if (this.muteLocalApp == mute) return;
+            this.muteLocalApp = mute;
+            if (mode.get() == MODE_SYSTEM_LOOPBACK) {
+                invalidateCapture();
+            }
+        }
+    }
+
+    public boolean isMuteLocalApp() {
+        return muteLocalApp;
+    }
+
+    private static Recorder buildPrivilegedPolicyRecorder(
+            Context ctx, int rate, int targetUid, boolean muteLocal) {
+        try {
+            final PrivilegedAudioPolicyHelper.ActivePolicySession session =
+                    PrivilegedAudioPolicyHelper.openLoopbackSession(
+                            ctx, rate, android.os.Process.myUid(), targetUid, muteLocal);
+            return new Recorder() {
+                @Override public void start() {
+                    session.audioRecord.startRecording();
+                }
+                @Override public int read(byte[] pcm, int offset, int length) {
+                    return session.audioRecord.read(pcm, offset, length, AudioRecord.READ_BLOCKING);
+                }
+                @Override public void stop() {
+                    session.close();
+                }
+                @Override public void release() {
+                    session.close();
+                }
+            };
+        } catch (RuntimeException re) {
+            throw re;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public void setTargetAppUid(int uid, String appLabel) {

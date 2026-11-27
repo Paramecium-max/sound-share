@@ -1100,7 +1100,29 @@ void AudioPipeline::recover_playback_route() {
 #ifdef _WIN32
     WindowsPlaybackRoute route;
     route.recover();
+    PerAppSilentRouter::recover_stale_routes();
 #endif
+}
+
+void AudioPipeline::set_mute_local_app(bool mute) {
+    if (mute_local_app_.exchange(mute) != mute) {
+        source_gen_.fetch_add(1);
+    }
+}
+
+SilentRouteStatus AudioPipeline::mute_local_status() const {
+    SilentRouteStatus st;
+    {
+        std::lock_guard<std::mutex> lock(route_status_mu_);
+        st = mute_local_status_;
+    }
+    if (!st.active) {
+        st.supported = PerAppSilentRouter::has_secondary_render_endpoint();
+        if (!st.supported && st.hint.empty()) {
+            st.hint = "未检测到空闲副输出口，可接入 HDMI 显示器音频或安装 VB-Cable 开启本机消音";
+        }
+    }
+    return st;
 }
 
 bool AudioPipeline::is_loopback_supported() {
@@ -1708,6 +1730,7 @@ void AudioPipeline::worker_loop() {
 #ifdef _WIN32
     WinProAudioThreadGuard pro_audio_guard;
     WindowsPlaybackRoute playback_route;
+    PerAppSilentRouter per_app_router;
     WasapiCapture wasapi;
     std::chrono::steady_clock::time_point next_route_attempt{};
     bool using_fallback = false;
@@ -1856,7 +1879,19 @@ void AudioPipeline::worker_loop() {
 #ifdef _WIN32
             const auto now = std::chrono::steady_clock::now();
             const auto process_pid = process_loopback_pid(win_param);
-            const bool wants_route = want_takeover && is_streaming;
+            const bool want_per_app_silent = process_pid && *process_pid > 0 && mute_local_app_.load() && is_streaming;
+            if (want_per_app_silent) {
+                SilentRouteStatus rs;
+                per_app_router.apply_for_process_tree(*process_pid, &rs);
+                std::lock_guard<std::mutex> lock(route_status_mu_);
+                mute_local_status_ = std::move(rs);
+            } else {
+                per_app_router.restore();
+                std::lock_guard<std::mutex> lock(route_status_mu_);
+                mute_local_status_.active = false;
+                mute_local_status_.endpoint_name.clear();
+            }
+            const bool wants_route = want_takeover && is_streaming && !want_per_app_silent;
             if (now >= next_route_attempt && (!wasapi.is_active() || using_fallback || wants_route)) {
                 next_route_attempt = now + std::chrono::milliseconds(800);
                 std::wstring target_ep;
@@ -1965,6 +2000,7 @@ void AudioPipeline::worker_loop() {
 
 #ifdef _WIN32
     wasapi.stop();
+    per_app_router.restore();
     playback_route.stop();
 #elif defined(__linux__) && !defined(__ANDROID__)
     stop_loopback_process();

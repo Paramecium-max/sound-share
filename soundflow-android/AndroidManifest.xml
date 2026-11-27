@@ -10,6 +10,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Privileged audio routing permissions: silently ignored on non-root installs,
+         activated when systemized via Magisk priv-app for zero-dialog loopback capture. -->
+    <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_ROUTING" />
     <!-- Used for optional DLNA playback session Visualizer and user-consented
          AudioPlaybackCapture system internal audio loopback; microphone input is never used. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -89,6 +93,13 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="io.soundflow.receiver.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 
     <permission

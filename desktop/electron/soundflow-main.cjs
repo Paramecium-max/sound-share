@@ -245,6 +245,12 @@ function publishSenderState() {
     type: 'state',
     data: {
       ...sender, codec, hasProjection: true, notificationAccessGranted: true,
+      captureBackend: 'wasapi_process',
+      shizukuAvailable: false,
+      shizukuGranted: false,
+      muteLocalApp: Boolean(sender.muteLocalApp),
+      muteLocalSupported: Boolean(sender.muteLocalSupported),
+      muteLocalHint: sender.muteLocalHint || '',
       targetAppUid: target?.uid ?? -1, targetAppPkg: target?.packageName ?? '',
       targetAppName: target?.label ?? '',
       track: sender.track ? { ...sender.track, hasLyrics: Boolean(senderLrc || sender.track.hasLyrics) } : undefined,
@@ -343,6 +349,9 @@ async function uiSenderRpc(raw) {
         result = await senderRequest(method, { mode: request.mode, param: request.mode === 2 ? `process:${target?.uid ?? 0}` : request.mode === 1 ? wavPath : '' });
         break;
       case 'source.setTargetApp': result = await updateTarget(request); break;
+      case 'source.setMuteLocalApp':
+        result = await senderRequest(method, { muteLocalApp: Boolean(request.muteLocalApp) });
+        break;
       case 'codec.set':
         if (!['AAC_LC', 'LPCM'].includes(request.codec)) throw new Error('无效的音频编码');
         if (sender.multiroomRunning) throw new Error('请先停止全屋发送再切换编码');

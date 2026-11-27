@@ -26,6 +26,7 @@ add_library(miplay_core STATIC
     src/media/aac_encoder.cpp
     src/media/audio_pipeline.cpp
     src/media/process_loopback.cpp
+    src/media/per_app_route.cpp
     src/media/media_control.cpp
     src/rtsp/wfd_rtsp_server.cpp
     src/engine/multiroom_engine.cpp

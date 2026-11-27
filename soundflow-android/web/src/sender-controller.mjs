@@ -22,6 +22,12 @@ export function initSenderController({
     discoveryRunning: false,
     multiroomRunning: false,
     hasProjection: false,
+    captureBackend: "media_projection",
+    shizukuAvailable: false,
+    shizukuGranted: false,
+    muteLocalApp: false,
+    muteLocalSupported: false,
+    muteLocalHint: "",
     timerServicePort: 0,
     sampleRate: 48000,
     basePlayDelayMs: 350,
@@ -68,6 +74,10 @@ export function initSenderController({
   const appFilterRow = document.getElementById("sender-app-row");
   const appSelect = document.getElementById("sender-app-select");
   const appRefreshBtn = document.getElementById("sender-app-refresh-btn");
+  const muteLocalRow = document.getElementById("sender-mute-local-row");
+  const muteLocalDesc = document.getElementById("sender-mute-local-desc");
+  const muteLocalSwitch = document.getElementById("sender-mute-local-switch");
+  const shizukuBtn = document.getElementById("sender-shizuku-btn");
   const projectionRow = document.getElementById("sender-projection-banner");
   const projectionBtn = document.getElementById("sender-projection-btn");
   const notifBanner = document.getElementById("sender-notif-banner");
@@ -450,8 +460,35 @@ export function initSenderController({
     }
     syncAppSelectSelection();
 
+    const isDirectPrivileged = state.captureBackend === "privileged_policy" || state.captureBackend === "shizuku";
+    if (muteLocalRow) {
+      muteLocalRow.style.display = state.sourceMode === MODE_SYSTEM_LOOPBACK ? "flex" : "none";
+    }
+    if (muteLocalSwitch) {
+      muteLocalSwitch.setAttribute("aria-checked", String(!!state.muteLocalApp));
+      muteLocalSwitch.disabled = !state.muteLocalSupported && !state.muteLocalApp;
+    }
+    if (shizukuBtn) {
+      const showShizuku = !isDirectPrivileged && !!state.shizukuAvailable && !state.shizukuGranted && state.captureBackend === "media_projection";
+      shizukuBtn.style.display = showShizuku ? "inline-flex" : "none";
+    }
+    if (muteLocalDesc) {
+      if (isDirectPrivileged) {
+        const badge = state.captureBackend === "privileged_policy" ? "系统特权直抓 · 免投屏" : "Shizuku 直抓 · 免投屏";
+        muteLocalDesc.textContent = singleAppActive
+          ? `${badge} · 仅在全屋音箱发声，本机其他应用照常外放`
+          : `${badge} · 开启后拦截媒体外放仅走全屋音箱`;
+      } else if (state.muteLocalSupported) {
+        muteLocalDesc.textContent = singleAppActive
+          ? "仅在全屋音箱发声，电脑本地其他应用照常外放"
+          : "需选择单个目标应用后可仅对该应用开启本机消音";
+      } else {
+        muteLocalDesc.textContent = state.muteLocalHint || "当前环境暂不支持单应用本机独立消音";
+      }
+    }
+
     if (projectionRow) {
-      projectionRow.style.display = (state.sourceMode === MODE_SYSTEM_LOOPBACK && !state.hasProjection) ? "flex" : "none";
+      projectionRow.style.display = (state.sourceMode === MODE_SYSTEM_LOOPBACK && !state.hasProjection && !isDirectPrivileged) ? "flex" : "none";
     }
     if (notifBanner) {
       notifBanner.style.display = (state.sourceMode === MODE_SYSTEM_LOOPBACK && !state.notificationAccessGranted) ? "flex" : "none";
@@ -597,6 +634,24 @@ export function initSenderController({
   });
 
   appRefreshBtn?.addEventListener("click", () => refreshInstalledApps(true));
+
+  muteLocalSwitch?.addEventListener("click", async () => {
+    const next = !state.muteLocalApp;
+    muteLocalSwitch.setAttribute("aria-checked", String(next));
+    const res = await rpcAsync("source.setMuteLocalApp", { muteLocalApp: next });
+    if (res?.error) {
+      muteLocalSwitch.setAttribute("aria-checked", String(!!state.muteLocalApp));
+      showToast(res.error);
+      return;
+    }
+    showToast(next ? "已开启本机静音投送源" : "已恢复本机同响");
+  });
+
+  shizukuBtn?.addEventListener("click", async () => {
+    const res = await rpcAsync("shizuku.requestPermission");
+    if (res?.error) showToast(res.error);
+    else showToast("已发起 Shizuku 授权请求");
+  });
 
   projectionBtn?.addEventListener("click", () => {
     rpcAsync("source.setMode", { mode: MODE_SYSTEM_LOOPBACK });

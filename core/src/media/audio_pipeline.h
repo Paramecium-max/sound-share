@@ -1,6 +1,7 @@
 #pragma once
 
 #include "media/media_control.h"
+#include "media/per_app_route.h"
 
 #include <array>
 #include <atomic>
@@ -112,6 +113,9 @@ public:
     std::string source_param() const;
     std::string last_error() const;
     bool is_process_loopback_fallback() const { return process_loopback_fallback_.load(); }
+    void set_mute_local_app(bool mute);
+    bool is_mute_local_app() const { return mute_local_app_.load(); }
+    SilentRouteStatus mute_local_status() const;
 
     static void recover_playback_route();
     static bool is_loopback_supported();
@@ -173,6 +177,9 @@ private:
     std::mutex ext_mu_;
     SmoothLoopbackFifo ext_fifo_;
     std::atomic<bool> process_loopback_fallback_{false};
+    std::atomic<bool> mute_local_app_{false};
+    mutable std::mutex route_status_mu_;
+    SilentRouteStatus mute_local_status_{};
 
 #if defined(__linux__) && !defined(__ANDROID__)
     // Exclusively owned by the audio worker.

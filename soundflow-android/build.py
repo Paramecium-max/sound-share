@@ -199,6 +199,8 @@ def build_apk(so_path: Path) -> Path:
     )
 
     java_srcs = sorted((PROJ / "src").rglob("*.java")) + sorted((BUILD / "gen").rglob("*.java"))
+    lib_jars = sorted((PROJ / "libs").glob("*.jar"))
+    javac_cp = os.pathsep.join([str(SDK_JAR), *(str(j) for j in lib_jars)])
     run(
         JAVA_BIN / "javac",
         "-encoding",
@@ -208,7 +210,7 @@ def build_apk(so_path: Path) -> Path:
         "-target",
         "11",
         "-cp",
-        SDK_JAR,
+        javac_cp,
         "-d",
         BUILD / "classes",
         *java_srcs,
@@ -227,6 +229,7 @@ def build_apk(so_path: Path) -> Path:
         "--output",
         BUILD / "dex",
         *class_files,
+        *lib_jars,
     )
 
     unsigned_apk = BUILD / "unsigned.apk"

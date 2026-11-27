@@ -764,6 +764,11 @@ bool MultiRoomEngine::set_source_mode(media::AudioSourceMode mode, const std::st
     return true;
 }
 
+void MultiRoomEngine::set_mute_local_app(bool mute) {
+    audio_pipeline_.set_mute_local_app(mute);
+    emit_state_changed();
+}
+
 void MultiRoomEngine::push_external_pcm(const int16_t* stereo_pcm, size_t frame_samples) {
     audio_pipeline_.push_external_pcm(stereo_pcm, frame_samples);
 }
@@ -1036,6 +1041,10 @@ EngineStateSnapshot MultiRoomEngine::snapshot_state() const {
     snap.multiroom_running = multiroom_running_;
     snap.loopback_supported = media::AudioPipeline::is_loopback_supported();
     snap.process_loopback_fallback = audio_pipeline_.is_process_loopback_fallback();
+    snap.mute_local_app = audio_pipeline_.is_mute_local_app();
+    const auto mute_st = audio_pipeline_.mute_local_status();
+    snap.mute_local_supported = mute_st.supported;
+    snap.mute_local_hint = mute_st.hint;
     snap.timer_service_port = timer_service_.port();
     snap.session_time_offset_us = master_clock_.session_origin_us();
     snap.sample_rate = active_audio_cfg_.sample_rate;
@@ -1099,6 +1108,8 @@ json::Value MultiRoomEngine::snapshot_state_value() const {
         {"bindIp", snap.bind_ip}, {"autoBind", snap.auto_bind},
         {"discoveryRunning", snap.discovery_running}, {"multiroomRunning", snap.multiroom_running},
         {"loopbackSupported", snap.loopback_supported}, {"processLoopbackFallback", snap.process_loopback_fallback},
+        {"muteLocalApp", snap.mute_local_app}, {"muteLocalSupported", snap.mute_local_supported},
+        {"muteLocalHint", snap.mute_local_hint},
         {"timerServicePort", snap.timer_service_port},
         {"sessionTimeOffsetUs", snap.session_time_offset_us}, {"sampleRate", snap.sample_rate},
         {"basePlayDelayMs", snap.base_play_delay_ms}, {"codec", snap.prefer_lpcm ? "LPCM" : "AAC_LC"},

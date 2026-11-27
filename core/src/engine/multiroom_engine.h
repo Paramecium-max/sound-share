@@ -52,6 +52,9 @@ struct EngineStateSnapshot {
     bool multiroom_running = false;
     bool loopback_supported = true;
     bool process_loopback_fallback = false;
+    bool mute_local_app = false;
+    bool mute_local_supported = false;
+    std::string mute_local_hint;
     uint16_t timer_service_port = 0;
     uint64_t session_time_offset_us = 0;
     uint32_t sample_rate = 48000;
@@ -96,6 +99,7 @@ public:
     void set_master_volume(int32_t volume_0_100);
 
     bool set_source_mode(media::AudioSourceMode mode, const std::string& param = "", std::string* err_out = nullptr);
+    void set_mute_local_app(bool mute);
     void push_external_pcm(const int16_t* stereo_pcm, size_t frame_samples);
     void set_media_metadata(const cmd::MediaInfoPayload& info, bool broadcast = true);
     void set_media_position_ms(uint64_t position_ms, bool broadcast = true);

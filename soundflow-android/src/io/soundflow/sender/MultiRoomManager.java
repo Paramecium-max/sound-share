@@ -70,6 +70,7 @@ public final class MultiRoomManager {
 
     private final NativeSender nativeSender = new NativeSender();
     private final AudioCaptureEngine audioEngine = new AudioCaptureEngine();
+    private final ShizukuCaptureBridge shizukuBridge = new ShizukuCaptureBridge();
     private final ArrayDeque<String> logBuffer = new ArrayDeque<>(160);
 
     private final AtomicBoolean initialized = new AtomicBoolean(false);
@@ -92,6 +93,8 @@ public final class MultiRoomManager {
     private volatile int targetAppUid = -1;
     private volatile String targetAppPkg = "";
     private volatile String targetAppName = "";
+    private volatile String captureBackend = "media_projection";
+    private volatile boolean muteLocalApp = false;
     private volatile String platformError = "";
     private volatile String activeWavPath = "";
 
@@ -152,8 +155,62 @@ public final class MultiRoomManager {
     public void attachContext(Context context) {
         if (context == null) return;
         this.appContext = context.getApplicationContext();
+        shizukuBridge.register(() -> {
+            refreshCaptureBackend();
+            broadcastStateThrottled(true);
+        });
+        refreshCaptureBackend();
         if (!initialized.compareAndSet(false, true)) return;
         new Thread(() -> initOnBackground(this.appContext), "SoundFlow-SenderInit").start();
+    }
+
+    public synchronized void refreshCaptureBackend() {
+        Context ctx = this.appContext;
+        if (ctx == null) return;
+        if (PrivilegedAudioPolicyHelper.hasDirectPrivilegedRouting(ctx)) {
+            if (!"privileged_policy".equals(captureBackend) || !audioEngine.hasMediaProjection()) {
+                captureBackend = "privileged_policy";
+                audioEngine.setPrivilegedPolicyContext(ctx);
+                platformError = "";
+                logSender("已启用系统特权免投屏直抓通道 (AudioPolicy)");
+            }
+            return;
+        }
+        if (shizukuBridge.isAvailable() && shizukuBridge.isGranted()) {
+            if (!"shizuku".equals(captureBackend) || !audioEngine.hasMediaProjection()) {
+                captureBackend = "shizuku";
+                audioEngine.setShizukuBridge(ctx, shizukuBridge);
+                platformError = "";
+                logSender("已启用 Shizuku 免投屏直抓通道 (UID 2000)");
+            }
+            return;
+        }
+        if (!"media_projection".equals(captureBackend)) {
+            captureBackend = "media_projection";
+            audioEngine.revokeMediaProjection(null);
+        }
+    }
+
+    public synchronized void setMuteLocalApp(boolean mute) throws Exception {
+        if (this.muteLocalApp == mute) return;
+        boolean restart = multiroomRunning.get() && uiSourceMode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK;
+        boolean lpcm = preferLpcm;
+        int rate = sampleRate;
+        int delay = basePlayDelayMs;
+        if (restart) {
+            audioEngine.stop();
+            JSONObject stopped = callNative("multiroom.stop", null);
+            multiroomRunning.set(false);
+            if (!stopped.optBoolean("result", false)) {
+                throw new IllegalStateException(stopped.optString("error", "无法确认旧音频流已停止"));
+            }
+        }
+        this.muteLocalApp = mute;
+        audioEngine.setMuteLocalApp(mute);
+        if (restart && !startMultiroom(lpcm, rate, delay)) {
+            throw new IllegalStateException(platformError);
+        }
+        broadcastStateThrottled(true);
     }
 
     public void setUiActionDelegate(UiActionDelegate delegate) {
@@ -787,10 +844,13 @@ public final class MultiRoomManager {
                     }
                     this.uiSourceMode = mode;
                     this.platformError = "";
+                    refreshCaptureBackend();
                     audioEngine.setMode(mode, param);
                     if (mode == AudioCaptureEngine.MODE_SYSTEM_LOOPBACK && !audioEngine.hasMediaProjection()) {
                         syncNativeSourceMode();
-                        if (uiDelegate != null) uiDelegate.onRequestSystemAudioCapture();
+                        if ("media_projection".equals(captureBackend) && uiDelegate != null) {
+                            uiDelegate.onRequestSystemAudioCapture();
+                        }
                     } else {
                         if (mode == AudioCaptureEngine.MODE_WAV_FILE && !param.isEmpty()) {
                             activeWavPath = param;
@@ -798,6 +858,17 @@ public final class MultiRoomManager {
                         syncNativeSourceMode();
                     }
                     pollNativeOnce(true);
+                    break;
+                }
+                case "source.setMuteLocalApp": {
+                    setMuteLocalApp(req.optBoolean("muteLocalApp", false));
+                    result = buildStateJson();
+                    break;
+                }
+                case "shizuku.requestPermission": {
+                    result = shizukuBridge.requestPermission();
+                    refreshCaptureBackend();
+                    broadcastStateThrottled(true);
                     break;
                 }
                 case "app.listAudioApps":
@@ -887,6 +958,15 @@ public final class MultiRoomManager {
         base.put("sampleRate", running ? base.optInt("sampleRate", sampleRate) : sampleRate);
         base.put("sourceMode", uiSourceMode);
         base.put("hasProjection", audioEngine.hasMediaProjection());
+        base.put("captureBackend", captureBackend);
+        boolean shizukuAvail = shizukuBridge.isAvailable();
+        boolean shizukuGrant = shizukuBridge.isGranted();
+        boolean muteSupported = "privileged_policy".equals(captureBackend) || "shizuku".equals(captureBackend);
+        base.put("shizukuAvailable", shizukuAvail);
+        base.put("shizukuGranted", shizukuGrant);
+        base.put("muteLocalApp", muteLocalApp);
+        base.put("muteLocalSupported", muteSupported);
+        base.put("muteLocalHint", muteSupported ? "" : "需 Magisk 特权固化或授权 Shizuku 免投屏通道");
         base.put("targetAppUid", targetAppUid);
         base.put("targetAppPkg", targetAppPkg);
         base.put("targetAppName", targetAppName);

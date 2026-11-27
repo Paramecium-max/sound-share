@@ -3,6 +3,8 @@
 #include "discovery/mdns_discovery.h"
 #include "discovery/probe_burst.h"
 #include "engine/multiroom_engine.h"
+#include "media/per_app_route.h"
+#include "sidecar/sender_rpc.h"
 #include "media/aac_encoder.h"
 #include "media/aac_timeline.h"
 #include "media/audio_pipeline.h"
@@ -2199,6 +2201,36 @@ static void test_remote_control_and_lrc_sync() {
     std::cout << "[PASS] test_remote_control_and_lrc_sync\n";
 }
 
+static void test_per_app_silent_router_and_rpc() {
+    std::vector<media::RecoveryRouteEntry> entries{
+        {1234, 133500000000000000ULL, "\\\\?\\SWD#MMDEVAPI#{0.0.0.00000000}.{aaaa}#{e6327cad-dcec-4949-ae8a-991e976a79d2}"},
+        {5678, 133500000000000099ULL, ""},
+    };
+    const std::string serialized = media::PerAppSilentRouter::serialize_recovery_entries(entries);
+    const std::string with_noise = serialized + "bad_line_without_pipes\r\n0|123|ignored\r\nnotanumber|1|x\r\n";
+    const auto parsed = media::PerAppSilentRouter::parse_recovery_entries(with_noise);
+    CHECK(parsed.size() == 2);
+    CHECK(parsed[0].pid == 1234 && parsed[0].creation_time == 133500000000000000ULL);
+    CHECK(parsed[0].prior_token == entries[0].prior_token);
+    CHECK(parsed[1].pid == 5678 && parsed[1].prior_token.empty());
+
+    MultiRoomEngine engine;
+    const std::string r1 = sidecar::handle_request(
+        engine, R"({"id":"m1","method":"source.setMuteLocalApp","muteLocalApp":true})");
+    const auto v1 = json::parse(r1);
+    const auto& obj1 = std::get<json::Value::Object>(v1.data);
+    const auto& res1 = std::get<json::Value::Object>(obj1.at("result").data);
+    CHECK(std::get<bool>(res1.at("muteLocalApp").data) == true);
+
+    const std::string r2 = sidecar::handle_request(
+        engine, R"({"id":"m2","method":"source.setMuteLocalApp","muteLocalApp":false})");
+    const auto v2 = json::parse(r2);
+    const auto& obj2 = std::get<json::Value::Object>(v2.data);
+    const auto& res2 = std::get<json::Value::Object>(obj2.at("result").data);
+    CHECK(std::get<bool>(res2.at("muteLocalApp").data) == false);
+    std::cout << "[PASS] test_per_app_silent_router_and_rpc\n";
+}
+
 int main(int argc, char** argv) {
 #if defined(__linux__)
     if (argc == 2 && std::string_view(argv[1]) == "--continuous-loopback-source") {
@@ -2239,6 +2271,7 @@ int main(int argc, char** argv) {
     test_rtsp_multiport_dual_tcp_negotiation();
     test_smooth_audio_anti_jitter_pipeline();
     test_mdns_qu_unicast_and_multi_service_discovery();
+    test_per_app_silent_router_and_rpc();
     std::cout << "\nALL MIPLAY_CORE TESTS PASSED!\n";
     return 0;
 }
