@@ -6,7 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { promisify } = require('node:util');
 const { SmtcBridge } = require('./smtc_bridge.cjs');
-const { DesktopLyrics, isTimed } = require('./soundflow-lyrics.cjs');
+const { DesktopLyrics, isTimed, parseLrcLines, lrcLineAt } = require('./soundflow-lyrics.cjs');
 const { SoundFlowNative } = require('./soundflow-native.cjs');
 
 const APP_URL = 'https://app.soundflow.local/index.html';
@@ -33,6 +33,10 @@ let track = {};
 let localLrc = '';
 let lyricLookup;
 let senderLrc = '';
+let senderLrcLines = [];
+let senderLyricLookup = null;
+let senderTrackSig = '';
+let senderLastLine = '';
 let wavPath = '';
 let codec = 'AAC_LC';
 let trackRevision = 0;
@@ -372,7 +376,7 @@ async function uiSenderRpc(raw) {
       case 'media.control':
         result = sender.sourceMode === 1
           ? await senderRequest('wav.pause', { paused: request.action === 'pause' })
-          : smtc.dispatchAction(request.action);
+          : (smtc.dispatchAction(request.action, request.positionMs) || true);
         break;
       case 'multiroom.start':
         result = await senderRequest(method, { codec, sampleRate: request.sampleRate, basePlayDelayMs: request.basePlayDelayMs });
@@ -466,6 +470,7 @@ async function handle(method, args) {
       const text = await readLrc(file);
       await senderRequest('media.loadLrcFile', { path: file });
       senderLrc = text;
+      senderLrcLines = parseLrcLines(text);
       publishSenderState();
       return;
     }
@@ -540,10 +545,123 @@ else {
     core = new SoundFlowNative(binary, log);
     smtc = new SmtcBridge((current) => {
       if (sender.sourceMode !== 2) return;
-      senderRequest('media.setMetadata', current.available ? {
-        title: current.title, artist: current.artist, album: current.album,
-        positionMs: current.positionMs, durationMs: current.durationMs,
-      } : { title: '', artist: '', album: '' }).catch((error) => log(error.message));
+      if (!current.available || !current.title) {
+        if (senderTrackSig) {
+          senderTrackSig = '';
+          senderLyricLookup?.abort();
+          senderLrc = '';
+          senderLrcLines = [];
+          senderLastLine = '';
+          senderRequest('media.setMetadata', {
+            title: '', artist: '', album: '', lyrics: '', lyricLine: '',
+            sourceName: target?.label ?? 'Windows 音频',
+          }).catch((error) => log(error.message));
+        }
+        return;
+      }
+
+      const sig = `${current.title}|${current.artist || ''}`;
+      const trackChanged = sig !== senderTrackSig;
+      if (trackChanged) {
+        senderTrackSig = sig;
+        senderLyricLookup?.abort();
+        senderLrc = '';
+        senderLrcLines = [];
+        senderLastLine = '';
+
+        senderRequest('media.setMetadata', {
+          title: current.title,
+          artist: current.artist || '',
+          album: current.album || '',
+          positionMs: current.positionMs || 0,
+          durationMs: current.durationMs || 0,
+          lyrics: '',
+          lyricLine: '',
+          sourceName: target?.label ?? 'Windows 音频',
+          broadcast: true,
+        }).catch((error) => log(error.message));
+
+        const lookupCtrl = new AbortController();
+        senderLyricLookup = lookupCtrl;
+        const queryTrack = {
+          title: current.title,
+          artist: current.artist || '',
+          album: current.album || '',
+          durationMs: current.durationMs || 0,
+          kuwoMusicId: current.kuwoMusicId || '',
+        };
+        (async () => {
+          let lrcText = await lyrics.read(queryTrack);
+          let enrichedAlbum = queryTrack.album;
+          let enrichedDur = queryTrack.durationMs;
+          if (!lrcText && !lookupCtrl.signal.aborted) {
+            const timeout = AbortSignal.timeout(6500);
+            const rich = await lyrics.lookupRich(queryTrack, AbortSignal.any([lookupCtrl.signal, timeout]));
+            if (rich) {
+              if (rich.lyrics && isTimed(rich.lyrics)) {
+                lrcText = rich.lyrics;
+                await lyrics.write(queryTrack, lrcText).catch(() => {});
+                await publishLyricCount().catch(() => {});
+              }
+              if (rich.album && !enrichedAlbum) enrichedAlbum = rich.album;
+              if (rich.durationMs > 0 && !enrichedDur) enrichedDur = rich.durationMs;
+              smtc.updateEnrichedMeta({ album: enrichedAlbum, durationMs: enrichedDur });
+            }
+          }
+          if (lookupCtrl.signal.aborted || senderTrackSig !== sig) return;
+          if (lrcText) {
+            senderLrc = lrcText;
+            senderLrcLines = parseLrcLines(lrcText);
+          }
+          const latestPos = smtc.lastTrack?.positionMs || current.positionMs || 0;
+          const curLine = lrcLineAt(senderLrcLines, latestPos);
+          senderLastLine = curLine;
+          await senderRequest('media.setMetadata', {
+            title: current.title,
+            artist: current.artist || '',
+            album: enrichedAlbum || '',
+            positionMs: latestPos,
+            durationMs: enrichedDur || 0,
+            lyrics: senderLrc,
+            lyricLine: curLine,
+            sourceName: target?.label ?? 'Windows 音频',
+            broadcast: true,
+          });
+          sender = await senderRequest('state.get');
+          publishSenderState();
+        })().catch((error) => {
+          if (!lookupCtrl.signal.aborted) log(`发送台歌词同步失败 ${error.message}`);
+        });
+        return;
+      }
+
+      // Same track: advance position and live lyric sentence
+      const posMs = current.positionMs || 0;
+      const durMs = current.durationMs || sender.track?.durationMs || 0;
+      const album = current.album || sender.track?.album || '';
+      const curLine = lrcLineAt(senderLrcLines, posMs);
+      if (curLine !== senderLastLine) {
+        senderLastLine = curLine;
+        senderRequest('media.setMetadata', {
+          title: current.title,
+          artist: current.artist || '',
+          album,
+          positionMs: posMs,
+          durationMs: durMs,
+          lyrics: senderLrc,
+          lyricLine: curLine,
+          sourceName: target?.label ?? 'Windows 音频',
+          broadcast: true,
+        }).catch((error) => log(error.message));
+      } else {
+        senderRequest('media.setPosition', {
+          positionMs: posMs,
+          broadcast: true,
+        }).catch((error) => log(error.message));
+      }
+      if (senderStage) {
+        send('position', posMs);
+      }
     });
     smtc.start();
     core.ready.then(async () => {
