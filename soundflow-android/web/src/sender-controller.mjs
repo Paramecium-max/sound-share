@@ -318,9 +318,9 @@ export function initSenderController({
     const badgeEl = card.querySelector(".sender-dev-badge");
     if (d.rtspStreaming) {
       const residualMs = Math.abs((Number(d.syncResidualUs) || 0) / 1000);
-      badgeEl.textContent = d.syncPackets > 0
+      badgeEl.textContent = d.syncPackets > 0 && Number.isFinite(residualMs) && residualMs <= 5000
         ? `同步 ±${residualMs.toFixed(1)}ms`
-        : "RTP 推流中";
+        : (d.syncPackets > 0 ? "时钟对齐中…" : "RTP 推流中");
       badgeEl.className = "sender-dev-badge tnum streaming";
     } else if (d.inGroup && state.multiroomRunning) {
       badgeEl.textContent = d.cmdConnected ? "握手就绪" : "连接中…";
