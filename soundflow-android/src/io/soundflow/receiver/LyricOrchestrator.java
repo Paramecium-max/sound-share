@@ -254,6 +254,8 @@ public final class LyricOrchestrator {
         return peak + "," + posArg + "," + bass + "," + mid + "," + high;
     }
 
+    private String mediaProtocol = "";
+
     public void onMediaUpdate(
             long mediaSeq,
             String rawTitle,
@@ -281,6 +283,8 @@ public final class LyricOrchestrator {
         }
         lastMediaSeq = mediaSeq;
 
+        boolean protocolChanged = !mediaProtocol.equals(protocol);
+        mediaProtocol = protocol;
         String cleanTitle = safeTrim(rawTitle);
         String cleanArtist = safeTrim(rawArtist);
         String cleanAlbum = safeTrim(rawAlbum);
@@ -288,6 +292,11 @@ public final class LyricOrchestrator {
         if (isInternalProcessAlbum) cleanAlbum = "";
         long durSec = durationMs / 1000L;
         if (cleanTitle.isEmpty() && cleanArtist.isEmpty() && cleanAlbum.isEmpty()) {
+            if (protocolChanged && !currentSongKey.isEmpty()) {
+                clearTrack();
+                evalOrQueue("window.SoundFlowStage && window.SoundFlowStage.setTrackHeader('', '', '', '');"
+                        + "window.SoundFlowStage && window.SoundFlowStage.pushRealtimeLine('',true);");
+            }
             updateSenderPosition(protocol, positionMs);
             return;
         }
@@ -479,6 +488,13 @@ public final class LyricOrchestrator {
     }
 
     public void clearStage() {
+        mediaProtocol = "";
+        clearTrack();
+        setPlayingState(false);
+        eval("window.SoundFlowStage && window.SoundFlowStage.pushRealtimeLine('',true);");
+    }
+
+    private void clearTrack() {
         flushLanRecordedToDisk();
         invalidateOnlineLookup();
         offlineTicket++;
@@ -494,8 +510,6 @@ public final class LyricOrchestrator {
         rememberedTrackDurSec = -1;
         hasFullLrcForCurrentSong = false;
         lanRecordedLines.clear();
-        setPlayingState(false);
-        eval("window.SoundFlowStage && window.SoundFlowStage.pushRealtimeLine('',true);");
     }
 
     private void recordLanLine(String text) {

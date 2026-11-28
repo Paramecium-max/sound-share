@@ -95,7 +95,10 @@ public final class DlnaRendererServer {
     private volatile long session;
     private volatile long sampledDuration;
     private volatile long sampledPosition;
-    private volatile SeekRequest pendingSeek;
+    private final AtomicReference<SeekRequest> pendingSeek = new AtomicReference<>();
+    // MediaPlayer provides no request ID in onSeekComplete. Issue one seek at
+    // a time and remember only the latest position requested by a controller.
+    private SeekRequest inFlightSeek;
 
     private static final class SeekRequest {
         final long session;
@@ -696,15 +699,8 @@ public final class DlnaRendererServer {
             if (sampledDuration > 0) targetMs = Math.min(sampledDuration, targetMs);
             if (mediaPrepared) {
                 SeekRequest seek = new SeekRequest(session, targetMs);
-                pendingSeek = seek;
-                playerHandler.post(() -> {
-                    if (pendingSeek != seek || session != seek.session || player == null || !mediaPrepared) return;
-                    try {
-                        player.seekTo(seek.targetMs, MediaPlayer.SEEK_CLOSEST);
-                    } catch (IllegalStateException e) {
-                        if (pendingSeek == seek) pendingSeek = null;
-                    }
-                });
+                pendingSeek.set(seek);
+                playerHandler.post(this::startPendingSeek);
             }
             return soapResp("AVTransport", "Seek", "");
         }
@@ -715,7 +711,7 @@ public final class DlnaRendererServer {
         }
         if (action.contains("GetPositionInfo")) {
             long dur = sampledDuration;
-            SeekRequest seek = pendingSeek;
+            SeekRequest seek = pendingSeek.get();
             boolean awaitingSeek = seek != null && seek.session == session
                     && SystemClock.elapsedRealtime() - seek.requestedAt < 4_000L;
             long pos = awaitingSeek ? seek.targetMs : sampledPosition
@@ -778,13 +774,16 @@ public final class DlnaRendererServer {
                 }
             });
             player.setOnSeekCompleteListener(mp -> {
-                if (player != mp) return;
-                SeekRequest seek = pendingSeek;
-                long actual = getPositionSafe();
-                if (seek == null || Math.abs(actual - seek.targetMs) <= 1000L) {
-                    emitState(playing ? "PLAYING" : "PAUSED_PLAYBACK");
-                    if (pendingSeek == seek) pendingSeek = null;
+                if (player != mp || inFlightSeek == null) return;
+                SeekRequest completed = inFlightSeek;
+                inFlightSeek = null;
+                if (pendingSeek.get() == completed) {
+                    samplePosition();
+                    if (pendingSeek.compareAndSet(completed, null)) {
+                        notifyState(playing ? "PLAYING" : "PAUSED_PLAYBACK");
+                    }
                 }
+                startPendingSeek();
             });
             player.setOnCompletionListener(mp -> {
                 if (player != mp) return;
@@ -807,6 +806,23 @@ public final class DlnaRendererServer {
         }
     }
 
+    private void startPendingSeek() {
+        if (inFlightSeek != null) return;
+        SeekRequest seek = pendingSeek.get();
+        if (seek == null) return;
+        if (seek.session != session || player == null || !mediaPrepared) {
+            pendingSeek.compareAndSet(seek, null);
+            return;
+        }
+        inFlightSeek = seek;
+        try {
+            player.seekTo(seek.targetMs, MediaPlayer.SEEK_CLOSEST);
+        } catch (IllegalStateException e) {
+            inFlightSeek = null;
+            pendingSeek.compareAndSet(seek, null);
+        }
+    }
+
     private void releasePlayerKeepDataSource() {
         synchronized (visualizerLock) {
             audioSessionId = 0;
@@ -815,7 +831,8 @@ public final class DlnaRendererServer {
         }
         mediaPrepared = false;
         playing = false;
-        pendingSeek = null;
+        pendingSeek.set(null);
+        inFlightSeek = null;
         sampledDuration = 0;
         sampledPosition = 0;
         sampledAt = SystemClock.elapsedRealtime();
@@ -842,9 +859,17 @@ public final class DlnaRendererServer {
     }
 
     private void emitState(String state) {
+        samplePosition();
+        notifyState(state);
+    }
+
+    private void samplePosition() {
         sampledDuration = getDurationSafe();
         sampledPosition = getPositionSafe();
         sampledAt = SystemClock.elapsedRealtime();
+    }
+
+    private void notifyState(String state) {
         listener.onDlnaState(session, playing, state, title, artist, album, sampledDuration, sampledPosition);
     }
 

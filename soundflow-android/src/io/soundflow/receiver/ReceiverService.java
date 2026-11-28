@@ -160,13 +160,21 @@ public final class ReceiverService extends Service {
     private volatile boolean miplayEngineStarted = false;
     private int lastVolumeIndex = -1;
     private int currentVolumePercent = 45;
-    private long generation = 0;
+    private volatile long generation = 0;
     private int foregroundType;
     private String publishedNoticeTitle;
     private String publishedNoticeStatus;
     private int publishedNoticeAction = -1;
     private boolean nativeSessionActive;
     private boolean nativePlaying;
+    private MiPlayTrack nativeTrack;
+    private String nativeSource = "";
+    private String nativeFormat = "";
+    private long nativePositionMs;
+    private long nativePositionAnchor;
+    private boolean nativePositionKnown;
+    private int lastLoggedVolumePercent = -1;
+    private boolean dlnaPaused;
     private long publishedMediaPosition;
     private long publishedMediaAt;
 
@@ -551,6 +559,10 @@ public final class ReceiverService extends Service {
         if (healthy && next.equals(boundEndpoint)) return;
 
         long ticket = ++generation;
+        clearNativePlayback();
+        nativeMediaGeneration = 0;
+        lastLoggedVolumePercent = -1;
+        activeProtocol = "xiaomi";
         miplayRunning = false;
         dlnaRunning = false;
         playing = false;
@@ -702,6 +714,7 @@ public final class ReceiverService extends Service {
                         || !mediaArtist.equals(artist == null ? "" : artist);
                 activeProtocol = "dlna";
                 dlnaSession = session;
+                dlnaPaused = false;
                 visualGeneration++;
                 playing = false;
                 sessionActive = true;
@@ -719,7 +732,8 @@ public final class ReceiverService extends Service {
         public void onDlnaState(long session, boolean isPlaying, String transportState, String title, String artist, String album, long durationMs, long positionMs) {
             main.post(() -> {
                 if (destroyed || !desired || session != dlnaSession || !"dlna".equals(activeProtocol)) return;
-                boolean nextActive = isPlaying || "PAUSED_PLAYBACK".equals(transportState);
+                dlnaPaused = "PAUSED_PLAYBACK".equals(transportState);
+                boolean nextActive = isPlaying || dlnaPaused;
                 long previousPosition = currentLivePositionMs();
                 boolean changed = playing != isPlaying || sessionActive != nextActive
                         || mediaDurationMs != durationMs || Math.abs(positionMs - previousPosition) >= 450L
@@ -824,11 +838,13 @@ public final class ReceiverService extends Service {
         @Override public void run() {
             if (destroyed) return;
             try {
+                long pollGeneration = generation;
                 String raw = NativeBridge.poll();
                 if (raw != null && !"[]".equals(raw)) {
                     JSONArray events = new JSONArray(raw);
                     main.post(() -> {
-                        if (destroyed || !desired || ENGINE_OWNER.get() != engineToken) return;
+                        if (destroyed || !desired || pollGeneration != generation
+                                || ENGINE_OWNER.get() != engineToken) return;
                         JSONObject lastVolume = null;
                         for (int i = 0; i < events.length(); i++) {
                             JSONObject event = events.optJSONObject(i);
@@ -952,24 +968,53 @@ public final class ReceiverService extends Service {
         return "null".equals(val) ? "" : val;
     }
 
-    private void activateXiaomiTransport() {
+    private void clearNativePlayback() {
+        nativeSessionActive = false;
+        nativePlaying = false;
+        nativeTrack = null;
+        nativeSource = "";
+        nativeFormat = "";
+        nativePositionMs = 0;
+        nativePositionAnchor = 0;
+        nativePositionKnown = false;
+    }
+
+    private long nativePositionAt(long now) {
+        return nativePositionMs + (nativePlaying && nativePositionAnchor != 0
+                ? Math.max(0L, now - nativePositionAnchor) : 0L);
+    }
+
+    private void setNativePlaying(boolean value, long now) {
+        if (nativePlaying == value) return;
+        nativePositionMs = nativePositionAt(now);
+        nativePositionAnchor = now;
+        nativePlaying = value;
+    }
+
+    private void applyNativeTrack(long now) {
+        MiPlayTrack track = nativeTrack;
+        mediaTitle = track == null ? "" : track.title;
+        mediaArtist = track == null ? "" : track.artist;
+        mediaAlbum = track == null ? "" : track.album;
+        mediaArtwork = track == null ? "" : track.artwork;
+        mediaLyricsLrc = track == null ? "" : track.lyrics;
+        mediaLyricLine = track == null ? "" : track.line;
+        mediaDurationMs = track == null ? 0 : track.durationMs;
+        mediaPositionMs = nativePositionKnown ? nativePositionAt(now) : 0;
+        mediaPositionAnchorElapsed = nativePositionKnown ? now : 0;
+        miplayPositionKnown = nativePositionKnown;
+        lastMediaSeq++;
+        updateMediaSessionMetadata();
+    }
+
+    private void activateXiaomiTransport(long now) {
         boolean wasDlna = "dlna".equals(activeProtocol);
         activeProtocol = "xiaomi";
         if (wasDlna) {
             visualGeneration++;
-            mediaTitle = "";
-            mediaArtist = "";
-            mediaAlbum = "";
-            mediaArtwork = "";
-            mediaLyricsLrc = "";
-            mediaLyricLine = "";
-            mediaDurationMs = 0;
-            mediaPositionMs = 0;
-            mediaPositionAnchorElapsed = 0;
-            miplayPositionKnown = false;
-            sourceName = "小米妙播发送端";
-            formatText = "";
-            updateMediaSessionMetadata();
+            sourceName = nativeSource.isEmpty() ? "小米妙播发送端" : nativeSource;
+            formatText = nativeFormat;
+            applyNativeTrack(now);
             if (dlnaServer != null) dlnaServer.stopPlayback();
         }
         if (focusHeld) {
@@ -1013,13 +1058,19 @@ public final class ReceiverService extends Service {
 
     private void handleNativeEvent(JSONObject e) {
         String event = optCleanString(e, "event");
-        if (!"progress".equals(event) && !"protocol_trace".equals(event) && !"discovery_packet_received".equals(event)) {
-            if (!event.startsWith("discovery_query")) {
-                final String safeLine = sanitizeNativeLogEvent(e);
-                logWriter.execute(() -> writeLog("native", safeLine));
-            }
+        int volume = "volume".equals(event) ? e.optInt("percent", currentVolumePercent) : currentVolumePercent;
+        boolean logVolume = "volume".equals(event) && volume != lastLoggedVolumePercent;
+        if (logVolume) lastLoggedVolumePercent = volume;
+        if (logVolume || (!"volume".equals(event) && !"progress".equals(event)
+                && !"protocol_trace".equals(event) && !"discovery_packet_received".equals(event)
+                && !event.startsWith("discovery_query"))) {
+            logWriter.execute(() -> writeLog("native", sanitizeNativeLogEvent(e)));
         }
+
+        long now = SystemClock.elapsedRealtime();
         String stage = "interconnect_stage".equals(event) ? e.optString("stage") : "";
+        boolean newTrack = false;
+        boolean acceptedProgress = false;
         switch (event) {
             case "interconnect_stage":
                 if ("media_session_established".equals(stage)) nativeSessionActive = true;
@@ -1027,62 +1078,94 @@ public final class ReceiverService extends Service {
             case "stream_started":
             case "audio_output_signal_started":
                 nativeSessionActive = true;
-                nativePlaying = true;
+                setNativePlaying(true, now);
                 break;
             case "playback_state":
-                nativePlaying = e.optBoolean("playing");
+                setNativePlaying(e.optBoolean("playing"), now);
                 nativeSessionActive = e.optBoolean("session_active", nativeSessionActive);
                 break;
             case "media_channel_closed":
             case "stream_stopped":
-                nativeSessionActive = false;
-                nativePlaying = false;
+                clearNativePlayback();
                 break;
+            case "source_info":
+                nativeSource = optCleanString(e, "source_name");
+                break;
+            case "audio_format":
+                nativeFormat = optCleanString(e, "codec") + " · " + e.optInt("sample_rate")
+                        + " Hz · " + e.optInt("channels") + "ch";
+                break;
+            case "media_info": {
+                MiPlayTrack incoming = new MiPlayTrack(e, nativeTrack);
+                if (incoming.hasIdentity()) {
+                    newTrack = nativeTrack == null || !incoming.sameSong(nativeTrack);
+                    nativeTrack = incoming;
+                }
+                long position = PlaybackPosition.parseMiPlayMillis(e.opt("position_ms"));
+                boolean richMetadata = incoming.album.startsWith("process:") || incoming.album.startsWith("wav:")
+                        || !incoming.lyrics.isEmpty() || !incoming.line.isEmpty();
+                boolean placeholder = position == 0 && !richMetadata && !newTrack && nativePositionKnown;
+                if (!placeholder && PlaybackPosition.isValidMiPlay(position, incoming.durationMs)) {
+                    nativePositionMs = position;
+                    nativePositionAnchor = now;
+                    nativePositionKnown = true;
+                } else if (newTrack || !PlaybackPosition.isValidMiPlay(nativePositionMs, incoming.durationMs)) {
+                    nativePositionMs = 0;
+                    nativePositionAnchor = 0;
+                    nativePositionKnown = false;
+                }
+                break;
+            }
+            case "progress": {
+                long position = PlaybackPosition.parseMiPlayMillis(e.opt("position_ms"));
+                if (PlaybackPosition.isValidMiPlay(position, nativeTrack == null ? 0 : nativeTrack.durationMs)) {
+                    nativePositionMs = position;
+                    nativePositionAnchor = now;
+                    nativePositionKnown = true;
+                    acceptedProgress = true;
+                }
+                break;
+            }
         }
+
+        boolean reclaimed = false;
         boolean reclaimFromMetadata = false;
         if ("dlna".equals(activeProtocol)) {
-            boolean explicitResume = "playback_state".equals(event) && e.optBoolean("playing");
-            reclaimFromMetadata = !sessionActive && nativeSessionActive && "media_info".equals(event);
-            boolean reclaimIdleDlna = (!playing && explicitResume) || reclaimFromMetadata;
-            boolean newNativeSession = reclaimIdleDlna
+            boolean isMetadata = "media_info".equals(event) && nativeTrack != null;
+            boolean sameDlnaTrack = isMetadata && nativeTrack.matchesDlna(mediaTitle, mediaArtist);
+            boolean explicitResume = "playback_state".equals(event) && nativePlaying;
+            reclaimFromMetadata = isMetadata && newTrack && !nativeTrack.title.isEmpty()
+                    && !sameDlnaTrack && nativeSessionActive && nativePlaying && (!sessionActive || dlnaPaused);
+            boolean newNativeSession = reclaimFromMetadata || (!playing && explicitResume)
                     || ("transport_connected".equals(stage) && !sessionActive)
                     || "media_session_established".equals(stage)
                     || "stream_started".equals(event)
                     || "audio_output_signal_started".equals(event);
-            if (newNativeSession) {
-                activateXiaomiTransport();
-            } else {
-                // A matching MiPlay side channel can supply a live lyric sentence,
-                // but cannot replace DLNA metadata, clock, or play/pause state.
-                if ("media_info".equals(event) && sessionActive && !mediaTitle.isEmpty()) {
-                    String album = optCleanString(e, "album");
-                    String artist = optCleanString(e, "artist");
-                    String title = optCleanString(e, "title");
-                    boolean sameTrack = mediaTitle.equals(album)
-                            || (artist.startsWith(mediaTitle + "-")
-                            && (mediaArtist.isEmpty() || artist.endsWith("-" + mediaArtist)));
-                    if (sameTrack) {
-                        String line = optCleanString(e, "lyric_line");
-                        if (line.isEmpty() && !title.equals(mediaTitle)) line = title;
-                        String lrc = optCleanString(e, "lyrics");
-                        if ((!line.isEmpty() && !line.equals(mediaLyricLine)) || (!lrc.isEmpty() && !lrc.equals(mediaLyricsLrc))) {
-                            if (!line.isEmpty()) mediaLyricLine = line;
-                            if (!lrc.isEmpty()) mediaLyricsLrc = lrc;
-                            lastMediaSeq++;
-                            broadcastMediaEvent();
-                        }
+            if (!newNativeSession) {
+                if (sessionActive && sameDlnaTrack) {
+                    String line = optCleanString(e, "lyric_line");
+                    if (line.isEmpty() && !nativeTrack.title.equals(mediaTitle)) line = nativeTrack.title;
+                    String lrc = optCleanString(e, "lyrics");
+                    if ((!line.isEmpty() && !line.equals(mediaLyricLine))
+                            || (!lrc.isEmpty() && !lrc.equals(mediaLyricsLrc))) {
+                        if (!line.isEmpty()) mediaLyricLine = line;
+                        if (!lrc.isEmpty()) mediaLyricsLrc = lrc;
+                        lastMediaSeq++;
+                        broadcastMediaEvent();
                     }
                 }
                 return;
             }
+            activateXiaomiTransport(now);
+            reclaimed = true;
         }
         long incomingGeneration = e.optLong("media_generation", 0);
         if (incomingGeneration != 0 && incomingGeneration != nativeMediaGeneration) {
             nativeMediaGeneration = incomingGeneration;
             visualGeneration++;
         }
-        boolean snapshotDirty = false;
-        boolean mediaDirty = false;
+        boolean snapshotDirty = reclaimed;
+        boolean mediaDirty = reclaimed;
 
         switch (event) {
             case "interconnect_stage": {
@@ -1090,7 +1173,7 @@ public final class ReceiverService extends Service {
                     statusText = "设备已握手，正在协商";
                     snapshotDirty = true;
                 } else if ("media_session_established".equals(stage)) {
-                    activateXiaomiTransport();
+                    activateXiaomiTransport(now);
                     sessionActive = true;
                     statusText = "音频信道已就绪";
                     acquirePlaybackLocks();
@@ -1102,11 +1185,11 @@ public final class ReceiverService extends Service {
                 break;
             }
             case "source_info":
-                sourceName = optCleanString(e, "source_name");
+                sourceName = nativeSource;
                 snapshotDirty = true;
                 break;
             case "stream_started":
-                activateXiaomiTransport();
+                activateXiaomiTransport(now);
                 sessionActive = true;
                 playing = true;
                 mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
@@ -1115,7 +1198,7 @@ public final class ReceiverService extends Service {
                 snapshotDirty = true;
                 break;
             case "audio_output_signal_started":
-                activateXiaomiTransport();
+                activateXiaomiTransport(now);
                 playing = true;
                 sessionActive = true;
                 mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
@@ -1165,72 +1248,34 @@ public final class ReceiverService extends Service {
                 if (reclaimFromMetadata) {
                     sessionActive = nativeSessionActive;
                     playing = nativePlaying;
-                    sourceName = "小米妙播发送端";
-                    statusText = playing ? "正在播放投送音频" : "播放已暂停";
-                    if (playing) acquirePlaybackLocks();
+                    statusText = "正在播放投送音频";
+                    acquirePlaybackLocks();
+                } else {
+                    if (newTrack) visualGeneration++;
+                    applyNativeTrack(now);
                 }
-                String title = optCleanString(e, "title");
-                String artist = optCleanString(e, "artist");
-                String album = optCleanString(e, "album");
-                String lyrics = optCleanString(e, "lyrics");
-                String lyricLine = optCleanString(e, "lyric_line");
-                boolean artistOrAlbumChanged = !mediaAlbum.equals(album) || !mediaArtist.equals(artist);
-                if (artistOrAlbumChanged) visualGeneration++;
-                // Older Xiaomi sources sometimes put the current lyric line in the title.
-                boolean richMetadata = album.startsWith("process:") || album.startsWith("wav:")
-                        || !lyrics.isEmpty() || !lyricLine.isEmpty();
-                boolean newTrack = artistOrAlbumChanged || (richMetadata && !mediaTitle.equals(title));
-                activeProtocol = "xiaomi";
-                mediaTitle = title;
-                mediaArtist = artist;
-                mediaAlbum = album;
-                mediaLyricsLrc = lyrics;
-                mediaLyricLine = lyricLine;
-                String art = optCleanString(e, "artwork").replaceAll("\\s+", "");
-                if (art.length() <= 196608) mediaArtwork = art;
-                else mediaArtwork = "";
-                long duration = PlaybackPosition.parseMiPlayMillis(e.opt("duration_ms"));
-                if (duration > 0 || newTrack) mediaDurationMs = Math.max(0L, duration);
-                long position = PlaybackPosition.parseMiPlayMillis(e.opt("position_ms"));
-                // Legacy live-lyric metadata can repeat a placeholder zero.
-                // An explicit SET_POSITION can still seek back to zero.
-                boolean legacyPlaceholder = position == 0 && !richMetadata && !newTrack
-                        && miplayPositionKnown;
-                if (!legacyPlaceholder && PlaybackPosition.isValidMiPlay(position, mediaDurationMs)) {
-                    mediaPositionMs = position;
-                    mediaPositionAnchorElapsed = SystemClock.elapsedRealtime();
-                    miplayPositionKnown = true;
-                } else if (newTrack || !PlaybackPosition.isValidMiPlay(mediaPositionMs, mediaDurationMs)) {
-                    mediaPositionMs = 0;
-                    mediaPositionAnchorElapsed = 0;
-                    miplayPositionKnown = false;
-                }
-                lastMediaSeq++;
-                updateMediaSessionMetadata();
                 mediaDirty = true;
                 snapshotDirty = true;
                 break;
             }
             case "progress": {
-                long nextPos = PlaybackPosition.parseMiPlayMillis(e.opt("position_ms"));
-                if (!PlaybackPosition.isValidMiPlay(nextPos, mediaDurationMs)) break;
-                long now = SystemClock.elapsedRealtime();
+                if (!acceptedProgress) break;
                 long expected = publishedMediaPosition + (playing && publishedMediaAt != 0
                         ? Math.max(0L, now - publishedMediaAt) : 0L);
-                boolean returnedToStart = nextPos == 0 && mediaPositionMs > 0;
-                mediaPositionMs = nextPos;
+                boolean returnedToStart = nativePositionMs == 0 && mediaPositionMs > 0;
+                mediaPositionMs = nativePositionMs;
                 mediaPositionAnchorElapsed = now;
-                if (!miplayPositionKnown || returnedToStart || Math.abs(nextPos - expected) >= 450L) {
+                if (!miplayPositionKnown || returnedToStart || Math.abs(mediaPositionMs - expected) >= 450L) {
                     mediaDirty = true;
                 }
                 miplayPositionKnown = true;
                 break;
             }
             case "volume":
-                applySystemVolume(e.optInt("percent", currentVolumePercent), false);
+                applySystemVolume(volume, false);
                 break;
             case "audio_format":
-                formatText = optCleanString(e, "codec") + " · " + e.optInt("sample_rate") + " Hz · " + e.optInt("channels") + "ch";
+                formatText = nativeFormat;
                 snapshotDirty = true;
                 break;
             case "error": {
@@ -1502,6 +1547,7 @@ public final class ReceiverService extends Service {
     private void stopReceiver() {
         desired = false;
         generation++;
+        clearNativePlayback();
         boundEndpoint = "";
         miplayRunning = false;
         dlnaRunning = false;

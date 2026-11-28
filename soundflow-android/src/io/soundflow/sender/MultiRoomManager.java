@@ -929,16 +929,20 @@ public final class MultiRoomManager {
                 }
                 case "shizuku.requestPermission": {
                     boolean requested = shizukuBridge.requestPermission();
-                    if (!requested) error = "未检测到运行中的 Shizuku 服务，可使用「无线 ADB 免投屏」直连本机 5555 端口";
+                    if (!requested) error = "未检测到运行中的 Shizuku 服务，可使用「无线 ADB 免投屏」配对并启动本机音频守护进程";
                     result = requested;
                     refreshCaptureBackend();
                     broadcastStateThrottled(true);
                     break;
                 }
+                case "adb.pair":
                 case "adb.connect": {
-                    int port = req.optInt("port", adbBridge.getConfiguredPort());
+                    int port = req.optInt("port", 0);
                     boolean enableMute = req.optBoolean("enableMute", false);
-                    boolean ok = adbBridge.connectAndStartDaemon(appContext, port);
+                    boolean pairing = "adb.pair".equals(method);
+                    boolean ok = pairing
+                            ? adbBridge.pairAndStartDaemon(appContext, req.optInt("pairPort", 0), port, req.optString("code", ""))
+                            : adbBridge.connectAndStartDaemon(appContext, port);
                     refreshCaptureBackend();
                     if (!ok) {
                         error = adbBridge.getLastError();
@@ -1034,7 +1038,9 @@ public final class MultiRoomManager {
             resp.put("type", "rpc");
             resp.put("id", id);
             if (error != null) resp.put("error", error);
-            else resp.put("result", result);
+            if (error == null || "adb.connect".equals(method) || "adb.pair".equals(method)) {
+                resp.put("result", result);
+            }
             return resp.toString();
         } catch (Exception e) {
             try {
@@ -1069,6 +1075,8 @@ public final class MultiRoomManager {
         base.put("adbDaemonActive", adbActive);
         base.put("adbPort", adbBridge.getConfiguredPort());
         base.put("adbLastError", adbBridge.getLastError());
+        base.put("adbPairingSupported", android.os.Build.VERSION.SDK_INT >= 30);
+        base.put("adbPairingSuggested", adbBridge.shouldSuggestPairing());
         base.put("muteLocalApp", muteLocalApp);
         base.put("muteLocalSupported", muteSupported);
         base.put("muteLocalHint", muteSupported ? "" : "点击开关或「无线 ADB 免投屏」连接本机调试端口即可开启单应用本机消音");

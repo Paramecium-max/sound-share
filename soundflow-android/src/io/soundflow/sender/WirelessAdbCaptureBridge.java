@@ -3,6 +3,10 @@ package io.soundflow.sender;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Process;
+import android.os.Build;
+import android.util.Log;
+
+import io.github.muntashirakon.adb.android.AdbMdns;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
@@ -23,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * over authenticated 127.0.0.1 TCP loopback.
  */
 public final class WirelessAdbCaptureBridge {
+    private static final String TAG = "SoundFlowWirelessAdb";
     private static final String PREFS = "soundflow_wireless_adb";
     private static final String KEY_PORT = "adb_port";
     private static final String KEY_DAEMON_PORT = "daemon_port";
@@ -33,12 +38,14 @@ public final class WirelessAdbCaptureBridge {
     private volatile int activeDaemonPort = 0;
     private volatile String activeToken = "";
     private volatile boolean cachedAlive = false;
+    private volatile boolean pairingSuggested;
+    private LocalWirelessAdb daemonConnection;
 
     public void init(Context ctx) {
         if (ctx == null) return;
         SharedPreferences sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         int savedPort = sp.getInt(KEY_PORT, -1);
-        configuredPort = savedPort > 0 ? savedPort : WirelessAdbClient.detectTcpPort();
+        configuredPort = savedPort > 0 ? savedPort : Build.VERSION.SDK_INT >= 30 ? 0 : WirelessAdbClient.detectTcpPort();
         activeDaemonPort = sp.getInt(KEY_DAEMON_PORT, 0);
         activeToken = sp.getString(KEY_TOKEN, "");
         cachedAlive = probeDaemonAlive();
@@ -112,62 +119,124 @@ public final class WirelessAdbCaptureBridge {
         }
     }
 
+    public boolean shouldSuggestPairing() {
+        return pairingSuggested;
+    }
+
     public synchronized boolean connectAndStartDaemon(Context ctx, int port) {
+        return startDaemon(ctx, port, 0, null);
+    }
+
+    public synchronized boolean pairAndStartDaemon(Context ctx, int pairingPort, int port, String code) {
+        if (Build.VERSION.SDK_INT < 30 || code == null || !code.matches("[0-9]{6}")) {
+            lastError = "请输入系统当前显示的六位无线调试配对码";
+            return false;
+        }
+        return startDaemon(ctx, port, pairingPort, code);
+    }
+
+    private boolean startDaemon(Context ctx, int port, int pairingPort, String pairingCode) {
+        pairingSuggested = false;
         if (ctx == null) {
             lastError = "上下文不可用";
             return false;
         }
-        int targetPort = (port > 0 && port <= 65535) ? port : WirelessAdbClient.detectTcpPort();
-        configuredPort = targetPort;
-        SharedPreferences sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        sp.edit().putInt(KEY_PORT, targetPort).apply();
-
-        if (isDaemonAlive()) {
+        if (isDaemonAlive() && pairingCode == null) {
             lastError = "";
             return true;
         }
-
-        // Gracefully shut down any previous daemon on the old port before launching a fresh one.
-        sendQuitQuiet(activeDaemonPort, activeToken);
-
+        boolean legacy = Build.VERSION.SDK_INT < 30 || (pairingCode == null && port == 5555);
+        int targetPort = port > 0 && port <= 65535 ? port : 0;
         int daemonPort;
         try {
             daemonPort = pickFreeLoopbackPort();
         } catch (IOException e) {
-            lastError = "分配本机回环端口失败: " + e.getMessage();
+            lastError = "分配本机音频守护进程端口失败";
             return false;
         }
         String token = randomHexToken();
-        String apkPath = ctx.getApplicationInfo().sourceDir;
-        String cmd = "CLASSPATH=" + shellQuote(apkPath)
-                + " setsid /system/bin/app_process /system/bin io.soundflow.sender.WirelessAdbAudioDaemon "
-                + daemonPort + " " + shellQuote(token)
-                + " </dev/null >/dev/null 2>&1 & echo LAUNCHED";
+        String classPath = shellQuote(ctx.getApplicationInfo().sourceDir);
+        String daemon = "/system/bin/app_process /system/bin io.soundflow.sender.WirelessAdbAudioDaemon "
+                + daemonPort + " " + shellQuote(token);
 
-        try (WirelessAdbClient adb = WirelessAdbClient.connect(ctx, "127.0.0.1", targetPort)) {
-            adb.execShell(cmd, 8000);
-        } catch (Throwable t) {
-            lastError = "无线 ADB 连接失败 (127.0.0.1:" + targetPort + "): "
-                    + (t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName());
-            cachedAlive = false;
+        String phase = pairingCode != null ? "pair" : "connect";
+        LocalWirelessAdb connection = null;
+        try {
+            if (legacy) {
+                if (targetPort == 0) targetPort = WirelessAdbClient.detectTcpPort();
+                try (WirelessAdbClient adb = WirelessAdbClient.connect(ctx, "127.0.0.1", targetPort)) {
+                    phase = "launch";
+                    String reply = adb.execShell("CLASSPATH=" + classPath + " setsid " + daemon
+                            + " </dev/null >/dev/null 2>&1 & echo LAUNCHED", 8000);
+                    if (!reply.contains("LAUNCHED")) throw new IOException("未收到音频守护进程启动确认");
+                }
+            } else {
+                connection = new LocalWirelessAdb(ctx);
+                if (pairingCode != null) {
+                    int peerPort = pairingPort > 0 && pairingPort <= 65535 ? pairingPort
+                            : LocalWirelessAdb.discover(ctx, AdbMdns.SERVICE_TYPE_TLS_PAIRING);
+                    if (peerPort == 0) throw new IOException("未发现本机配对端口，请保持系统配对码窗口打开");
+                    connection.pairLocal(peerPort, pairingCode);
+                    Log.i(TAG, "Local TLS pairing completed");
+                    phase = "connect";
+                }
+                if (targetPort == 0) targetPort = LocalWirelessAdb.discover(ctx, AdbMdns.SERVICE_TYPE_TLS_CONNECT);
+                if (targetPort == 0) throw new IOException("未发现本机无线调试连接端口");
+                connection.connectLocal(targetPort);
+                phase = "launch";
+                // Keep the ADB shell open while its foreground daemon is in use.
+                // Closing immediately after launching lets some adbd versions reap it.
+                connection.launchDaemon("export CLASSPATH=" + classPath + "; exec " + daemon);
+            }
+        } catch (Exception error) {
+            closeQuietly(connection);
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            pairingSuggested = !legacy && "connect".equals(phase) && pairingCode == null;
+            String detail = error.getMessage();
+            if ("pair".equals(phase)) {
+                lastError = error instanceof IOException && detail != null && detail.startsWith("未发现")
+                        ? detail : "无线调试配对失败，请确认配对码仍有效";
+            } else if ("connect".equals(phase)) {
+                lastError = pairingSuggested ? "无线调试尚未连接，请完成本机配对后重试"
+                        : "无线调试连接失败" + (detail == null ? "" : "：" + detail);
+            } else {
+                lastError = "无线 ADB 已连接，音频守护进程启动失败";
+            }
+            Log.w(TAG, "Local ADB " + phase + " failed: " + error.getClass().getSimpleName());
             return false;
         }
 
+        sendQuitQuiet(activeDaemonPort, activeToken);
+        closeQuietly(daemonConnection);
+        daemonConnection = connection;
+        configuredPort = targetPort;
         activeDaemonPort = daemonPort;
         activeToken = token;
-        sp.edit().putInt(KEY_DAEMON_PORT, daemonPort).putString(KEY_TOKEN, token).apply();
-
-        long deadline = System.currentTimeMillis() + 5000;
-        while (System.currentTimeMillis() < deadline) {
+        long deadline = android.os.SystemClock.elapsedRealtime() + 5000;
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
             if (isDaemonAlive()) {
+                ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_PORT, targetPort)
+                        .putInt(KEY_DAEMON_PORT, daemonPort).putString(KEY_TOKEN, token).apply();
                 lastError = "";
+                Log.i(TAG, "Local audio daemon authenticated and ready, ADB port=" + targetPort);
                 return true;
             }
-            try { Thread.sleep(80); } catch (InterruptedException ignored) { break; }
+            try {
+                Thread.sleep(80);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
-        cachedAlive = false;
-        lastError = "无线 ADB 已连通，但特权音频守护进程启动超时";
+        disconnect(ctx);
+        lastError = "无线 ADB 已连通，但音频守护进程启动超时";
+        Log.w(TAG, "Local audio daemon PING timed out");
         return false;
+    }
+
+    private static void closeQuietly(LocalWirelessAdb connection) {
+        if (connection == null) return;
+        try { connection.close(); } catch (IOException ignored) {}
     }
 
     private static void sendQuitQuiet(int port, String token) {
@@ -182,9 +251,12 @@ public final class WirelessAdbCaptureBridge {
 
     public synchronized void disconnect(Context ctx) {
         sendQuitQuiet(activeDaemonPort, activeToken);
+        closeQuietly(daemonConnection);
+        daemonConnection = null;
         activeDaemonPort = 0;
         activeToken = "";
         cachedAlive = false;
+        pairingSuggested = false;
         lastError = "";
         if (ctx != null) {
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

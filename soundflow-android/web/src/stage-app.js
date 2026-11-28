@@ -91,6 +91,9 @@ let fullLrcLines = [];
 let fullLyricSignature = "";
 let streamLines = [];
 let nextStreamStartMs = 0;
+let stageBackgroundBlob = "";
+let coverGeneration = 0;
+let artworkRequest = 0;
 let hasCustomArtwork = false;
 let lastSentFlowSpeed = -1;
 const rippleField = new RippleField();
@@ -194,16 +197,31 @@ function paintGenerativeCover(seedText) {
   ctx.fill();
   ctx.globalAlpha = 1;
 
-  const image = new Image();
-  image.src = coverCanvas.toDataURL("image/png");
-  setStageBackground(image);
+  const generation = ++coverGeneration;
+  coverCanvas.toBlob(async (blob) => {
+    if (!blob || generation !== coverGeneration || hasCustomArtwork) return;
+    const url = URL.createObjectURL(blob);
+    try {
+      const image = new Image();
+      image.src = url;
+      await image.decode();
+      if (generation === coverGeneration && !hasCustomArtwork) await setStageBackground(image);
+    } catch (error) {
+      console.warn("Could not decode the generated cover", error);
+    } finally {
+      if (stageBackgroundBlob !== url) URL.revokeObjectURL(url);
+    }
+  }, "image/png");
 }
 
 function setStageBackground(image) {
   // AMLL fetches string sources internally. An image element keeps the
   // decoded cover local and works with the WebView's connect-src 'none'.
+  const previous = stageBackgroundBlob;
+  stageBackgroundBlob = image.src.startsWith("blob:") ? image.src : "";
   bgHost.style.backgroundImage = `url("${image.src}")`;
-  bgRender?.setAlbum(image, false).catch((error) => {
+  if (previous && previous !== stageBackgroundBlob) URL.revokeObjectURL(previous);
+  return bgRender?.setAlbum(image, false).catch((error) => {
     console.warn("AMLL could not render the local cover", error);
   });
 }
@@ -879,8 +897,11 @@ window.SoundFlowStage = {
           : "image/webp";
       url = `data:${mime};base64,${base64Str}`;
     }
+    const generation = coverGeneration;
+    const request = ++artworkRequest;
     const img = new Image();
     img.onload = () => {
+      if (generation !== coverGeneration || request !== artworkRequest) return;
       hasCustomArtwork = true;
       const ctx = coverCanvas.getContext("2d");
       ctx.clearRect(0, 0, coverCanvas.width, coverCanvas.height);

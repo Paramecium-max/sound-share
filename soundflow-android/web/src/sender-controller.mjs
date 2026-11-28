@@ -86,6 +86,7 @@ export function initSenderController({
   const shizukuBtn = document.getElementById("sender-shizuku-btn");
   const guardAdbDesc = document.getElementById("guard-adb-desc");
   const guardAdbPort = document.getElementById("guard-adb-port");
+  const btnAdbPair = document.getElementById("btn-adb-pair");
   const btnAdbConnect = document.getElementById("btn-adb-connect");
   const btnAdbDisconnect = document.getElementById("btn-adb-disconnect");
   const rowGuardShizuku = document.getElementById("row-guard-shizuku");
@@ -498,18 +499,16 @@ export function initSenderController({
     }
     if (guardAdbDesc) {
       if (state.adbDaemonActive) {
-        guardAdbDesc.textContent = `已激活 · 正在通过本机无线 ADB (127.0.0.1:${state.adbPort || 5555}) 提供 UID 2000 免投屏单应用静音抓音`;
+        guardAdbDesc.textContent = `已激活 · 正在通过本机无线 ADB (127.0.0.1:${state.adbPort || "自动发现"}) 提供 UID 2000 免投屏单应用静音抓音`;
       } else if (state.adbLastError) {
         guardAdbDesc.textContent = state.adbLastError;
       } else {
-        guardAdbDesc.textContent = "未连接 · 点击「连接激活」直连本机无线 ADB 端口（首次会弹出系统调试授权框，勾选一律允许即可）";
+        guardAdbDesc.textContent = "未连接 · 首次使用先配对，已配对可直接连接本机";
       }
     }
-    if (guardAdbPort && document.activeElement !== guardAdbPort && state.adbPort > 0) {
-      guardAdbPort.value = String(state.adbPort);
-    }
+    if (btnAdbPair) btnAdbPair.hidden = !state.adbPairingSupported;
     if (btnAdbConnect) {
-      btnAdbConnect.textContent = state.adbDaemonActive ? "重新连接" : "连接激活";
+      btnAdbConnect.textContent = state.adbDaemonActive ? "检查连接" : "连接并启动";
     }
     if (btnAdbDisconnect) {
       btnAdbDisconnect.style.display = state.adbDaemonActive ? "inline-flex" : "none";
@@ -767,17 +766,33 @@ export function initSenderController({
 
   appRefreshBtn?.addEventListener("click", () => refreshInstalledApps(true));
 
+  let adbConnecting = false;
   async function connectWirelessAdb(enableMute = false) {
-    const port = Number(guardAdbPort?.value || state.adbPort || 5555) || 5555;
-    showToast(`正在连接本机无线 ADB (127.0.0.1:${port})，如弹出调试授权请点允许…`);
-    const res = await rpcAsync("adb.connect", { port, enableMute }, 40000);
-    if (res?.error) {
-      showToast(res.error);
+    if (adbConnecting) return false;
+    const port = Number(guardAdbPort?.value || 0);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      showToast("连接端口须在 1–65535 之间，留空可自动发现");
       return false;
+    }
+    adbConnecting = true;
+    showToast("正在连接本机无线调试…");
+    let res;
+    try {
+      res = await rpcAsync("adb.connect", { port, enableMute }, 45000);
+    } finally {
+      adbConnecting = false;
     }
     if (res?.result) {
       state = { ...state, ...res.result };
       renderState();
+    }
+    if (!res || res.error) {
+      if (res?.result?.adbPairingSuggested && window.SoundFlowBridge?.openAdbPairing) {
+        window.SoundFlowBridge.openAdbPairing(enableMute);
+      } else {
+        showToast(res?.error || "连接本机无线调试超时");
+      }
+      return false;
     }
     refreshInstalledApps(false);
     const boundHint = state.targetAppUid > 0 && state.targetAppName
@@ -810,6 +825,8 @@ export function initSenderController({
   btnAdbConnect?.addEventListener("click", () => {
     connectWirelessAdb(false);
   });
+
+  btnAdbPair?.addEventListener("click", () => window.SoundFlowBridge?.openAdbPairing?.(false));
 
   btnAdbDisconnect?.addEventListener("click", async () => {
     const res = await rpcAsync("adb.disconnect");

@@ -626,10 +626,11 @@
       <div class="list-group" data-android-only>
         <div class="list-row no-icon" style="flex-direction:column;align-items:stretch;gap:8px;">
           <div class="row-title">本机无线 ADB 直抓（UID 2000）</div>
-          <div class="row-desc" id="guard-adb-desc">连接本机无线 ADB 端口后，即可免投屏弹窗直抓任意应用，并开启「本机静音投送源」互不干扰。</div>
+          <div class="row-desc" id="guard-adb-desc">配对本机无线调试后，音流会启动音频守护进程，支持免投屏抓音与本机静音。</div>
           <div class="field-stack">
-            <input type="number" class="ios-input" id="guard-adb-port" min="1" max="65535" value="5555" placeholder="无线 ADB 端口（默认 5555）" />
-            <button type="button" class="row-btn" id="btn-adb-connect">连接激活</button>
+            <input type="number" class="ios-input" id="guard-adb-port" min="1" max="65535" placeholder="连接端口（留空自动发现）" aria-label="无线调试连接端口" />
+            <button type="button" class="row-btn" id="btn-adb-connect">连接并启动</button>
+            <button type="button" class="row-btn" id="btn-adb-pair" hidden>配对并启动</button>
             <button type="button" class="row-btn destructive" id="btn-adb-disconnect" style="display:none;">断开</button>
           </div>
         </div>
@@ -641,7 +642,7 @@
             </div>
             <div class="row-copy">
               <div class="row-title">Shizuku 免投屏通道（可选）</div>
-              <div class="row-desc" id="guard-shizuku-desc">未检测到 Shizuku 服务；已优先推荐使用上方内置无线 ADB 直连</div>
+              <div class="row-desc" id="guard-shizuku-desc">未检测到 Shizuku 服务；可使用上方的无线调试配对</div>
             </div>
           </div>
           <div class="row-trailing"><button type="button" class="row-btn" id="btn-guard-shizuku">授权</button></div>

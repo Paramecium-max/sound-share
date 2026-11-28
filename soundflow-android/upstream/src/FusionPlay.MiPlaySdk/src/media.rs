@@ -2093,6 +2093,7 @@ struct PcmRing {
     written: AtomicU64,
     reset_at: AtomicU64,
     overflowed: AtomicBool,
+    #[cfg(target_os = "android")]
     route: AtomicU64,
 }
 
@@ -2103,7 +2104,9 @@ impl PcmRing {
         Self {
             frames: slots(), pts: slots(), read: AtomicU64::new(0),
             written: AtomicU64::new(0), reset_at: AtomicU64::new(0),
-            overflowed: AtomicBool::new(false), route: AtomicU64::new(0),
+            overflowed: AtomicBool::new(false),
+            #[cfg(target_os = "android")]
+            route: AtomicU64::new(0),
         }
     }
 
@@ -2114,24 +2117,21 @@ struct PcmProducer {
     ring: Arc<PcmRing>,
     next_pts: Option<f64>,
     pending_discontinuity: bool,
-    route: u64,
 }
 
 #[cfg(any(target_os = "android", test))]
 impl PcmProducer {
     fn new(ring: Arc<PcmRing>) -> Self {
-        Self { ring, next_pts: None, pending_discontinuity: false, route: 0 }
+        Self { ring, next_pts: None, pending_discontinuity: false }
     }
 
     fn push(&mut self, input: &[f32], pts: Option<f64>) {
         let count = input.len() / 2;
         let start = self.ring.written.load(Ordering::Relaxed);
         let read = self.ring.read.load(Ordering::Acquire);
-        let route = self.ring.route.load(Ordering::Acquire);
-        if route != self.route || start == read {
+        if start == read {
             self.next_pts = None;
         }
-        self.route = route;
         let discontinuity = matches!((self.next_pts, pts), (Some(expected), Some(actual))
             if (actual - expected).abs() > MIPLAY_PTS_DISCONTINUITY_MICROS);
         let step = 1_000_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
@@ -2174,17 +2174,16 @@ impl PcmConsumer {
         Self { ring, read, end: read, reset_at: read, phase: 0.0 }
     }
 
-    fn discard_route_backlog(&mut self) {
-        self.refresh();
-        self.clear();
-        self.ring.overflowed.store(false, Ordering::Release);
-    }
-
-    fn trim_after_overflow(&mut self, keep_frames: usize) -> usize {
-        if !self.ring.overflowed.swap(false, Ordering::AcqRel) {
+    fn trim_backlog(&mut self, keep_frames: usize, route_reopened: bool) -> usize {
+        let overflowed = self.ring.overflowed.swap(false, Ordering::AcqRel);
+        if !overflowed && !route_reopened {
             return 0;
         }
-        self.drop_frames(self.buffered_frames().saturating_sub(keep_frames))
+        let dropped = self.drop_frames(self.buffered_frames().saturating_sub(keep_frames));
+        if dropped != 0 {
+            self.phase = 0.0;
+        }
+        dropped
     }
 
     fn refresh(&mut self) -> bool {
@@ -2320,7 +2319,8 @@ impl AndroidPlayout {
         let output_rate = f64::from(output_sample_rate);
         let callback_source_frames = (callback_frames as f64 * source_rate / output_rate).ceil() as usize;
         // Allow for the fractional read phase and the interpolation lookahead.
-        let required_frames = callback_source_frames + 2;
+        let rate_headroom = callback_source_frames.div_ceil(500);
+        let required_frames = callback_source_frames + rate_headroom + 2;
         let buffered_frames = queue.buffered_frames();
         if let Self::Playing { sender_clock } = *self {
             if buffered_frames < required_frames {
@@ -2371,6 +2371,12 @@ impl AndroidPlayout {
             alignment_error_micros,
         }
     }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_clock_rate_adjustment(rate_ppb: i64, phase_error_micros: f64) -> f64 {
+    let frequency = rate_ppb as f64 / 1_000_000_000.0;
+    (frequency - phase_error_micros / 12_000_000.0).clamp(-0.0015, 0.0015)
 }
 
 fn normalized_output_latency_millis(
@@ -3047,6 +3053,8 @@ struct AndroidMiPlayAudioCallback {
     measured_latency_us: Arc<AtomicU64>,
     first_buffered_at: Option<Instant>,
     playout: AndroidPlayout,
+    route_reopened: bool,
+    clock_phase_error: Option<f64>,
     underflow_count: u64,
     last_underflow_report: Option<Instant>,
     last_recovery_report: Option<Instant>,
@@ -3085,6 +3093,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         if self.paused.load(Ordering::Acquire) {
             self.next_onset_ms = None;
             self.playout = AndroidPlayout::Priming;
+            self.clock_phase_error = None;
             self.synchronization_started = false;
             self.first_buffered_at = None;
             LIVE_OUTPUT_PEAK_BITS.store(0, Ordering::Relaxed);
@@ -3099,6 +3108,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         if queue.refresh() {
             self.next_onset_ms = None;
             self.playout = AndroidPlayout::Priming;
+            self.clock_phase_error = None;
             self.synchronization_started = false;
             self.first_buffered_at = None;
         }
@@ -3106,7 +3116,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         if queue.buffered_frames() >= 2 {
             self.first_buffered_at.get_or_insert_with(Instant::now);
         }
-        let waiting_for_latency = !latency_measured
+        let waiting_for_latency = !self.route_reopened && !latency_measured
             && self.first_buffered_at.is_some_and(|first| first.elapsed() < ANDROID_LATENCY_STARTUP_WAIT);
         if waiting_for_latency {
             output.fill((0.0, 0.0));
@@ -3118,8 +3128,14 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             offset_buffer_frames(synchronized_buffer_frames(endpoint_latency_millis), offset_ms);
         let callback_reserve = (callback_frames as f64 * route_playback_rate).ceil() as usize
             + MIPLAY_ANDROID_PLAYOUT_RESERVE_FRAMES + 4;
-        if queue.trim_after_overflow(synchronized_frames.max(callback_reserve)) != 0 {
+        let reopened = self.route_reopened && queue.buffered_frames() >= callback_reserve;
+        self.route_reopened &= !reopened;
+        if queue.trim_backlog(synchronized_frames.max(callback_reserve), reopened) != 0 {
             self.next_onset_ms = None;
+            if matches!(self.playout, AndroidPlayout::Playing { sender_clock: true }) {
+                self.playout = AndroidPlayout::Priming;
+                self.clock_phase_error = None;
+            }
             self.latency_telemetry.update_buffered_frames(queue.buffered_frames());
         }
         if let Some(model) = self.presentation_clock.clock_model_snapshot() {
@@ -3164,7 +3180,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             }
         }
         let previous_playout = self.playout;
-        let mut leading_silence_frames = match self.playout.plan(
+        let (mut leading_silence_frames, dropped_frames, alignment_error_micros) = match self.playout.plan(
             queue,
             schedule_error_micros,
             synchronized_frames,
@@ -3173,11 +3189,13 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         ) {
             AndroidPlayoutAction::Render {
                 leading_silence_frames,
-                ..
-            } => leading_silence_frames,
+                dropped_frames,
+                alignment_error_micros,
+            } => (leading_silence_frames, dropped_frames, alignment_error_micros),
             action => {
                 if action == AndroidPlayoutAction::Underflow {
                     self.next_onset_ms = None;
+                    self.clock_phase_error = None;
                     self.underflow_count = self.underflow_count.saturating_add(1);
                     let now = Instant::now();
                     if self.last_underflow_report.is_none_or(|last| now - last >= StdDuration::from_secs(1)) {
@@ -3198,7 +3216,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             self.last_reported_offset_ms = offset_ms;
             self.diagnostics.offset.store((offset_ms + 401) as u64, Ordering::Release);
         }
-        let mut active_schedule_error = schedule_error_micros;
+        let mut active_schedule_error = alignment_error_micros.or(schedule_error_micros);
         if self.playout == (AndroidPlayout::Playing { sender_clock: true })
             && previous_playout == (AndroidPlayout::Playing { sender_clock: true })
             && let Some(mut err) = active_schedule_error
@@ -3207,6 +3225,10 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                 let late_frames = ((-err) * MIPLAY_SOURCE_SAMPLE_RATE as f64 / 1_000_000.0).floor() as usize;
                 let max_drop = queue.buffered_frames().saturating_sub(callback_reserve);
                 let dropped = queue.drop_frames(late_frames.min(max_drop));
+                if dropped != 0 {
+                    self.next_onset_ms = None;
+                    self.clock_phase_error = None;
+                }
                 err += dropped as f64 * 1_000_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
             } else if err > MIPLAY_RUNNING_LATE_DROP_MICROS && leading_silence_frames == 0 {
                 let pad = ((err * f64::from(output_sample_rate) / 1_000_000.0).ceil() as usize)
@@ -3217,18 +3239,26 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             active_schedule_error = Some(err);
         }
         output[..leading_silence_frames].fill((0.0, 0.0));
-        let playback_rate = if self.playout == (AndroidPlayout::Playing { sender_clock: true })
-            && let Some(err) = active_schedule_error
-        {
-            scheduled_playback_rate_for_error(err, route_playback_rate)
-        } else if self.playout == (AndroidPlayout::Playing { sender_clock: false })
-            && queue.buffered_frames() > callback_reserve
-        {
-            let excess = queue.buffered_frames() as f64 - synchronized_frames as f64;
-            let correction = excess / (MIPLAY_SAMPLE_RATE_HZ as f64 * 12.0);
-            route_playback_rate * (1.0 + correction.clamp(-0.002, 0.002))
-        } else {
-            route_playback_rate
+        if dropped_frames != 0 {
+            self.next_onset_ms = None;
+        }
+        let playback_rate = match (self.playout, active_schedule_error) {
+            (AndroidPlayout::Playing { sender_clock: true }, Some(error)) => {
+                let filtered = alignment_error_micros.unwrap_or_else(|| {
+                    self.clock_phase_error.map_or(error, |previous| previous + 0.04 * (error - previous))
+                });
+                self.clock_phase_error = Some(filtered);
+                let frequency = self.clock_model.map_or(0, |(_, _, rate_ppb)| rate_ppb);
+                route_playback_rate * (1.0 + android_clock_rate_adjustment(frequency, filtered))
+            }
+            (AndroidPlayout::Playing { sender_clock: false }, _)
+                if queue.buffered_frames() > callback_reserve =>
+            {
+                let excess = queue.buffered_frames() as f64 - synchronized_frames as f64;
+                let correction = excess / (MIPLAY_SAMPLE_RATE_HZ as f64 * 12.0);
+                route_playback_rate * (1.0 + correction.clamp(-0.002, 0.002))
+            }
+            _ => route_playback_rate,
         };
         let callback_peak =
             queue.render_stereo_block(&mut output[leading_silence_frames..], playback_rate);
@@ -3424,12 +3454,8 @@ fn open_android_miplay_stream(
     measured_latency_us: Arc<AtomicU64>,
 ) -> Result<(AndroidMiPlayOboeStream, Option<i32>)> {
     let reopened = queue.route.load(Ordering::Acquire) != 0;
-    let mut consumer = PcmConsumer::new(queue);
-    if reopened {
-        consumer.discard_route_backlog();
-    }
     let callback = AndroidMiPlayAudioCallback {
-        queue: consumer,
+        queue: PcmConsumer::new(queue),
         paused,
         presentation_clock,
         latency_telemetry,
@@ -3449,6 +3475,8 @@ fn open_android_miplay_stream(
         measured_latency_us,
         first_buffered_at: None,
         playout: AndroidPlayout::Priming,
+        route_reopened: reopened,
+        clock_phase_error: None,
         underflow_count: 0,
         last_underflow_report: None,
         last_recovery_report: None,
@@ -4050,17 +4078,35 @@ mod tests {
         }
         producer.push(&[4.0; 4], Some(1000.0 + 8.0 * dt));
         assert!(!consumer.refresh());
-        assert_eq!(consumer.trim_after_overflow(5), 3);
+        assert_eq!(consumer.trim_backlog(5, false), 3);
         assert_eq!(consumer.buffered_frames(), 5);
         producer.push(&[5.0; 4], Some(1000.0 + 10.0 * dt));
         assert!(!consumer.refresh());
-        assert_eq!(consumer.trim_after_overflow(5), 0);
+        assert_eq!(consumer.trim_backlog(5, false), 0);
         assert_eq!(consumer.buffered_frames(), 7);
         assert_eq!(consumer.stereo(8), (5.0, 5.0));
         drop(consumer);
         let mut reopened = PcmConsumer::new(ring);
-        reopened.discard_route_backlog();
-        assert_eq!(reopened.buffered_frames(), 0);
+        assert!(!reopened.refresh());
+        assert_eq!(reopened.trim_backlog(5, true), 2);
+        assert_eq!(reopened.buffered_frames(), 5);
+        assert_eq!(reopened.stereo(8), (5.0, 5.0));
+    }
+
+    #[test]
+    fn android_sender_clock_correction_converges_with_crystal_drift() {
+        for drift in [-60_000, 60_000] {
+            for estimate in [0, drift] {
+                let mut error = 6_000.0;
+                for _ in 0..30_000 {
+                    let rate = super::android_clock_rate_adjustment(estimate, error);
+                    error += (rate - drift as f64 / 1_000_000_000.0) * 20_000.0;
+                }
+                assert!(error.abs() < 1_000.0);
+            }
+        }
+        assert_eq!(super::android_clock_rate_adjustment(0, 1_000_000.0), -0.0015);
+        assert_eq!(super::android_clock_rate_adjustment(0, -1_000_000.0), 0.0015);
     }
 
     #[test]
@@ -4298,8 +4344,12 @@ mod tests {
             (20_000, 100_000, 20_000)
         );
         assert_eq!(
+            smooth_clock_model(true, 20_000, 100_000, 30_000, 200_000),
+            (23_500, 135_000, 10_000),
+        );
+        assert_eq!(
             smooth_clock_model(true, 20_000, 100_000, 60_000, 200_000),
-            (25_000, 125_000, 40_000),
+            (60_000, 200_000, 40_000),
         );
     }
 
@@ -4354,7 +4404,7 @@ mod tests {
 
     #[test]
     fn group_sync_accounts_for_the_native_output_callback() {
-        assert_eq!(synchronized_buffer_frames(20.0), 37_440);
+        assert_eq!(synchronized_buffer_frames(20.0), 6_240);
     }
 
     #[test]
@@ -4498,7 +4548,7 @@ mod tests {
     fn android_playout_rebuffers_on_a_timestamp_reset_and_preserves_the_fallback_watermark() {
         let mut queue = PcmQueue::new();
         let mut playout = AndroidPlayout::default();
-        let reserve = MIPLAY_ANDROID_PLAYOUT_RESERVE_FRAMES + 194;
+        let reserve = MIPLAY_ANDROID_PLAYOUT_RESERVE_FRAMES + 195;
         queue.push_timed(&vec![0.5; reserve * MIPLAY_SOURCE_CHANNELS], Some(0.0));
         assert!(matches!(playout.plan(&mut queue, Some(0.0), 10_000, 192, 48_000),
             AndroidPlayoutAction::Render { .. }));

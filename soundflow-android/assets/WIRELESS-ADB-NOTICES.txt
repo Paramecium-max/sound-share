@@ -1,0 +1,18 @@
+SoundFlow local Wireless ADB support
+
+LibADB Android 3.1.1 — Muntashir Al-Islam and contributors
+https://github.com/MuntashirAkon/libadb-android/tree/3.1.1
+Distributed here under Apache-2.0 (see licenses/Conscrypt-2.5.3-LICENSE.txt).
+
+SPAKE2 Java Android 2.2.1 — Muntashir Al-Islam and contributors
+https://github.com/MuntashirAkon/spake2-java/tree/2.2.1
+JNI library dynamically linked under LGPL-3.0. See licenses/SPAKE2-2.2.1-LGPL-3.0.txt and licenses/GPL-3.0.txt.
+The corresponding source is available at the tagged upstream URL above.
+
+Conscrypt Android 2.5.3 — Conscrypt Authors
+https://github.com/google/conscrypt/tree/2.5.3
+Apache-2.0. Includes BoringSSL. The license and notices are in licenses/.
+
+Bouncy Castle bcprov-jdk15to18 1.81 — The Legion of the Bouncy Castle Inc.
+https://www.bouncycastle.org/licence.html
+See licenses/BouncyCastle-1.81-LICENSE.html.

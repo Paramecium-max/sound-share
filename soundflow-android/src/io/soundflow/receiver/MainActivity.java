@@ -2,6 +2,7 @@ package io.soundflow.receiver;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -41,6 +42,9 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.text.InputType;
 
 import org.json.JSONObject;
 
@@ -55,6 +59,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import io.soundflow.sender.AdbPairingReceiver;
 import io.soundflow.sender.MediaSessionMonitorService;
 import io.soundflow.sender.MultiRoomManager;
 import io.soundflow.sender.SenderService;
@@ -527,15 +532,12 @@ public final class MainActivity extends Activity {
 
         @JavascriptInterface
         public void openDeveloperSettings() {
-            main.post(() -> {
-                try {
-                    startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
-                } catch (Throwable ignored) {
-                    try {
-                        startActivity(new Intent(Settings.ACTION_SETTINGS));
-                    } catch (Throwable ignored2) {}
-                }
-            });
+            main.post(MainActivity.this::openDeveloperSettingsUi);
+        }
+
+        @JavascriptInterface
+        public void openAdbPairing(boolean enableMute) {
+            main.post(() -> showAdbPairing(enableMute));
         }
 
         @JavascriptInterface
@@ -949,6 +951,100 @@ public final class MainActivity extends Activity {
         } catch (Throwable ignored) {}
         String seg = uri.getLastPathSegment();
         return (seg != null && !seg.isEmpty()) ? seg : "audio.wav";
+    }
+
+    private void openDeveloperSettingsUi() {
+        try {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+        } catch (android.content.ActivityNotFoundException unavailable) {
+            startActivity(new Intent(Settings.ACTION_SETTINGS));
+        }
+    }
+
+    private void showAdbPairing(boolean enableMute) {
+        if (Build.VERSION.SDK_INT < 30) {
+            showJsToast("Android 10 仅支持已开启的旧版调试端口");
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("配对本机无线调试")
+                .setMessage("在系统开发者选项开启无线调试，选择「使用配对码配对设备」。保持配对码窗口打开，下拉通知栏，展开音流通知并输入六位码。音流会继续连接并启动音频守护进程。")
+                .setPositiveButton("打开系统配对", (dialog, which) -> {
+                    if (AdbPairingReceiver.show(this, enableMute)) {
+                        openDeveloperSettingsUi();
+                    } else {
+                        new AlertDialog.Builder(this).setTitle("选择配对码输入方式")
+                                .setMessage("允许音流通知后可直接在通知栏输入。也可以使用系统分屏，同时打开无线调试配对码和音流手动输入。")
+                                .setPositiveButton("设置通知", (d, w) -> startActivity(
+                                        new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                                .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName())))
+                                .setNeutralButton("手动输入", (d, w) -> showManualAdbPairing(enableMute))
+                                .setNegativeButton("取消", null).show();
+                    }
+                })
+                .setNeutralButton("手动输入", (dialog, which) -> showManualAdbPairing(enableMute))
+                .setNegativeButton("取消", null).show();
+    }
+
+    private void showManualAdbPairing(boolean enableMute) {
+        LinearLayout fields = new LinearLayout(this);
+        fields.setOrientation(LinearLayout.VERTICAL);
+        int padding = Math.round(getResources().getDisplayMetrics().density * 24);
+        fields.setPadding(padding, 0, padding, 0);
+        EditText code = adbNumberField(fields, "六位配对码", 6);
+        EditText pairPort = adbNumberField(fields, "配对窗口端口（可选）", 5);
+        EditText port = adbNumberField(fields, "无线调试主页面端口（可选）", 5);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("手动配对并启动")
+                .setMessage("建议使用系统分屏。两个端口留空时，音流会自动寻找本机服务。")
+                .setView(fields).setPositiveButton("配对并启动", null)
+                .setNegativeButton("取消", null).create();
+        dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            String pairingCode = code.getText().toString().trim();
+            if (!pairingCode.matches("[0-9]{6}")) {
+                code.setError("请输入六位数字");
+                return;
+            }
+            int configuredPairPort = parseAdbPort(pairPort);
+            int configuredPort = parseAdbPort(port);
+            if (configuredPairPort < 0 || configuredPort < 0) return;
+            code.setText("");
+            dialog.dismiss();
+            showJsToast("正在配对本机无线调试…");
+            senderRpcExecutor.execute(() -> {
+                try {
+                    JSONObject request = new JSONObject().put("method", "adb.pair").put("code", pairingCode)
+                            .put("pairPort", configuredPairPort).put("port", configuredPort)
+                            .put("enableMute", enableMute);
+                    JSONObject result = new JSONObject(MultiRoomManager.getInstance().handleRpcRequest(request.toString()));
+                    String error = result.optString("error", "");
+                    main.post(() -> showJsToast(error.isEmpty() ? "无线 ADB 免投屏已就绪" : error));
+                } catch (Exception failure) {
+                    main.post(() -> showJsToast("无线调试配对未完成"));
+                }
+            });
+        });
+    }
+
+    private EditText adbNumberField(LinearLayout parent, String hint, int maxLength) {
+        EditText field = new EditText(this);
+        field.setHint(hint);
+        field.setInputType(InputType.TYPE_CLASS_NUMBER
+                | (maxLength == 6 ? InputType.TYPE_NUMBER_VARIATION_PASSWORD : 0));
+        field.setSaveEnabled(false);
+        field.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(maxLength)});
+        parent.addView(field);
+        return field;
+    }
+
+    private static int parseAdbPort(EditText field) {
+        String text = field.getText().toString().trim();
+        if (text.isEmpty()) return 0;
+        try {
+            int port = Integer.parseInt(text);
+            if (port > 0 && port <= 65535) return port;
+        } catch (NumberFormatException ignored) {}
+        field.setError("端口范围为 1–65535");
+        return -1;
     }
 
     private void refreshRootAndAntiKillStatus() {

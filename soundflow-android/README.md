@@ -1,10 +1,10 @@
-# 音流 · 全屋收发一体 v1.2.0
+# 音流 · 全屋收发一体 v1.2.4
 
 包名 `io.soundflow.receiver`，Android 10+，ARM64。集**独立双协议接收端**（Xiaomi MiPlay v3 + 通用 UPnP / DLNA MediaRenderer）与**全屋多设备同步发送端**（MiPlay WFD RTSP + MPEG-TS/RTP + UDP 微秒级时钟对齐引擎）于一体，不依赖小米私有互联服务。构建入口 `python3 build.py`，沿用本项目签名密钥；不要重新生成密钥。成品唯一存放在工作区 `输出内容/`，构建缓存按根目录 SOP 清理。
 
-- [v1.1.21 APK](../输出内容/应用/音流独立音频接收器_v1.1.21.apk)
+- [v1.2.4 APK](../../输出内容/应用/音流全屋收发一体_v1.2.4.apk)
 - [v1.1.20 Magisk 固化包](../输出内容/刷机包/J716F_SoundFlow_独立音频接收器系统固化_v1.1.20.zip)
-- [v1.1.20 回退 APK](../输出内容/旧包参考/音流/音流独立音频接收器_v1.1.20.apk)
+- [v1.2.2 回退 APK](../../输出内容/旧包参考/音流/音流全屋收发一体_v1.2.2.apk)
 - [设计说明](DESIGN.md)
 - [开源组件与本地变更](UPSTREAM_CHANGES.md)
 
@@ -56,3 +56,9 @@ DLNA 的音频频谱分析为可选能力：Android 的 Visualizer 要求录音�
 2026-11-27 v1.1.21。修复 Android PCM 满环和输出路由重开恢复、妙播从 DLNA 回切、起音时钟重锚及短回声误触发。DLNA 控制请求与常驻监听分开调度，Seek 后立即向控制端报告目标位置。歌词舞台直接用本地图片生成 AMLL 封面底色，保留严格离线 CSP。已在 Pad 6 覆盖安装并验证底色和 DLNA 播放、暂停、跳转、停止。合成起音时间戳和真机声光偏差是不同指标，DLNA 频谱及端到端声光偏差仍待实测。
 
 2026-11-27 v1.2.0。合并接收端与 `mishare` 全屋同步发送端为统一双模应用（保留 `io.soundflow.receiver` 包名与 `:receiver` 独立守护进程）。主进程集成 `io.soundflow.sender` 全屋引擎（`MultiRoomManager`、`SenderService`、`MediaSessionMonitorService`、`AudioCaptureEngine`、`WfdRtspServer`、`TsAndRtpSender`、`TimerService`、`CmdSession`、`MdnsDiscovery`）：采用零本地端口 `@JavascriptInterface` 桥接满足 `connect-src 'none'` 严格离线 CSP；系统内录默认 `excludeUid(Process.myUid())` 并自动过滤本机网卡 IP 防自激回环，开播自动暂停本机接收端活跃会话；底部升级为四栏液态玻璃水滴导航（新增「发送台」页签与偏好设置全屋参数），支持系统内录/本地无损 WAV/同步校准音多音箱齐奏、音箱反向播控转发、状态栏歌词提取与全屏 AMLL 流体歌词舞台联动。
+
+### v1.2.4 本机无线调试配对（2026-11-28）
+
+Android 11 及以上可从「无线 ADB 免投屏」连接本机动态调试端口。首次使用在音流选择「配对并启动」，进入系统开发者选项，启用无线调试并显示配对码。配对窗口保持打开时，展开音流通知并输入六位码。音流会完成 TLS 配对、连接本机并自动启动音频守护进程。守护进程运行期间，音流保持启动它的 ADB 会话。通知不可用时，可分屏使用音流的手动配对入口。Android 10 可继续使用已开启的旧版 ADB 端口。
+
+本版同时包含 PcmRing 路由重开、发送端时钟微调、妙播曲目回切、DLNA 连续 Seek、底鼓检测和封面异步解码整改。

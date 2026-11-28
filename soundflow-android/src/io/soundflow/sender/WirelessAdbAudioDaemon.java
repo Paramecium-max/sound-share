@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
  * Enforcing never blocks untrusted_app -> shell/ksu Unix socket connections.
  */
 public final class WirelessAdbAudioDaemon {
+    private static final String TAG = "SoundFlowAdbAudio";
     private static final Object LOCK = new Object();
     private static volatile boolean active = false;
     private static PrivilegedAudioPolicyHelper.ActivePolicySession activeSession;
@@ -47,12 +48,13 @@ public final class WirelessAdbAudioDaemon {
             }
             resolveShellContext();
         } catch (Throwable t) {
-            t.printStackTrace(System.err);
+            android.util.Log.w(TAG, "Initializing audio policy shell context", t);
         }
 
         Thread serverThread = new Thread(() -> {
             try (ServerSocket server = new ServerSocket(port, 8, InetAddress.getByName("127.0.0.1"))) {
                 server.setReuseAddress(true);
+                android.util.Log.i(TAG, "Local audio daemon ready");
                 while (true) {
                     final Socket client = server.accept();
                     client.setTcpNoDelay(true);
@@ -62,7 +64,7 @@ public final class WirelessAdbAudioDaemon {
                     worker.start();
                 }
             } catch (Throwable t) {
-                t.printStackTrace(System.err);
+                android.util.Log.e(TAG, "Local audio daemon failed", t);
                 stopCurrentSession();
                 System.exit(1);
             }

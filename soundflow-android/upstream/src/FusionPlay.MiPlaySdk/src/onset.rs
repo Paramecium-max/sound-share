@@ -538,7 +538,8 @@ impl Detector {
 }
 
 // Causal low-latency multi-lane percussion detector (Kick / 808 / Tom / Snare / Clap /
-// Rimshot / Woodblock / Accented Percussion) with <= 10.7 ms confirmation latency.
+// Rimshot / Woodblock / Accented Percussion). The independent bass sweep lane
+// follows the attack for up to 33 ms; the established kick lane uses three hops.
 #[derive(Clone, Copy, Default)]
 struct PercFrame {
     total_power: f32,
@@ -548,6 +549,8 @@ struct PercFrame {
     crack_power: f32,
     air_power: f32,
     sub_flux: f32,
+    sub_attack: f32,
+    sub_attack_centroid: f32,
     tom_flux: f32,
     body_flux: f32,
     crack_flux: f32,
@@ -591,6 +594,12 @@ impl PercFrame {
                 sub_n += 1;
             }
             if hz < 210.0 {
+                // A positive rise in one bin is independent of a drop in
+                // another as a new kick interferes with a held bass tone.
+                let delta = (mag - ref_log[k].exp_m1() * 0.01).max(0.0);
+                let attack = delta * delta;
+                f.sub_attack += attack;
+                f.sub_attack_centroid += attack * hz;
                 sub_w += power;
                 sub_c += power * hz;
                 if mag > best_sub_mag {
@@ -639,6 +648,7 @@ impl PercFrame {
         f.crack_flux /= crack_n.max(1) as f32;
         f.air_flux /= air_n.max(1) as f32;
         f.sub_centroid = sub_c / sub_w.max(1e-14);
+        f.sub_attack_centroid /= f.sub_attack.max(1e-14);
         f.broadband_centroid /= f.total_power.max(1e-14);
         if best_sub_k > 0 && best_sub_k + 1 < len {
             let a = input[best_sub_k - 1].max(0.0);
@@ -671,9 +681,21 @@ struct PendingKick {
     peak_upper: f32,
     peak_high: f32,
     peak_flux: f32,
+    peak_attack: f32,
     sustained_beater: bool,
     mixed_attack_at: Option<f64>,
     hops: u8,
+}
+
+#[derive(Clone, Copy)]
+struct SubAttack {
+    at: f64,
+    peak_hz: f32,
+    centroid: f32,
+    power: f32,
+    attack: f32,
+    upper: f32,
+    high: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -683,6 +705,9 @@ struct PendingImpact {
     strength: f32,
     sub_power: f32,
     perc_power: f32,
+    high_power: f32,
+    sub_attack: f32,
+    holdoff_ms: f64,
     is_kick: bool,
     wait_hops: u8,
 }
@@ -695,10 +720,13 @@ struct PercussionDetector {
     air_flux_hist: VecDeque<f32>,
     ref_powers: VecDeque<(f64, f32, f32, f32)>,
     pending_kick: Option<PendingKick>,
+    pending_sub: Option<SubAttack>,
     pending_impact: Option<PendingImpact>,
     last_hit: f64,
     hit_sub_power: f32,
     hit_perc_power: f32,
+    hit_high_power: f32,
+    hit_sub_attack: f32,
 }
 
 impl PercussionDetector {
@@ -711,10 +739,13 @@ impl PercussionDetector {
             air_flux_hist: VecDeque::with_capacity(96),
             ref_powers: VecDeque::with_capacity(6),
             pending_kick: None,
+            pending_sub: None,
             pending_impact: None,
             last_hit: -1000.0,
             hit_sub_power: 0.0,
             hit_perc_power: 0.0,
+            hit_high_power: 0.0,
+            hit_sub_attack: 0.0,
         }
     }
 
@@ -726,10 +757,13 @@ impl PercussionDetector {
         self.air_flux_hist.clear();
         self.ref_powers.clear();
         self.pending_kick = None;
+        self.pending_sub = None;
         self.pending_impact = None;
         self.last_hit = -1000.0;
         self.hit_sub_power = 0.0;
         self.hit_perc_power = 0.0;
+        self.hit_high_power = 0.0;
+        self.hit_sub_attack = 0.0;
     }
 
     fn adaptive_thresh(hist: &VecDeque<f32>, k: f32, min_val: f32) -> f32 {
@@ -758,10 +792,16 @@ impl PercussionDetector {
         if since_hit < 55.0 {
             self.hit_sub_power = self.hit_sub_power.max(f.sub_power);
             self.hit_perc_power = self.hit_perc_power.max(perc_power);
+            self.hit_high_power = self.hit_high_power.max(high_impact_power);
         }
 
         let sub_tail_mask = self.hit_sub_power * 0.25 * (-since_hit / 145.0).exp() as f32;
         let perc_tail_mask = self.hit_perc_power * 0.18 * (-since_hit / 140.0).exp() as f32;
+        let high_tail_mask = if since_hit < 135.0 {
+            self.hit_high_power * 0.30 * (-since_hit / 185.0).exp() as f32
+        } else {
+            0.0
+        };
 
         let sub_flux_th = Self::adaptive_thresh(&self.sub_flux_hist, 2.35 * strict, 0.032 * strict);
         let sub_pow_floor = median(self.sub_pow_hist.iter().copied());
@@ -805,6 +845,7 @@ impl PercussionDetector {
                 pk.peak_upper = pk.peak_upper.max(upper_jump);
                 pk.peak_high = pk.peak_high.max(high_jump);
                 pk.peak_flux = pk.peak_flux.max(f.sub_flux);
+                pk.peak_attack = pk.peak_attack.max(f.sub_attack);
                 pk.init_peak_hz = pk.init_peak_hz.max(f.sub_centroid);
                 if mixed_attack && pk.mixed_attack_at.is_none() {
                     pk.mixed_attack_at = Some(time);
@@ -841,6 +882,13 @@ impl PercussionDetector {
                             strength,
                             sub_power: pk.peak_sub,
                             perc_power: pk.peak_upper,
+                            high_power: high_impact_power,
+                            sub_attack: pk.peak_attack,
+                            holdoff_ms: if pk.peak_high > (self.hit_high_power * 0.40).max(0.001) {
+                                f64::from(90.0 - 32.0 * sens)
+                            } else {
+                                holdoff_ms
+                            },
                             is_kick: true,
                             wait_hops: 0,
                         });
@@ -868,9 +916,69 @@ impl PercussionDetector {
                     peak_upper: upper_jump,
                     peak_high: high_jump,
                     peak_flux: f.sub_flux,
+                    peak_attack: f.sub_attack,
                     sustained_beater: mid_burst && upper_jump > f.sub_power * 0.065,
                     mixed_attack_at: mixed_attack.then_some(time),
                     hops: 0,
+                });
+            }
+
+            // Confirm beaterless kicks independently so a developing bass
+            // sweep cannot delay the existing short kick confirmation path.
+            let sub_holdoff = f64::from(90.0 - 32.0 * sens);
+            let attack_floor = self.hit_sub_attack * 0.34 * (-since_hit / 180.0).exp() as f32;
+            let sub_attack = f.sub_attack > (0.0015 * strict).max(attack_floor)
+                && f.sub_attack_centroid > 90.0
+                && f.sub_flux > sub_flux_th * 0.8
+                && f.sub_power > f.body_power * 0.11
+                && f.sub_centroid < 160.0;
+            if let Some(mut attack) = self.pending_sub.take() {
+                attack.peak_hz = attack.peak_hz.max(f.sub_peak_hz);
+                attack.centroid = attack.centroid.max(f.sub_centroid);
+                attack.power = attack.power.max(f.sub_power);
+                attack.attack = attack.attack.max(f.sub_attack);
+                attack.upper = attack.upper.max(upper_jump);
+                attack.high = attack.high.max(high_jump);
+                let age = time - attack.at;
+                let spacing = attack.at - self.last_hit;
+                let required_gain = if spacing < 85.0 { 0.33 }
+                    else if spacing < 240.0 { 0.25 }
+                    else { 0.25 * (-(spacing - 240.0) / 150.0).exp() as f32 };
+                let independent = spacing >= sub_holdoff
+                    && attack.attack > self.hit_sub_attack * required_gain;
+                let decaying_sweep = age >= 16.0
+                    && attack.peak_hz > 78.0
+                    && f.sub_peak_hz < attack.peak_hz - 8.0
+                    && f.sub_centroid < attack.centroid * 0.94
+                    && f.sub_power < attack.power * 0.84
+                    && attack.high < (attack.upper * 0.13).max(0.00015);
+                if fired.is_none() && independent && decaying_sweep && age <= 33.0 {
+                    let score = (attack.attack / 0.004).sqrt();
+                    fired = Some(PendingImpact {
+                        at: attack.at,
+                        score,
+                        strength: (0.48 + score * 0.12).min(1.0),
+                        sub_power: attack.power,
+                        perc_power: attack.upper,
+                        high_power: high_impact_power,
+                        sub_attack: attack.attack,
+                        holdoff_ms: sub_holdoff,
+                        is_kick: true,
+                        wait_hops: 0,
+                    });
+                } else if age < 33.0 {
+                    self.pending_sub = Some(attack);
+                }
+            }
+            if self.pending_sub.is_none() && fired.is_none() && sub_attack && since_hit >= sub_holdoff {
+                self.pending_sub = Some(SubAttack {
+                    at: time,
+                    peak_hz: f.sub_peak_hz,
+                    centroid: f.sub_centroid,
+                    power: f.sub_power,
+                    attack: f.sub_attack,
+                    upper: upper_jump,
+                    high: high_jump,
                 });
             }
 
@@ -882,7 +990,7 @@ impl PercussionDetector {
                 && perc_flux > perc_flux_th
                 && perc_power > 0.00025f32.max(perc_tail_mask)
                 && high_impact_power > f.body_power * 0.06
-                && high_jump > 0.00018
+                && high_jump > 0.00018f32.max(high_tail_mask)
                 && high_jump > body_jump * 0.42
                 && high_jump > sub_jump * 0.24
                 && f.mid_flatness > 0.015
@@ -895,7 +1003,7 @@ impl PercussionDetector {
             let crisp_perc = perc_power_rising
                 && f.air_flux > air_flux_th * 1.12
                 && high_impact_power > f.body_power * 0.06
-                && high_jump > 0.00018
+                && high_jump > 0.00018f32.max(high_tail_mask)
                 && high_impact_power > 0.00022f32.max(perc_tail_mask * 0.85)
                 && high_jump > body_jump * 0.42
                 && high_jump > sub_jump * 0.24
@@ -918,6 +1026,9 @@ impl PercussionDetector {
                     strength,
                     sub_power: f.sub_power,
                     perc_power,
+                    high_power: high_impact_power,
+                    sub_attack: f.sub_attack,
+                    holdoff_ms,
                     is_kick: false,
                     wait_hops: 2,
                 };
@@ -962,6 +1073,9 @@ impl PercussionDetector {
                             strength: cur.strength.max(prev.strength),
                             sub_power: cur.sub_power.max(prev.sub_power),
                             perc_power: cur.perc_power.max(prev.perc_power),
+                            high_power: cur.high_power.max(prev.high_power),
+                            sub_attack: cur.sub_attack.max(prev.sub_attack),
+                            holdoff_ms: cur.holdoff_ms.min(prev.holdoff_ms),
                             is_kick: prev.is_kick || cur.is_kick,
                             wait_hops: if prev.is_kick || cur.is_kick {
                                 0
@@ -974,10 +1088,12 @@ impl PercussionDetector {
                     }
                     if prev.wait_hops > 0 {
                         self.pending_impact = Some(prev);
-                    } else if prev.at - self.last_hit >= holdoff_ms {
+                    } else if prev.at - self.last_hit >= prev.holdoff_ms {
                         self.last_hit = prev.at;
                         self.hit_sub_power = prev.sub_power;
                         self.hit_perc_power = prev.perc_power;
+                        self.hit_high_power = prev.high_power;
+                        self.hit_sub_attack = prev.sub_attack;
                         emitted = Some(OnsetEvent {
                             band: 3,
                             percussion: true,
@@ -988,10 +1104,12 @@ impl PercussionDetector {
                 } else if prev.wait_hops > 0 {
                     prev.wait_hops -= 1;
                     self.pending_impact = Some(prev);
-                } else if prev.at - self.last_hit >= holdoff_ms {
+                } else if prev.at - self.last_hit >= prev.holdoff_ms {
                     self.last_hit = prev.at;
                     self.hit_sub_power = prev.sub_power;
                     self.hit_perc_power = prev.perc_power;
+                    self.hit_high_power = prev.high_power;
+                    self.hit_sub_attack = prev.sub_attack;
                     emitted = Some(OnsetEvent {
                         band: 3,
                         percussion: true,
@@ -1001,7 +1119,7 @@ impl PercussionDetector {
                 }
             }
         } else if let Some(cur) = fired {
-            if cur.at - self.last_hit >= holdoff_ms {
+            if cur.at - self.last_hit >= cur.holdoff_ms {
                 self.pending_impact = Some(cur);
             }
         }
@@ -1295,6 +1413,77 @@ mod tests {
         let times = detect(&[(0.42, 1.0), (0.475, 0.35), (0.53, 0.22)]);
         assert_eq!(times.len(), 1, "echoes: {times:?}");
         assert!((times[0] - 420.0).abs() <= 15.0, "{times:?}");
+    }
+
+    #[test]
+    fn percussion_phase_matrix() {
+        fn detect(kind: usize, mixed: bool, phase: usize, schedule: &[(f32, f32)]) -> Vec<f64> {
+            let mut detector = Detector::new();
+            let mut fft = Fft::new();
+            let mut window = VecDeque::with_capacity(WINDOW);
+            let mut events = Vec::with_capacity(16);
+            let mut drums = Vec::new();
+            let tau = std::f32::consts::TAU;
+            let phi = tau * phase as f32 / 8.0;
+            for i in 0..36_000 {
+                let t = i as f32 / 48_000.0;
+                let bed = if mixed {
+                    0.24 * (tau * 82.4 * t + phi).sin()
+                        + 0.35 * (tau * 220.0 * t + phi).sin()
+                        + 0.23 * (tau * 440.0 * t + phi * 2.0).sin()
+                        + 0.18 * (tau * 660.0 * t + phi * 3.0).sin()
+                } else { 0.0 };
+                let kick = schedule.iter().map(|&(start, amplitude)| {
+                    let dt = t - start;
+                    if !(0.0..0.35).contains(&dt) { return 0.0; }
+                    let (base, sweep, sweep_s, decay, click, click_hz) = match kind {
+                        0 => (52.0, 78.0, 0.024, 0.110, 0.18, 260.0),
+                        1 => (44.0, 68.0, 0.022, 0.075, 0.0, 260.0),
+                        _ => (51.0, 95.0, 0.022, 0.060, 0.36, 2400.0),
+                    };
+                    let phase = tau * (base * dt + sweep * sweep_s * (1.0 - (-dt / sweep_s).exp()));
+                    amplitude * (0.68 * (-dt / decay).exp() * phase.sin()
+                        + click * (tau * click_hz * dt).sin() * (-dt / 0.009).exp())
+                }).sum::<f32>();
+                window.push_back(bed + kick);
+                if window.len() == WINDOW {
+                    let stamp = (i - WINDOW * 3 / 8) as f64 / 48.0;
+                    events.clear();
+                    detector.process_into(fft.spectrum(&window), 48_000, stamp, &mut events);
+                    drums.extend(events.iter().filter(|e| e.percussion).map(|e| e.time_ms));
+                    window.drain(..HOP);
+                }
+            }
+            drums
+        }
+
+        for kind in 0..3 {
+            for mixed in [false, true] {
+                let mut first_hits = [0; 4];
+                let mut second_hits = [0; 4];
+                let mut echoes = 0;
+                for phase in 0..8 {
+                    let start = 0.275 + phase as f32 * 0.0041;
+                    for (i, interval) in [0.090, 0.112, 0.125, 0.140].into_iter().enumerate() {
+                        let second = start + interval;
+                        let hits = detect(kind, mixed, phase, &[(start, 1.0), (second, 1.0)]);
+                        first_hits[i] += usize::from(hits.iter().any(|&t| (t - f64::from(start) * 1000.0).abs() < 25.0));
+                        second_hits[i] += usize::from(hits.iter().any(|&t| (t - f64::from(second) * 1000.0).abs() < 25.0));
+                    }
+                    let hits = detect(kind, mixed, phase, &[(start, 1.0), (start + 0.055, 0.34), (start + 0.110, 0.22)]);
+                    echoes += hits.iter().filter(|&&t| t > f64::from(start) * 1000.0 + 38.0).count();
+                }
+                eprintln!("{kind}, mixed={mixed}: first={first_hits:?}, second={second_hits:?}, echoes={echoes}");
+                assert!(first_hits.iter().all(|&n| n >= 7));
+                if mixed && kind == 1 {
+                    assert!(second_hits[0] >= 7 && second_hits[1] >= 7 && second_hits[2] >= 5 && second_hits[3] >= 7);
+                } else {
+                    let minimum = if mixed && kind == 0 { 6 } else { 8 };
+                    assert!(second_hits.iter().all(|&n| n >= minimum));
+                }
+                assert_eq!(echoes, 0);
+            }
+        }
     }
 
     #[test]

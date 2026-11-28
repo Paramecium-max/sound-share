@@ -254,7 +254,7 @@ public final class WirelessAdbClient implements AutoCloseable {
         }
     }
 
-    private static synchronized KeyPair loadOrCreateKeyPair(Context ctx) throws Exception {
+    static synchronized KeyPair loadOrCreateKeyPair(Context ctx) throws Exception {
         File dir = new File(ctx.getFilesDir(), "adb_keys");
         if (!dir.exists()) dir.mkdirs();
         File privFile = new File(dir, "adbkey.pk8");

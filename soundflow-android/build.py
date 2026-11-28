@@ -11,6 +11,7 @@ import secrets
 import struct
 import subprocess
 import zipfile
+import urllib.request
 
 PROJ = Path(__file__).resolve().parent
 ROOT = next((p for p in (PROJ.parent, PROJ.parent.parent) if (p / "拆包内容/tools").is_dir()), PROJ.parent)
@@ -58,7 +59,7 @@ OUT_APP = OUT_ROOT / "应用"
 OUT_ZIP = OUT_ROOT / "刷机包"
 DEBUG_DIR = Path(os.environ.get("SOUNDFLOW_DEBUG_DIR", str(ROOT / "调试文件/音流独立接收器")))
 
-VERSION = "1.2.2"
+VERSION = "1.2.4"
 
 
 def run(*args, **kw):
@@ -176,6 +177,53 @@ def add_zip_entry(out: zipfile.ZipFile, name: str, data: bytes, stored: bool = F
     out.writestr(info, data)
 
 
+ADB_DEPENDENCIES = (
+    ("libadb-3.1.1.aar",
+     "https://jitpack.io/com/github/MuntashirAkon/libadb-android/3.1.1/libadb-android-3.1.1.aar",
+     "e6fcb495a20a507ca4a125afc9c554e838a84b3a15fbcc29f7deafd0f88bbb58"),
+    ("spake2-android-2.2.1.aar",
+     "https://jitpack.io/com/github/MuntashirAkon/spake2-java/spake2-android/2.2.1/spake2-android-2.2.1.aar",
+     "8798fb6c04b5d53a6307ed9481e9afe563227abd4e8b9e917c8514fa850071bb"),
+    ("conscrypt-android-2.5.3.aar",
+     "https://repo.maven.apache.org/maven2/org/conscrypt/conscrypt-android/2.5.3/conscrypt-android-2.5.3.aar",
+     "551ae4e301c571760d1791e647db6ed1dcb10d34dcae7aa12b67f220f2ce98d1"),
+    ("bcprov-jdk15to18-1.81.jar",
+     "https://repo.maven.apache.org/maven2/org/bouncycastle/bcprov-jdk15to18/1.81/bcprov-jdk15to18-1.81.jar",
+     "0ef9c4d9536719aaa1c92a7c694d87981fa9d4d64dd9479cc322a08aebbc651e"),
+)
+
+
+def prepare_adb_dependencies():
+    cache = BUILD / "adb-dependencies"
+    cache.mkdir(parents=True, exist_ok=True)
+    jars = []
+    libraries = {}
+    for filename, url, digest in ADB_DEPENDENCIES:
+        archive = cache / filename
+        if not archive.is_file():
+            with urllib.request.urlopen(url, timeout=25) as response:
+                payload = response.read(16 * 1024 * 1024)
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise ValueError(f"Checksum mismatch for {filename}")
+            archive.write_bytes(payload)
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+            raise ValueError(f"Checksum mismatch for cached {filename}")
+        if archive.suffix == ".jar":
+            jars.append(archive)
+            continue
+        classes = archive.with_suffix(".jar")
+        with zipfile.ZipFile(archive) as component:
+            classes.write_bytes(component.read("classes.jar"))
+            for name in component.namelist():
+                if name.startswith("jni/arm64-v8a/") and name.endswith(".so"):
+                    library = cache / Path(name).name
+                    library.write_bytes(component.read(name))
+                    verify_elf_alignment(library)
+                    libraries[name.replace("jni/", "lib/", 1)] = library
+        jars.append(classes)
+    return jars, libraries
+
+
 def build_apk(so_path: Path) -> Path:
     for d in ("classes", "dex", "gen"):
         shutil.rmtree(BUILD / d, ignore_errors=True)
@@ -222,7 +270,8 @@ def build_apk(so_path: Path) -> Path:
         d8_libs.extend(["--lib", stub_classes])
 
     java_srcs = sorted((PROJ / "src").rglob("*.java")) + sorted((BUILD / "gen").rglob("*.java"))
-    lib_jars = sorted((PROJ / "libs").glob("*.jar"))
+    adb_jars, adb_libraries = prepare_adb_dependencies()
+    lib_jars = sorted((PROJ / "libs").glob("*.jar")) + adb_jars
     javac_cp = os.pathsep.join([str(SDK_JAR), *extra_cp, *(str(j) for j in lib_jars)])
     run(
         JAVA_BIN / "javac",
@@ -261,6 +310,8 @@ def build_apk(so_path: Path) -> Path:
         for dex in sorted((BUILD / "dex").glob("*.dex")):
             add_zip_entry(zout, dex.name, dex.read_bytes())
         add_zip_entry(zout, "lib/arm64-v8a/libsoundflow.so", so_path.read_bytes(), stored=True, align=16384)
+        for name, library in adb_libraries.items():
+            add_zip_entry(zout, name, library.read_bytes(), stored=True, align=16384)
 
     keys = PROJ / "keys"
     external_key = os.environ.get("SOUNDFLOW_KS_FILE")
